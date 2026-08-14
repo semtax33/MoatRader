@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from moatrader.canonical.models import SourceType, StatementType
+from moatrader.evidence.models import (
+    EvidenceBatchExtractionResult,
+    EvidenceCard,
+    EvidenceDirection,
+    EvidenceExtractionResult,
+    EvidenceMetric,
+    EvidenceRelationType,
+    EvidenceType,
+)
+from moatrader.evidence.processing import (
+    build_evidence_relations,
+    calibrate_card_reliability,
+    cluster_duplicate_evidence,
+)
+from moatrader.evidence.validation import validate_evidence_batch_result, validate_evidence_result
+from moatrader.semantic.chunker import SemanticChunk
+
+
+def _card(evidence_id: str, fact: str, direction: EvidenceDirection) -> EvidenceCard:
+    return EvidenceCard(
+        evidence_id=evidence_id,
+        source_chunk_id="C1",
+        node_ids=["N1"],
+        evidence_type=EvidenceType.SWITCHING_COST,
+        statement_type=StatementType.MANAGEMENT_CLAIM,
+        fact=fact,
+        direction=direction,
+        strength=0.7,
+        source_type=SourceType.IR,
+        reliability=0.95,
+    )
+
+
+def test_reliability_is_capped_by_statement_and_source() -> None:
+    assert calibrate_card_reliability(
+        _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)
+    ).reliability == 0.55
+
+
+def test_relations_preserve_duplicates_updates_and_contradictions() -> None:
+    relations = build_evidence_relations(
+        [
+            _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE),
+            _card("E2", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE),
+            _card("E3", "Customer qualification takes 24 months.", EvidenceDirection.MOAT_POSITIVE),
+            _card("E4", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_NEGATIVE),
+        ],
+        update_threshold=0.70,
+    )
+
+    assert [relation.relation for relation in relations] == [
+        EvidenceRelationType.DUPLICATES,
+        EvidenceRelationType.UPDATES,
+        EvidenceRelationType.CONTRADICTS,
+    ]
+
+
+def test_relations_preserve_supports_and_weakens() -> None:
+    relations = build_evidence_relations(
+        [
+            _card("E1", "Qualification creates customer friction.", EvidenceDirection.MOAT_POSITIVE),
+            _card("E2", "Integration creates customer friction.", EvidenceDirection.MOAT_POSITIVE),
+            _card("E3", "Dual sourcing reduces customer friction.", EvidenceDirection.MOAT_NEGATIVE),
+        ],
+        duplicate_threshold=1.1,
+        update_threshold=1.1,
+        contradiction_threshold=1.1,
+        support_threshold=0.0,
+        weakens_threshold=0.0,
+    )
+
+    assert [relation.relation for relation in relations] == [
+        EvidenceRelationType.SUPPORTS,
+        EvidenceRelationType.WEAKENS,
+    ]
+
+
+def test_duplicate_clusters_choose_one_canonical_and_keep_supporters() -> None:
+    cards = [
+        _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE),
+        _card("E2", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE),
+    ]
+    relations = build_evidence_relations(cards)
+
+    clusters = cluster_duplicate_evidence(cards, relations)
+
+    assert len(clusters) == 1
+    assert clusters[0].canonical_evidence_id == "E1"
+    assert clusters[0].supporting_evidence_ids == ["E2"]
+
+
+def test_batch_validation_drops_cards_with_unknown_chunk_ids() -> None:
+    result = EvidenceBatchExtractionResult(
+        cards=[_card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)]
+    )
+
+    errors = validate_evidence_batch_result(result, [], {})
+
+    assert errors == []
+    assert result.cards == []
+
+
+def test_validation_drops_only_an_ungrounded_numeric_metric() -> None:
+    card = _card("E1", "Customer qualification is lengthy.", EvidenceDirection.MOAT_POSITIVE)
+    card.metrics = [EvidenceMetric(name="qualification_months", value=18)]
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Customer qualification is lengthy.",
+        token_count=5,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert result.cards[0].metrics == []
+
+
+def test_evidence_metric_ignores_repaired_json_fragment_keys() -> None:
+    metric = EvidenceMetric.model_validate(
+        {"name": "revenue", "value": 8780, "unit": "KRW mn", '8780,"unit': "KRW mn"}
+    )
+
+    assert metric.name == "revenue"
+    assert metric.value == 8780
+
+
+def test_empty_card_confidence_fields_use_neutral_defaults() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["strength"] = ""
+    payload["reliability"] = ""
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.strength == 0.5
+    assert card.reliability == 0.5
+
+
+def test_card_confidence_normalizes_common_alternate_scales() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["strength"] = 4
+    payload["reliability"] = 80
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.strength == 0.8
+    assert card.reliability == 0.8
+
+
+def test_numeric_evidence_period_is_normalized_to_string() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["period"] = 2025
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.period == "2025"
+
+
+def test_malformed_metric_string_fragments_are_dropped() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["metrics"] = [
+        {"name": "revenue", "value": 100, "unit": "KRW mn"},
+        {"value": 30049, "unit": "KRW mn"},
+        ',\n{',
+        'evidence_id":"EVID-3',
+    ]
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert len(card.metrics) == 1
+    assert card.metrics[0].name == "revenue"
+
+
+def test_empty_mechanism_values_are_normalized_to_empty_list() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["mechanism"] = {}
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.mechanism == []
+
+    payload["mechanism"] = [{"text": "Customer workflow integration creates friction."}]
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.mechanism == ["Customer workflow integration creates friction."]
+
+    payload["mechanism"] = ""
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.mechanism == []

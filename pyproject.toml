@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moatrader"
+version = "0.3.0"
+description = "Source-neutral canonical financial document model and LLM evidence pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "json-repair>=0.63",
+    "lxml>=5.0",
+    "pydantic>=2.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+llm = ["openai>=2.0"]
+all = ["openai>=2.0", "pytest>=8.0"]
+
+[project.scripts]
+moatrader = "moatrader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

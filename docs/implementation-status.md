@@ -1,0 +1,48 @@
+# 구현 상태와 운영 경계
+
+## 연결 완료
+
+- OpenDART `list.json`/`corpCode.xml`/`document.xml` 자동 수집
+- SEC `data.sec.gov/submissions` discovery와 `Archives/edgar/data` primary HTML/complete submission 자동 수집
+- source별 rate limit, HTTP/DART transient retry, 응답·ZIP size limit, ZIP path traversal 방어
+- immutable Bronze version, 원문·metadata·파일별 SHA-256, revision/latest pointer, runner universe CSV 생성
+- DART `SECTION-n` XML hierarchy 복원과 원문 ZIP 내 모든 첨부문서 보존
+- DART, SEC EDGAR, IR HTML/iXBRL → source-neutral `CanonicalDocumentBundle`
+- section/paragraph/list/note/figure/table AST, rowspan/colspan, multi-header, 단위/기간/주석, provenance
+- inline XBRL `StructuredFact`와 PIT financial snapshot
+- cross-filing chunk exact/near dedup 및 숫자 변경 보존
+- local evidence extraction → deterministic validation/repair → reliability calibration
+- canonical/supporting evidence cluster와 duplicate-free scoring dossier
+- SUPPORTS/WEAKENS/CONTRADICTS/UPDATES/DUPLICATES evidence relation
+- claim별 evidence citation을 강제하는 section summary → company dossier → 경제적 질문 BM25 retrieval
+- L1/L2/L3 evidence pack, context budget pruning, coverage 기록
+- OpenAI Responses API/Pydantic Structured Outputs transport, retry, usage audit, `store=false`
+- task별 모델 routing: evidence/section summary는 `gpt-5-nano`, 최종 MOAT는 `gpt-5.6-luna`
+- 최종 MOAT evidence citation 검증
+- LLM 비의존 Python unlevered DCF, assumptions hash/as-of manifest
+- 한 종목/복수 종목/전체 universe 실행, 병렬 처리, 회사별 실패 격리, chunk/section resume
+- MOAT/DCF/신뢰도/coverage screening과 재랭킹
+- PIT backtest, 다음 거래 가능 timestamp 체결, mark-to-market, turnover/거래비용, 누락 가격 fail-closed
+
+## 외부 데이터가 반드시 보장해야 하는 것
+
+- 각 공시의 시장 공개 가능 시각인 timezone-aware `available_at`
+- corporate action이 반영된 수정주가와 정확한 `price_as_of`
+- 과거 각 시점의 전체 investable universe 구성
+- 상장폐지일까지의 가격 또는 명시적인 청산 가격
+- DCF 가정의 출처·승인·시점 정책
+
+이 조건이 빠지면 코드가 PIT 필터를 수행해도 survivorship bias, stale-price bias 또는 corporate-action 오류를 제거할 수 없습니다.
+
+## 아직 별도 adapter/서비스가 필요한 범위
+
+- DART 명시적 XML taxonomy와 SEC taxonomy/version별 정교한 concept mapping
+- IR PDF/PPT, OCR, chart, page/slide bbox viewer
+- 실제 모델 tokenizer와 대표 corpus 기반 prompt/model calibration
+- parser 원문/AST/Markdown 동시 비교 viewer와 15~30개 실제 공시 golden corpus
+- segment별 MOAT 산출 및 revenue/EBIT 가중 company score
+- plain/generic/full-context renderer와 체계적인 ablation harness
+- benchmark, factor IC/Q5-Q1, benchmark-relative return, delisting corpus를 포함한 연구 리포트
+- scheduler, queue, database, auth, monitoring을 갖춘 상시 운영 API/UI
+
+현재 runner의 입력 경계는 DART XML/HTML, SEC HTML/iXBRL, IR HTML과 metadata JSON입니다. PDF/PPT를 `source=IR`로 넣으면 안 되며, 먼저 전용 adapter를 구현해야 합니다.

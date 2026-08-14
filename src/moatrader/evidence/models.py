@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+from decimal import Decimal
+from enum import StrEnum
+
+from pydantic import ConfigDict, Field, field_validator, model_validator
+
+from moatrader.canonical.models import ContractModel, SourceType, StatementType
+
+
+class EvidenceType(StrEnum):
+    SWITCHING_COST = "SWITCHING_COST"
+    NETWORK_EFFECT = "NETWORK_EFFECT"
+    COST_ADVANTAGE = "COST_ADVANTAGE"
+    INTANGIBLE_ASSET = "INTANGIBLE_ASSET"
+    SCALE_ADVANTAGE = "SCALE_ADVANTAGE"
+    REGULATORY_BARRIER = "REGULATORY_BARRIER"
+    PRICING_POWER = "PRICING_POWER"
+    CUSTOMER_RETENTION = "CUSTOMER_RETENTION"
+    MARKET_SHARE = "MARKET_SHARE"
+    MARGIN_STABILITY = "MARGIN_STABILITY"
+    COMPETITIVE_THREAT = "COMPETITIVE_THREAT"
+    CUSTOMER_CONCENTRATION = "CUSTOMER_CONCENTRATION"
+    SUBSTITUTION_RISK = "SUBSTITUTION_RISK"
+    TECHNOLOGY_RISK = "TECHNOLOGY_RISK"
+    CAPITAL_INTENSITY = "CAPITAL_INTENSITY"
+    ROIC_QUALITY = "ROIC_QUALITY"
+    FCF_QUALITY = "FCF_QUALITY"
+    OTHER = "OTHER"
+
+
+class EvidenceDirection(StrEnum):
+    MOAT_POSITIVE = "MOAT_POSITIVE"
+    MOAT_NEGATIVE = "MOAT_NEGATIVE"
+    NEUTRAL = "NEUTRAL"
+
+
+class EvidenceMetric(ContractModel):
+    # JSON repair can preserve a malformed presentation fragment as an extra
+    # key. Only the canonical name/value/unit fields are material.
+    model_config = ConfigDict(extra="ignore")
+
+    name: str
+    value: Decimal | str
+    unit: str | None = None
+
+
+class EvidenceCard(ContractModel):
+    # Provider models occasionally add harmless presentation-only fields such
+    # as period_unit. Core grounding fields remain required and are validated
+    # independently against the canonical chunk.
+    model_config = ConfigDict(extra="ignore")
+
+    evidence_id: str
+    source_chunk_id: str
+    node_ids: list[str] = Field(min_length=1)
+    evidence_type: EvidenceType = EvidenceType.OTHER
+    statement_type: StatementType = StatementType.MANAGEMENT_CLAIM
+    fact: str = Field(min_length=1)
+    mechanism: list[str] = Field(default_factory=list)
+    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
+    strength: float = Field(default=0.5, ge=0.0, le=1.0)
+    source_type: SourceType = SourceType.OTHER
+    company_scope: str = "COMPANY"
+    segment: str | None = None
+    metrics: list[EvidenceMetric] = Field(default_factory=list)
+    unit: str | None = None
+    period: str | None = None
+    raw_quote: str | None = None
+    reliability: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @field_validator("metrics", mode="before")
+    @classmethod
+    def null_metrics_are_empty(cls, value: object) -> object:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [
+                item
+                for item in value
+                if isinstance(item, EvidenceMetric)
+                or (
+                    isinstance(item, dict)
+                    and item.get("name")
+                    and item.get("value") is not None
+                )
+            ]
+        return value
+
+    @field_validator("period", mode="before")
+    @classmethod
+    def numeric_period_is_string(cls, value: object) -> object:
+        if value is None or isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, Decimal, date, datetime)):
+            return str(value)
+        return value
+
+    @field_validator("statement_type", mode="before")
+    @classmethod
+    def normalize_statement_type_typo(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized in {"DISLOSED_FACT", "DISCLOSE_FACT", "DISCLOSEDFACT"}:
+                return StatementType.DISCLOSED_FACT
+            if normalized not in {item.value for item in StatementType}:
+                return StatementType.MANAGEMENT_CLAIM
+            return normalized
+        return value
+
+    @field_validator("evidence_type", mode="before")
+    @classmethod
+    def unknown_evidence_type_is_other(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized not in {item.value for item in EvidenceType}:
+                return EvidenceType.OTHER
+            return normalized
+        return value
+
+    @field_validator("direction", mode="before")
+    @classmethod
+    def unknown_direction_is_neutral(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper()
+            if normalized not in {item.value for item in EvidenceDirection}:
+                return EvidenceDirection.NEUTRAL
+            return normalized
+        return value
+
+    @field_validator("source_type", mode="before")
+    @classmethod
+    def normalize_source_type(cls, value: object) -> object:
+        if isinstance(value, str):
+            normalized = value.strip().upper().replace(" ", "_")
+            if normalized in {"SEC", "EDGAR"}:
+                return SourceType.SEC_EDGAR
+            if normalized not in {item.value for item in SourceType}:
+                return SourceType.OTHER
+            return normalized
+        return SourceType.OTHER if value is None else value
+
+    @field_validator("mechanism", mode="before")
+    @classmethod
+    def null_mechanism_is_empty(cls, value: object) -> object:
+        if value is None or value == {} or value == "":
+            return []
+        if isinstance(value, list):
+            return [
+                item.get("text") if isinstance(item, dict) and isinstance(item.get("text"), str) else item
+                for item in value
+            ]
+        return value
+
+    @field_validator("strength", "reliability", mode="before")
+    @classmethod
+    def null_confidence_is_neutral(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return value
+        if numeric < 0:
+            return 0.0
+        if numeric <= 1:
+            return numeric
+        if numeric <= 5:
+            return numeric / 5
+        if numeric <= 10:
+            return numeric / 10
+        if numeric <= 100:
+            return numeric / 100
+        return 1.0
+
+    @field_validator("company_scope", mode="before")
+    @classmethod
+    def null_scope_is_company(cls, value: object) -> object:
+        return "COMPANY" if value is None else value
+
+
+class EvidenceExtractionResult(ContractModel):
+    model_config = ConfigDict(extra="ignore")
+
+    chunk_id: str
+    cards: list[EvidenceCard] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def cards_belong_to_chunk(self) -> "EvidenceExtractionResult":
+        if any(card.source_chunk_id != self.chunk_id for card in self.cards):
+            raise ValueError("every evidence card must cite the result chunk_id")
+        return self
+
+
+class EvidenceBatchExtractionResult(ContractModel):
+    """Evidence extracted from multiple canonical chunks in one bounded call."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cards: list[EvidenceCard] = Field(default_factory=list)
+
+
+class EvidenceRelationType(StrEnum):
+    SUPPORTS = "SUPPORTS"
+    CONTRADICTS = "CONTRADICTS"
+    WEAKENS = "WEAKENS"
+    UPDATES = "UPDATES"
+    DUPLICATES = "DUPLICATES"
+
+
+class EvidenceRelation(ContractModel):
+    from_evidence_id: str
+    to_evidence_id: str
+    relation: EvidenceRelationType
+
+
+class EvidenceCluster(ContractModel):
+    canonical_evidence_id: str
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class CitedSummaryClaim(ContractModel):
+    text: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+
+
+class SectionSummary(ContractModel):
+    section_path: list[str]
+    positive_evidence_ids: list[str] = Field(default_factory=list)
+    negative_evidence_ids: list[str] = Field(default_factory=list)
+    key_mechanisms: list[CitedSummaryClaim] = Field(default_factory=list)
+    key_kpis: list[CitedSummaryClaim] = Field(default_factory=list)
+    uncertainties: list[CitedSummaryClaim] = Field(default_factory=list)
+
+
+class CompanyDossier(ContractModel):
+    issuer_id: str | None = None
+    issuer_name: str
+    ticker: str | None = None
+    as_of: datetime
+    source_document_ids: list[str] = Field(min_length=1)
+    business_summary: str | None = None
+    financial_summary: str | None = None
+    evidence: list[EvidenceCard] = Field(default_factory=list)
+    relations: list[EvidenceRelation] = Field(default_factory=list)
+    section_summaries: list[SectionSummary] = Field(default_factory=list)
+    key_table_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def dossier_references_are_internal(self) -> "CompanyDossier":
+        ids = {card.evidence_id for card in self.evidence}
+        if len(ids) != len(self.evidence):
+            raise ValueError("evidence IDs must be unique")
+        referenced: set[str] = set()
+        for summary in self.section_summaries:
+            referenced.update(summary.positive_evidence_ids)
+            referenced.update(summary.negative_evidence_ids)
+            for claim in [*summary.key_mechanisms, *summary.key_kpis, *summary.uncertainties]:
+                referenced.update(claim.evidence_ids)
+        for relation in self.relations:
+            referenced.add(relation.from_evidence_id)
+            referenced.add(relation.to_evidence_id)
+        missing = referenced - ids
+        if missing:
+            raise ValueError(f"dossier references missing evidence: {sorted(missing)}")
+        return self
+
+
+class Durability(StrEnum):
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    MEDIUM_HIGH = "MEDIUM_HIGH"
+    HIGH = "HIGH"
+
+
+class MoatMechanismScore(ContractModel):
+    evidence_type: EvidenceType
+    score: float = Field(ge=0.0, le=10.0)
+    evidence_ids: list[str] = Field(min_length=1)
+    rationale: str
+
+
+class CoverageMetrics(ContractModel):
+    char_retention: float | None = Field(default=None, ge=0.0)
+    token_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+    evidence_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+    section_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+    table_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+    numeric_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class MoatScore(ContractModel):
+    issuer_id: str | None = None
+    as_of: date
+    economic_moat_score: float = Field(ge=0.0, le=10.0)
+    mechanisms: list[MoatMechanismScore] = Field(default_factory=list)
+    counterevidence_ids: list[str] = Field(default_factory=list)
+    durability: Durability
+    model_confidence: float = Field(ge=0.0, le=1.0)
+    document_coverage: CoverageMetrics
+    caveats: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def positive_score_has_evidence(self) -> "MoatScore":
+        if self.economic_moat_score > 0 and not self.mechanisms:
+            raise ValueError("a positive moat score requires cited mechanisms")
+        return self
