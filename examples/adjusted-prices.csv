@@ -1,0 +1,3 @@
+timestamp,ticker,adjusted_close,tradable
+2025-05-19T15:30:00+09:00,SAMPLE,10.00,true
+2025-06-30T15:30:00+09:00,SAMPLE,10.80,true

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import io
 import json
 import os
@@ -12,14 +13,34 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime, time as datetime_time, timedelta
+from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from xml.etree import ElementTree
 
+from moatrader.financial.pit import (
+    ANNUAL_REPORT_CODE,
+    FinancialReportPeriod,
+    candidate_financial_periods,
+    conservative_receipt_available_at,
+    financial_report_period,
+    receipt_number,
+    trailing_twelve_month_metrics,
+)
+
 
 DART_API = "https://opendart.fss.or.kr/api"
-ANNUAL_REPORT_CODE = "11011"
+
+
+@dataclass(frozen=True)
+class FinancialReport:
+    period: FinancialReportPeriod
+    fs_div: str
+    receipt_no: str
+    available_at: datetime
+    rows: list[dict[str, object]]
+    payload_path: Path
 
 
 def decimal_value(value: object) -> Decimal | None:
@@ -93,10 +114,24 @@ def corporation_map(client: DartClient, output_root: Path) -> dict[str, str]:
     return result
 
 
-def amount(rows: list[dict[str, object]], pattern: str, statements: set[str]) -> Decimal | None:
+def row_decimal(row: dict[str, object], fields: tuple[str, ...]) -> Decimal | None:
+    for field in fields:
+        value = decimal_value(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def amount(
+    rows: list[dict[str, object]],
+    pattern: str,
+    statements: set[str],
+    *,
+    fields: tuple[str, ...] = ("thstrm_amount",),
+) -> Decimal | None:
     regex = re.compile(pattern, re.IGNORECASE)
     values = [
-        decimal_value(row.get("thstrm_amount"))
+        row_decimal(row, fields)
         for row in rows
         if str(row.get("sj_div") or "") in statements
         and regex.search(f"{row.get('account_id', '')} {row.get('account_nm', '')}")
@@ -105,7 +140,13 @@ def amount(rows: list[dict[str, object]], pattern: str, statements: set[str]) ->
     return max(clean, key=abs) if clean else None
 
 
-def sum_amounts(rows: list[dict[str, object]], pattern: str, statements: set[str]) -> Decimal:
+def sum_amounts(
+    rows: list[dict[str, object]],
+    pattern: str,
+    statements: set[str],
+    *,
+    fields: tuple[str, ...] = ("thstrm_amount",),
+) -> Decimal | None:
     regex = re.compile(pattern, re.IGNORECASE)
     values: list[Decimal] = []
     seen: set[tuple[str, str]] = set()
@@ -115,24 +156,31 @@ def sum_amounts(rows: list[dict[str, object]], pattern: str, statements: set[str
         if str(row.get("sj_div") or "") not in statements or not regex.search(f"{account_id} {account_name}"):
             continue
         key = (account_id, account_name)
-        value = decimal_value(row.get("thstrm_amount"))
+        value = row_decimal(row, fields)
         if value is not None and key not in seen:
             values.append(abs(value))
             seen.add(key)
-    return sum(values, Decimal(0))
+    return sum(values, Decimal(0)) if values else None
 
 
-def fetch_year(
+def fetch_report(
     client: DartClient,
     output_root: Path,
     ticker: str,
     corp_code: str,
-    year: int,
-) -> tuple[list[dict[str, object]], str] | None:
+    period: FinancialReportPeriod,
+    *,
+    timezone: tzinfo,
+    required_fs_div: str | None = None,
+) -> FinancialReport | None:
     ticker_dir = output_root / "source" / "financials" / ticker
     ticker_dir.mkdir(parents=True, exist_ok=True)
-    for fs_div in ("CFS", "OFS"):
-        path = ticker_dir / f"{year}-{fs_div}.json"
+    fs_divisions = (required_fs_div,) if required_fs_div else ("CFS", "OFS")
+    for fs_div in fs_divisions:
+        path = ticker_dir / f"{period.business_year}-{period.report_code}-{fs_div}.json"
+        legacy_path = ticker_dir / f"{period.business_year}-{fs_div}.json"
+        if period.is_annual and not path.is_file() and legacy_path.is_file():
+            path = legacy_path
         if path.is_file():
             payload = json.loads(path.read_text(encoding="utf-8"))
         else:
@@ -140,39 +188,69 @@ def fetch_year(
                 "fnlttSinglAcntAll.json",
                 {
                     "corp_code": corp_code,
-                    "bsns_year": year,
-                    "reprt_code": ANNUAL_REPORT_CODE,
+                    "bsns_year": period.business_year,
+                    "reprt_code": period.report_code,
                     "fs_div": fs_div,
                 },
             )
             path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         if str(payload.get("status")) == "000" and payload.get("list"):
-            return list(payload["list"]), fs_div
+            rows = list(payload["list"])
+            response_years = {str(row.get("bsns_year") or "").strip() for row in rows} - {""}
+            response_codes = {str(row.get("reprt_code") or "").strip() for row in rows} - {""}
+            if response_years != {str(period.business_year)} or response_codes != {period.report_code}:
+                raise ValueError(
+                    f"OpenDART response period mismatch for {ticker}: "
+                    f"expected {period.label}, got years={sorted(response_years)} codes={sorted(response_codes)}"
+                )
+            number = receipt_number(rows)
+            available_at = conservative_receipt_available_at(number, timezone)
+            return FinancialReport(
+                period=period,
+                fs_div=fs_div,
+                receipt_no=number,
+                available_at=available_at,
+                rows=rows,
+                payload_path=path,
+            )
         if str(payload.get("status")) not in {"013"}:
             break
     return None
 
 
-def annual_metrics(rows: list[dict[str, object]]) -> dict[str, Decimal | None]:
+def financial_metrics(
+    rows: list[dict[str, object]],
+    *,
+    interim: bool,
+) -> dict[str, Decimal | None]:
+    # OpenDART documents ``thstrm_amount`` as the three-month value for
+    # interim income statements. TTM construction must therefore fail closed
+    # when the explicit cumulative field is absent instead of mixing a quarter
+    # with year-to-date cash-flow values.
+    flow_fields = ("thstrm_add_amount",) if interim else ("thstrm_amount",)
     revenue = amount(
         rows,
         r"ifrs(?:-full)?_(?:Revenue|SalesRevenue)|dart_Revenue|(?:^|\s)(?:수익\(매출액\)|매출액)(?:$|\s)",
         {"IS", "CIS"},
+        fields=flow_fields,
     )
     ebit = amount(
         rows,
         r"OperatingIncomeLoss|ProfitLossFromOperatingActivities|영업이익(?:\(손실\))?",
         {"IS", "CIS"},
+        fields=flow_fields,
     )
     capex = sum_amounts(
         rows,
         r"PurchaseOfPropertyPlantAndEquipment|PurchaseOfIntangibleAssets|유형자산의 취득|무형자산의 취득|건설중인자산의 취득",
         {"CF"},
+        fields=flow_fields,
     )
     depreciation = sum_amounts(
         rows,
         r"Depreciation|Amortisation|Amortization|감가상각비|무형자산상각비|사용권자산상각비",
         {"CF"},
+        fields=flow_fields,
     )
     cash = amount(rows, r"CashAndCashEquivalents|^\s*현금및현금성자산\s*$", {"BS"}) or Decimal(0)
     debt = sum_amounts(
@@ -195,16 +273,227 @@ def annual_metrics(rows: list[dict[str, object]]) -> dict[str, Decimal | None]:
     }
 
 
+def annual_metrics(rows: list[dict[str, object]]) -> dict[str, Decimal | None]:
+    return financial_metrics(rows, interim=False)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def report_descriptor(report: FinancialReport) -> dict[str, object]:
+    return {
+        "business_year": report.period.business_year,
+        "report_code": report.period.report_code,
+        "period_label": report.period.label,
+        "period_end": report.period.period_end.isoformat(),
+        "receipt_no": report.receipt_no,
+        "available_at": report.available_at.isoformat(),
+        "fs_div": report.fs_div,
+        "payload_path": str(report.payload_path.resolve()),
+        "payload_sha256": file_sha256(report.payload_path),
+    }
+
+
+def latest_pit_financial_report(
+    client: DartClient,
+    output_root: Path,
+    ticker: str,
+    corp_code: str,
+    as_of: datetime,
+) -> tuple[FinancialReport, list[dict[str, object]]]:
+    rejected_future: list[dict[str, object]] = []
+    for period in candidate_financial_periods(as_of):
+        report = fetch_report(
+            client,
+            output_root,
+            ticker,
+            corp_code,
+            period,
+            timezone=as_of.tzinfo,
+        )
+        if report is None:
+            continue
+        if report.available_at > as_of:
+            rejected_future.append(report_descriptor(report))
+            continue
+        return report, rejected_future
+    raise ValueError("no point-in-time financial report available")
+
+
+def exact_pit_financial_report(
+    client: DartClient,
+    output_root: Path,
+    ticker: str,
+    corp_code: str,
+    period: FinancialReportPeriod,
+    *,
+    as_of: datetime,
+    fs_div: str,
+) -> FinancialReport:
+    report = fetch_report(
+        client,
+        output_root,
+        ticker,
+        corp_code,
+        period,
+        timezone=as_of.tzinfo,
+        required_fs_div=fs_div,
+    )
+    if report is None:
+        raise ValueError(f"missing {period.label} {fs_div} financial report")
+    if report.available_at > as_of:
+        raise ValueError(
+            f"{period.label} {fs_div} financial report was not available at cutoff "
+            f"({report.available_at.isoformat()} > {as_of.isoformat()})"
+        )
+    return report
+
+
+def build_pit_ttm_input(
+    client: DartClient,
+    output_root: Path,
+    ticker: str,
+    corp_code: str,
+    as_of: datetime,
+) -> tuple[dict[str, Decimal | None], dict[str, object], FinancialReport]:
+    latest, rejected_future = latest_pit_financial_report(
+        client,
+        output_root,
+        ticker,
+        corp_code,
+        as_of,
+    )
+    current = financial_metrics(latest.rows, interim=not latest.period.is_annual)
+    components = [latest]
+    if latest.period.is_annual:
+        metrics = current
+        formula = f"{latest.period.label}"
+    else:
+        prior_year = latest.period.business_year - 1
+        prior_annual = exact_pit_financial_report(
+            client,
+            output_root,
+            ticker,
+            corp_code,
+            financial_report_period(prior_year, ANNUAL_REPORT_CODE),
+            as_of=as_of,
+            fs_div=latest.fs_div,
+        )
+        prior_interim = exact_pit_financial_report(
+            client,
+            output_root,
+            ticker,
+            corp_code,
+            financial_report_period(prior_year, latest.period.report_code),
+            as_of=as_of,
+            fs_div=latest.fs_div,
+        )
+        prior_fy_metrics = annual_metrics(prior_annual.rows)
+        prior_ytd_metrics = financial_metrics(prior_interim.rows, interim=True)
+        metrics = trailing_twelve_month_metrics(
+            prior_fy_metrics,
+            current,
+            prior_ytd_metrics,
+            current,
+        )
+        components.extend([prior_annual, prior_interim])
+        formula = (
+            f"{prior_annual.period.label} + {latest.period.label} YTD "
+            f"- {prior_interim.period.label} YTD"
+        )
+
+    if metrics.get("revenue") is None or metrics["revenue"] <= 0:
+        raise ValueError(f"no positive PIT TTM revenue for {latest.period.label}")
+
+    audit = {
+        "financial_data_cutoff": as_of.isoformat(),
+        "financial_period_basis": "FY" if latest.period.is_annual else "TTM",
+        "balance_sheet_basis": latest.period.label,
+        "latest_report_period": latest.period.label,
+        "latest_report_code": latest.period.report_code,
+        "latest_report_receipt_no": latest.receipt_no,
+        "latest_report_available_at": latest.available_at.isoformat(),
+        "financial_statement_scope": latest.fs_div,
+        "ttm_formula": formula,
+        "ttm_revenue": str(metrics.get("revenue")),
+        "ttm_ebit": str(metrics.get("ebit")),
+        "ttm_capex": str(metrics.get("capex")),
+        "ttm_depreciation": str(metrics.get("depreciation")),
+        "ttm_nwc": str(metrics.get("nwc")),
+        "ttm_component_receipts": ";".join(report.receipt_no for report in components),
+        "rejected_future_financial_reports": json.dumps(
+            rejected_future,
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "calendar_fiscal_year_assumption": True,
+    }
+    audit["components"] = [report_descriptor(report) for report in components]
+    return metrics, audit, latest
+
+
+def pit_annual_history(
+    client: DartClient,
+    output_root: Path,
+    ticker: str,
+    corp_code: str,
+    years: list[int],
+    *,
+    as_of: datetime,
+    fs_div: str,
+) -> tuple[list[tuple[int, dict[str, Decimal | None]]], list[dict[str, object]]]:
+    history: list[tuple[int, dict[str, Decimal | None]]] = []
+    sources: list[dict[str, object]] = []
+    for year in years:
+        report = fetch_report(
+            client,
+            output_root,
+            ticker,
+            corp_code,
+            financial_report_period(year, ANNUAL_REPORT_CODE),
+            timezone=as_of.tzinfo,
+            required_fs_div=fs_div,
+        )
+        if report is None or report.available_at > as_of:
+            continue
+        history.append((year, annual_metrics(report.rows)))
+        sources.append(report_descriptor(report))
+    return history, sources
+
+
+def json_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def assumptions_from_history(
     history: list[tuple[int, dict[str, Decimal | None]]],
     size_bucket: str,
     shares: Decimal,
+    *,
+    base_metrics: dict[str, Decimal | None] | None = None,
+    base_period: str | None = None,
+    base_basis: str = "FY",
 ) -> tuple[dict[str, str | list[str]], dict[str, object]]:
     valid = [(year, metrics) for year, metrics in history if metrics["revenue"] and metrics["revenue"] > 0]
     if not valid:
         raise ValueError("no positive annual revenue")
-    latest_year, latest = valid[-1]
-    revenue = latest["revenue"]
+    latest_year, latest_annual = valid[-1]
+    latest = base_metrics or latest_annual
+    revenue = latest.get("revenue")
+    if revenue is None or revenue <= 0:
+        raise ValueError("no positive PIT base revenue")
     assert revenue is not None
 
     growth_rates: list[Decimal] = []
@@ -222,9 +511,12 @@ def assumptions_from_history(
         for step in range(5)
     ]
 
+    ratio_observations = [metrics for _year, metrics in valid]
+    if base_metrics is not None and base_period != f"{latest_year}FY":
+        ratio_observations.append(base_metrics)
     margins = [
         metrics["ebit"] / metrics["revenue"]
-        for _year, metrics in valid
+        for metrics in ratio_observations
         if metrics["ebit"] is not None and metrics["revenue"]
     ]
     current_margin = clamp(
@@ -244,7 +536,7 @@ def assumptions_from_history(
 
     capex_ratios = [
         metrics["capex"] / metrics["revenue"]
-        for _year, metrics in valid
+        for metrics in ratio_observations
         if metrics["capex"] is not None and metrics["revenue"]
     ]
     capex_ratio = clamp(
@@ -285,18 +577,25 @@ def assumptions_from_history(
     }
     audit = {
         "latest_financial_year": latest_year,
+        "base_financial_period": base_period or f"{latest_year}FY",
+        "base_financial_basis": base_basis,
         "history_years": [year for year, _metrics in valid],
         "historical_revenue": [str(metrics["revenue"]) for _year, metrics in valid],
         "historical_ebit": [str(metrics["ebit"]) for _year, metrics in valid],
+        "base_revenue": str(revenue),
+        "base_ebit": str(latest.get("ebit")),
         "normalized_growth": str(normalized_growth),
         "current_ebit_margin": str(current_margin),
         "normalized_ebit_margin": str(normalized_margin),
         "capex_pct_revenue": str(capex_ratio),
         "depreciation_pct_revenue": str(depreciation_ratio),
         "nwc_pct_revenue": str(nwc_ratio),
+        "tax_rate": "0.24",
+        "tax_rate_method": "fixed-baseline/1",
         "wacc": str(wacc),
+        "wacc_method": "size-bucket-baseline/1",
         "net_debt": str(net_debt),
-        "method": "historical-normalization-baseline/1",
+        "method": "pit-ttm-historical-normalization/2",
     }
     return assumptions, audit
 
@@ -403,13 +702,15 @@ def main() -> int:
         args.collected_manifest.resolve(),
         as_of=as_of,
     )
-    years = sorted(set(args.years or [2022, 2023, 2024]))
+    requested_years = sorted(set(args.years)) if args.years else None
 
     manifest_rows: list[dict[str, object]] = []
     audits: list[dict[str, object]] = []
     exclusions: list[dict[str, object]] = []
     assumptions_dir = output_root / "assumptions"
     assumptions_dir.mkdir(parents=True, exist_ok=True)
+    dcf_inputs_dir = output_root / "dcf-inputs"
+    dcf_inputs_dir.mkdir(parents=True, exist_ok=True)
 
     for index, source in enumerate(universe, start=1):
         ticker = source["stock_code"].zfill(6)
@@ -430,6 +731,8 @@ def main() -> int:
             continue
 
         dcf_path = ""
+        dcf_input_path_text = ""
+        dcf_input_hash = ""
         audit: dict[str, object] = {
             "stock_code": ticker,
             "name": source.get("name", ""),
@@ -442,26 +745,81 @@ def main() -> int:
         if source.get("finance_hint", "").strip().lower() == "true":
             exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": "FINANCIAL_COMPANY_DCF_MODEL_MISMATCH"})
         else:
-            history: list[tuple[int, dict[str, Decimal | None]]] = []
-            fs_divisions: list[str] = []
-            for year in years:
-                response = fetch_year(client, output_root, ticker, corp_code, year)
-                if response is None:
-                    continue
-                rows, fs_div = response
-                history.append((year, annual_metrics(rows)))
-                fs_divisions.append(f"{year}:{fs_div}")
             try:
+                base_metrics, pit_details, latest_report = build_pit_ttm_input(
+                    client,
+                    output_root,
+                    ticker,
+                    corp_code,
+                    as_of,
+                )
+                latest_completed_year = (
+                    latest_report.period.business_year
+                    if latest_report.period.is_annual
+                    else latest_report.period.business_year - 1
+                )
+                years = requested_years or list(
+                    range(latest_completed_year - 2, latest_completed_year + 1)
+                )
+                history, annual_sources = pit_annual_history(
+                    client,
+                    output_root,
+                    ticker,
+                    corp_code,
+                    years,
+                    as_of=as_of,
+                    fs_div=latest_report.fs_div,
+                )
                 assumptions, details = assumptions_from_history(
                     history,
                     source.get("size_bucket", ""),
                     diluted_shares,
+                    base_metrics=base_metrics,
+                    base_period=latest_report.period.label,
+                    base_basis=str(pit_details["financial_period_basis"]),
                 )
+                input_payload = {
+                    "schema_version": "moatrader-dcf-input/2",
+                    "ticker": ticker,
+                    "issuer_name": source.get("name", ""),
+                    "as_of": as_of.isoformat(),
+                    "metrics": {key: str(value) if value is not None else None for key, value in base_metrics.items()},
+                    "pit": pit_details,
+                    "annual_history": [
+                        {
+                            "year": year,
+                            "metrics": {
+                                key: str(value) if value is not None else None
+                                for key, value in metrics.items()
+                            },
+                        }
+                        for year, metrics in history
+                    ],
+                    "annual_sources": annual_sources,
+                    "assumption_method": details["method"],
+                }
+                input_hash = json_sha256(input_payload)
+                input_payload["input_sha256"] = input_hash
+                dcf_input_path = dcf_inputs_dir / f"{ticker}.json"
+                dcf_input_path.write_text(
+                    json.dumps(input_payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                dcf_input_path_text = str(dcf_input_path)
+                dcf_input_hash = input_hash
                 assumption_path = assumptions_dir / f"{ticker}.json"
                 assumption_path.write_text(json.dumps(assumptions, ensure_ascii=False, indent=2), encoding="utf-8")
                 dcf_path = str(assumption_path)
+                csv_pit_details = {key: value for key, value in pit_details.items() if key != "components"}
+                audit.update(csv_pit_details)
                 audit.update(details)
-                audit["financial_statement_scope"] = ";".join(fs_divisions)
+                audit["annual_history_sources"] = json.dumps(
+                    annual_sources,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                audit["dcf_input_path"] = str(dcf_input_path)
+                audit["dcf_input_sha256"] = input_hash
             except ValueError as exc:
                 exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": str(exc)})
 
@@ -473,13 +831,15 @@ def main() -> int:
                 "current_price": format(price, "f"),
                 "price_as_of": price_as_of.isoformat(),
                 "dcf_assumptions": dcf_path,
+                "dcf_input": dcf_input_path_text,
+                "dcf_input_sha256": dcf_input_hash,
             }
         )
         audits.append(audit)
 
     manifest_headers = [
         "ticker", "source", "input", "metadata", "issuer_id", "issuer_name",
-        "current_price", "price_as_of", "dcf_assumptions",
+        "current_price", "price_as_of", "dcf_assumptions", "dcf_input", "dcf_input_sha256",
     ]
     write_csv(output_root / "universe-manifest.csv", manifest_rows, manifest_headers)
     audit_headers = sorted({key for row in audits for key in row})

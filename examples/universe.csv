@@ -1,0 +1,2 @@
+ticker,source,input,metadata,issuer_id,issuer_name,current_price,price_as_of,dcf_assumptions
+SAMPLE,DART,sample-dart.html,sample-dart-metadata.json,00126380,Sample Company,10,2025-05-15T16:00:00+09:00,sample-dcf-assumptions.json

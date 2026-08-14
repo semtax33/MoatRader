@@ -133,6 +133,27 @@ moatrader collect manifest `
 
 원문 저장 계약, revision 처리, PIT 시각 정책과 운영 옵션은 [DART/SEC 수집기](docs/ingestion.md), 붙여넣은 전체 설계의 구현 여부는 [요구사항 감사표](docs/requirements-audit.md)를 참고하십시오.
 
+## 한국 주식 PIT·TTM DCF 입력 준비
+
+`prepare_kr_dcf_manifest.py`는 평가일에 이용 가능했던 OpenDART 정기보고서만 선택합니다. 분기·반기 손익과 현금흐름은 OpenDART의 누적금액을 사용하여 `직전 FY + 당기 YTD - 전년 동기 YTD`로 TTM을 만들고, 현금·부채·운전자본은 최신 보고서의 재무상태표 시점값을 사용합니다. 접수번호에는 시각이 없으므로 접수일 다음 날 00:00부터 이용 가능한 것으로 보수적으로 처리합니다.
+
+```powershell
+python scripts\prepare_kr_dcf_manifest.py `
+  --universe data\universe.csv `
+  --collected-manifest data-lake\bronze\collected-universe.csv `
+  --output data-lake\date-inputs\2025-08-31 `
+  --as-of 2025-08-31T23:59:59+09:00
+```
+
+`--year`를 생략하면 최신 PIT 보고서 기준으로 직전 3개 완료 사업연도를 자동 선택합니다. 명시적으로 고정하려면 `--year 2022 --year 2023 --year 2024`처럼 반복합니다.
+
+- `dcf-inputs\TICKER.json`: TTM 숫자, 산식, 사용한 접수번호·공시시점·재무제표 범위, annual history, 입력 hash
+- `assumptions\TICKER.json`: deterministic DCF 엔진 입력
+- `dcf-audit.csv`: 종목별 PIT·TTM 요약과 입력 경로/hash
+- `exclusions.csv`: 미래공시, TTM 구성요소 부족, 금융사 모델 불일치 등 제외 사유
+
+분기 누적금액이 없거나 동일한 `CFS`/`OFS` 범위의 전기 연간·전년 동기 보고서를 확보하지 못하면 분기값을 임의로 혼합하지 않고 해당 DCF를 제외합니다. 현재 한국 주식 준비기는 12월 결산을 전제로 하며 이 가정은 입력 감사정보에 기록됩니다.
+
 ## 한 종목·여러 종목·전체 유니버스 MOAT 실행
 
 유니버스 CSV는 공시 문서 한 개당 한 행입니다. 같은 ticker를 여러 행에 쓰면 DART, EDGAR, IR 등 여러 문서를 한 회사 dossier로 합칩니다. 예시는 `examples\universe.csv`에 있습니다.
