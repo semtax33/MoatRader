@@ -102,6 +102,20 @@ def _write_run(
             ),
             encoding="utf-8",
         )
+        (artifact / "compression-audit.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "compression-invariance/1",
+                    "passed": True,
+                    "claim_jaccard": 1.0,
+                    "counterevidence_recall": 1.0,
+                    "moat_score_delta": 0.0,
+                    "factor_scores_equal": True,
+                    "pack_token_reduction_fraction": 0.5,
+                }
+            ),
+            encoding="utf-8",
+        )
         companies.append(
             CompanyRunResult(
                 ticker=ticker,

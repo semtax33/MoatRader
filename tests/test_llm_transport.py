@@ -38,7 +38,7 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
                 usage=SimpleNamespace(
                     input_tokens=10,
                     output_tokens=3,
-                    input_tokens_details=SimpleNamespace(cached_tokens=4),
+                    input_tokens_details=SimpleNamespace(cached_tokens=4, cache_write_tokens=2),
                 ),
             )
 
@@ -49,6 +49,7 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
         user="user",
         response_schema=EvidenceExtractionResult.model_json_schema(),
         input_sha256="0" * 64,
+        prompt_cache_key="moatrader:test",
     )
     transport = OpenAIResponsesTransport(client=client)
 
@@ -56,19 +57,24 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
 
     assert captured[0]["model"] == "gpt-5.6-luna"
     assert captured[0]["text"]["format"]["type"] == "json_schema"  # type: ignore[index]
+    assert captured[0]["text"]["verbosity"] == "low"  # type: ignore[index]
     assert captured[0]["reasoning"] == {"effort": "medium"}
-    assert captured[0]["max_output_tokens"] == 8_000
+    assert captured[0]["max_output_tokens"] == 2_000
+    assert captured[0]["prompt_cache_key"] == "moatrader:test"
+    assert captured[0]["prompt_cache_options"] == {"mode": "explicit"}
     assert captured[0]["store"] is False
     assert result.response_id == "resp_fixture"
     assert result.model == "gpt-5.6-luna-fixture"
     assert result.usage.input_tokens == 10
     assert result.usage.cached_input_tokens == 4
+    assert result.usage.cache_write_tokens == 2
 
     moat_request = request.model_copy(update={"task": LLMTask.FINAL_MOAT_SCORING})
     moat_result = transport.execute(moat_request, EvidenceExtractionResult)
 
     assert captured[1]["model"] == "gpt-5.6-luna"
     assert captured[1]["reasoning"] == {"effort": "medium"}
+    assert captured[1]["max_output_tokens"] == 4_000
     assert moat_result.model == "gpt-5.6-luna-fixture"
 
 

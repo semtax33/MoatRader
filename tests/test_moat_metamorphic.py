@@ -9,14 +9,16 @@ from moatrader.evidence.atomic import (
     select_atomic_evidence_units,
 )
 from moatrader.evidence.models import (
-    AtomicEvidenceJudgment,
+    AtomicEvidenceExtraction,
     CanonicalClaimSignature,
+    DcfLink,
     EconomicScope,
     EvidenceCard,
     EvidenceDirection,
     EvidenceType,
+    ForwardDriverType,
 )
-from moatrader.evidence.processing import build_canonical_claim_set
+from moatrader.evidence.processing import atomic_extraction_to_judgment, build_canonical_claim_set
 from moatrader.evidence.validation import derive_moat_score
 from moatrader.llm.contracts import build_atomic_evidence_request
 from moatrader.llm.replay import LLMReplayCache
@@ -106,13 +108,74 @@ def test_atomic_replay_identity_uses_evidence_key_not_full_prompt(tmp_path) -> N
         moat_model="gpt-5.6-luna",
         summary_reasoning_effort="low",
         moat_reasoning_effort="medium",
-        engine_version="0.7.0",
+        engine_version="0.8.0",
     )
 
-    assert cache.identity(request, AtomicEvidenceJudgment)[0] == cache.identity(
+    assert cache.identity(request, AtomicEvidenceExtraction)[0] == cache.identity(
         changed,
-        AtomicEvidenceJudgment,
+        AtomicEvidenceExtraction,
     )[0]
+
+
+def test_atomic_api_schema_uses_compact_readable_aliases_without_changing_internal_fields() -> None:
+    schema = AtomicEvidenceExtraction.model_json_schema()
+    properties = schema["properties"]
+
+    assert {"relevant", "type", "direction", "fact", "mechanism", "scope", "subject", "predicate", "horizon", "metric"} <= set(properties)
+    assert "is_investment_relevant" not in properties
+    parsed = AtomicEvidenceExtraction.model_validate(
+        {
+            "relevant": True,
+            "type": "SWITCHING_COST",
+            "fact": "Five-year contracts create switching friction.",
+            "mechanism": ["long contract"],
+            "direction": "MOAT_POSITIVE",
+            "scope": "COMPANY",
+            "segment": None,
+            "horizon": "LONG",
+            "subject": "customer contract",
+            "predicate": "switching friction",
+        }
+    )
+
+    assert parsed.is_investment_relevant is True
+    assert parsed.claim_subject == "customer contract"
+    assert "is_investment_relevant" in parsed.model_dump()
+
+
+def test_minimal_atomic_output_is_enriched_from_source_without_llm_arithmetic() -> None:
+    unit = build_atomic_evidence_units(
+        [
+            _chunk(
+                "IR",
+                "회사는 2026년 생산능력(CAPA)을 30% 확대할 계획이다.",
+                role=SectionRole.GUIDANCE,
+                source_type=SourceType.IR,
+            )
+        ],
+        issuer_id="ISSUER-1",
+    )[0]
+    extraction = AtomicEvidenceExtraction(
+        is_investment_relevant=True,
+        evidence_type=EvidenceType.OPERATING_DRIVER,
+        direction=EvidenceDirection.NEUTRAL,
+        fact="2026년 생산능력을 30% 확대할 계획",
+        mechanism=["capacity expansion"],
+        economic_scope=EconomicScope.COMPANY,
+        claim_subject="production capacity",
+        claim_predicate="planned expansion",
+        claim_horizon="2026",
+        claim_metric="capacity growth",
+    )
+
+    judgment = atomic_extraction_to_judgment(extraction, unit)
+
+    assert judgment.statement_type == StatementType.MANAGEMENT_CLAIM
+    assert judgment.strength == 0.5
+    assert judgment.forward_driver_type == ForwardDriverType.CAPACITY
+    assert judgment.dcf_links == [DcfLink.REVENUE, DcfLink.CAPEX]
+    assert any(str(metric.value) == "30" and metric.unit == "%" for metric in judgment.metrics)
+    assert judgment.period == "2026년"
 
 
 def _card(evidence_id: str, predicate: str, reliability: float = 0.8) -> EvidenceCard:

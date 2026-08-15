@@ -202,23 +202,25 @@ Python validator는 다음을 검사합니다.
 
 ### Pass 2: Hierarchical Summary
 
-Section summary는 evidence ID만 재조합합니다. 새로운 사실을 만들 수 없습니다. 대형 복합기업은 evidence의 `segment`를 유지한 뒤 segment MOAT를 revenue/EBIT exposure와 별도 결합해야 합니다.
+Section summary는 LLM을 다시 호출하지 않고 Python이 canonical fact와 evidence ID만 재조합합니다. positive/counter/KPI lane을 분리하며 새로운 사실을 만들 수 없습니다. 대형 복합기업은 evidence의 `segment`를 유지한 뒤 segment MOAT를 revenue/EBIT exposure와 별도 결합해야 합니다.
 
 ### Pass 3: Company Scoring
 
-최종 입력은 다음 3층입니다.
+최종 입력은 평소에는 compact claim pack만 사용하고, 충돌·낮은 신뢰도일 때 Evidence ID로 원문을 여는 progressive-disclosure 3층입니다.
 
 ```text
-L1 Structured Summary + Financial Snapshot
-L2 Evidence Cards + Counterevidence
-L3 selected raw chunks/tables
+L1 Python Financial Feature Vector
+L2 Factor-routed Canonical Claims + complete Counterevidence
+L3 Evidence ID -> RawQuote/selected raw chunks/tables (on demand)
 ```
 
 MOAT output은 0~10 점수, mechanism별 evidence ID, counterevidence, durability, confidence와 별도의 document coverage를 포함합니다. 점수가 양수인데 evidence mechanism이 없으면 schema가 거부합니다.
 
 ## 10. Token budget
 
-고정 char 제한 대신 실제 model context에서 prompt reserve를 뺀 token budget을 사용합니다. 현재 fallback token counter는 보수적 heuristic이며 production LLM의 tokenizer를 `TokenCounter`로 주입해야 합니다.
+고정 char 제한 대신 실제 model context에서 prompt reserve를 뺀 token budget을 사용합니다. API 요청은 readable compact JSON key와 task별 output cap을 사용하고 `input_tokens`, `output_tokens`, `cached_tokens`, `cache_write_tokens`를 기록합니다. 현재 atomic 정적 prefix는 GPT-5.6의 1,024-token cache 최소값보다 짧으므로 explicit-only/no-breakpoint로 불필요한 cache write를 막고, 동일 evidence는 로컬 replay cache로 재사용합니다. 현재 fallback token counter는 보수적 heuristic이며 production 계측은 Responses input-token-count endpoint와 실제 response usage를 기준으로 합니다.
+
+압축은 MOAT score/factor score 불변, claim Jaccard 1.0, counterevidence recall 1.0인 `compression-audit.json`을 통과해야 합니다. 숫자는 Python feature로 압축하고, 원문·자유 서술형 summary는 점수 입력에 중복 삽입하지 않습니다.
 
 `DynamicTokenBudgetAllocator`는 문서에 실제 존재하는 section role만 대상으로 minimum quota를 먼저 만족시키고, 남은 예산을 role weight, retrieval relevance, chunk cost로 배분합니다. 선택 후에는 document order로 되돌려 문맥을 유지합니다.
 

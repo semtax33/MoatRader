@@ -11,8 +11,7 @@ import pytest
 
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
-    AtomicEvidenceJudgment,
-    CanonicalClaimSignature,
+    AtomicEvidenceExtraction,
     CitedSummaryClaim,
     CoverageMetrics,
     Durability,
@@ -34,21 +33,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
     if request.task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
-        return AtomicEvidenceJudgment(
+        return AtomicEvidenceExtraction(
             is_investment_relevant=True,
             evidence_type=EvidenceType.SWITCHING_COST,
-            statement_type=StatementType.DISCLOSED_FACT,
             fact="The disclosure supports a repeatable customer relationship.",
             mechanism=["workflow integration", "switching friction"],
             direction=EvidenceDirection.MOAT_POSITIVE,
-            strength=0.7,
-            claim_signature=CanonicalClaimSignature(
-                moat_source=EvidenceType.SWITCHING_COST,
-                subject="customer workflow",
-                predicate="switching friction",
-                direction=EvidenceDirection.MOAT_POSITIVE,
-                horizon="LONG",
-            ),
+            claim_subject="customer workflow",
+            claim_predicate="switching friction",
+            claim_horizon="LONG",
         )
     if request.task == LLMTask.SECTION_SUMMARY:
         evidence_ids = list(request.metadata["evidence_ids"])
@@ -127,9 +120,16 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert (company_dir / "evidence-clusters.json").is_file()
     assert (company_dir / "claim-clusters.json").is_file()
     assert (company_dir / "metamorphic-audit.json").is_file()
+    assert (company_dir / "compression-audit.json").is_file()
+    assert (company_dir / "financial-feature-vector.json").is_file()
+    assert (company_dir / "financial-feature-vector.md").is_file()
+    assert (company_dir / "section-summary-manifest.json").is_file()
+    assert (company_dir / "llm-token-budget.json").is_file()
     assert (company_dir / "run-manifest.json").is_file()
     assert (company_dir / "dcf-assumptions.json").is_file()
     assert (company_dir / "dcf-manifest.json").is_file()
+    assert (company_dir / "valuation-summary.json").is_file()
+    assert (company_dir / "valuation-summary.md").is_file()
     raw_calls = list((company_dir / "llm-raw").glob("*.json"))
     assert raw_calls
     call_audit = [
@@ -139,6 +139,19 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     ]
     assert all(item.get("raw_response_sha256") for item in call_audit)
     assert all(Path(item["raw_response_path"]).is_file() for item in call_audit)
+    assert all(item["task"] == "LOCAL_EVIDENCE_EXTRACTION" for item in call_audit)
+    summary_manifest = json.loads(
+        (company_dir / "section-summary-manifest.json").read_text(encoding="utf-8")
+    )
+    assert summary_manifest["llm_calls_avoided"] == 1
+    assert summary_manifest["summaries"][0]["generator"] == "deterministic-python"
+    compression = json.loads((company_dir / "compression-audit.json").read_text(encoding="utf-8"))
+    assert compression["passed"] is True
+    assert compression["claim_jaccard"] == 1.0
+    assert compression["counterevidence_recall"] == 1.0
+    token_budget = json.loads((company_dir / "llm-token-budget.json").read_text(encoding="utf-8"))
+    assert token_budget["schema_token_reduction_fraction"] > 0.5
+    assert token_budget["estimated_schema_tokens_avoided"] > 0
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None

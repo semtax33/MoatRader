@@ -14,10 +14,10 @@
 - deterministic atomic segmentation → 항목별 LLM classification → validation/repair → reliability calibration
 - 원문용 evidence ID와 의미 dedupe용 canonical claim ID/set
 - SUPPORTS/WEAKENS/CONTRADICTS/UPDATES/DUPLICATES evidence relation
-- claim별 evidence citation을 강제하는 section summary → company dossier → 경제적 질문 BM25 retrieval
-- generated summary가 완전히 제외된 scoring dossier와 표시용 evidence pack, coverage 기록
+- canonical fact와 Evidence ID만 재조합하는 deterministic section summary → company dossier → 경제적 질문 BM25 retrieval
+- generated summary가 완전히 제외된 scoring dossier, factor별 compact claim pack, on-demand raw provenance, coverage 기록
 - OpenAI Responses API/Pydantic Structured Outputs transport, retry, usage audit, `store=false`
-- task별 모델 routing: 표시용 section summary는 `gpt-5-nano`, atomic evidence 분류는 pinned `gpt-5.6-luna`
+- compact Structured Outputs와 task별 cap을 쓰는 atomic evidence 분류: pinned `gpt-5.6-luna` (`gpt-5-nano`는 선택적 문장 요약용 예약 설정)
 - final-score LLM 호출이 없는 canonical claim Python reducer
 - LLM 비의존 Python unlevered DCF, assumptions hash/as-of manifest
 - 한 종목/복수 종목/전체 universe 실행, 병렬 처리, 회사별 실패 격리, chunk/section resume
@@ -28,6 +28,8 @@
 - LLM 제안값과 독립적인 deterministic mechanism score/durability/counterevidence penalty
 - 구조적 증거 생략을 삭제로 취급하지 않는 PIT evidence ledger와 supersede/retract 이력
 - shuffle/duplicate/summary/format/boilerplate/node-order metamorphic zero-tolerance gate
+- claim/factor score 불변 및 counterevidence recall 100%를 강제하는 compression-invariance gate
+- Python financial feature vector, provenance 포함 valuation summary, cached/cache-write token audit
 - evidence·claim Jaccard를 포함한 3~5종목 반복·인접시점 preflight 강제
 
 ## 외부 데이터가 반드시 보장해야 하는 것

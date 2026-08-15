@@ -4,7 +4,6 @@ import hashlib
 import inspect
 import json
 import traceback
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,8 +15,13 @@ from moatrader.adapters import RawDocument
 from moatrader.audit import RunManifest
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import CanonicalDocumentBundle, SectionNode, TableNode
-from moatrader.context import DynamicTokenBudgetAllocator, EvidencePackBuilder
+from moatrader.context import (
+    DynamicTokenBudgetAllocator,
+    EvidencePackBuilder,
+    build_financial_feature_vector,
+)
 from moatrader.evidence.models import (
+    AtomicEvidenceExtraction,
     AtomicEvidenceJudgment,
     CompanyDossier,
     CoverageMetrics,
@@ -38,9 +42,11 @@ from moatrader.evidence.validation import (
 )
 from moatrader.evidence.processing import (
     assign_canonical_claim_identity,
+    atomic_extraction_to_judgment,
     atomic_judgment_to_card,
     build_canonical_claim_set,
     build_evidence_relations,
+    build_evidence_preserving_summaries,
     build_forward_driver_cards,
     cluster_duplicate_evidence,
 )
@@ -79,12 +85,12 @@ from moatrader.runner.models import (
     UniverseRunResult,
 )
 from moatrader.runner.report import rank_run_result, ranking_csv, results_csv
-from moatrader.semantic import SemanticChunk, deduplicate_chunks
+from moatrader.semantic import HeuristicTokenCounter, SemanticChunk, deduplicate_chunks
 from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.7.0"
+RUNNER_VERSION = "0.8.0"
 
 
 class MoatUniverseRunner:
@@ -251,6 +257,9 @@ class MoatUniverseRunner:
             snapshot = self.snapshots.build(bundles, as_of=self.config.as_of)
             self.store.write_json(company_dir / "financial-snapshot.json", snapshot)
             self.store.write_text(company_dir / "financial-snapshot.md", snapshot.to_markdown())
+            feature_vector = build_financial_feature_vector(snapshot)
+            self.store.write_json(company_dir / "financial-feature-vector.json", feature_vector)
+            self.store.write_text(company_dir / "financial-feature-vector.md", feature_vector.markdown)
             dcf = self._calculate_dcf(company, company_dir, snapshot)
 
             dedup = deduplicate_chunks(chunks)
@@ -284,6 +293,52 @@ class MoatUniverseRunner:
                 for chunk in evidence_chunks
             ]
             self.store.write_jsonl(company_dir / "evidence-requests.jsonl", evidence_requests)
+            token_counter = HeuristicTokenCounter()
+            minimal_schema_json = json.dumps(
+                AtomicEvidenceExtraction.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            prior_schema_json = json.dumps(
+                AtomicEvidenceJudgment.model_json_schema(by_alias=False),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            minimal_schema_tokens = token_counter.count(minimal_schema_json)
+            prior_schema_tokens = token_counter.count(prior_schema_json)
+            token_budget_audit = {
+                "schema_version": "llm-token-budget/1",
+                "atomic_request_count": len(evidence_requests),
+                "estimated_atomic_input_tokens": sum(
+                    token_counter.count(
+                        request.system
+                        + request.user
+                        + json.dumps(
+                            request.response_schema,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                    for request in evidence_requests
+                ),
+                "minimal_atomic_schema_tokens": minimal_schema_tokens,
+                "prior_full_atomic_schema_tokens": prior_schema_tokens,
+                "schema_token_reduction_fraction": (
+                    max(0.0, 1.0 - minimal_schema_tokens / prior_schema_tokens)
+                    if prior_schema_tokens
+                    else 0.0
+                ),
+                "estimated_schema_tokens_avoided": max(
+                    0,
+                    (prior_schema_tokens - minimal_schema_tokens) * len(evidence_requests),
+                ),
+                "atomic_max_output_tokens": min(self.config.max_output_tokens, 2_000),
+                "exact_usage_source": "llm-calls.jsonl provider response usage",
+            }
+            self.store.write_json(company_dir / "llm-token-budget.json", token_budget_audit)
             if self.config.dry_run:
                 result = CompanyRunResult(
                     ticker=company.ticker,
@@ -379,7 +434,7 @@ class MoatUniverseRunner:
             )
 
             self._checkpoint(checkpoint_path, signature, "SUMMARIZING")
-            summaries = self._load_or_summarize(company_dir, evidence_chunks, cards, audits)
+            summaries = self._load_or_summarize(company_dir, evidence_chunks, claim_cards, audits)
             dossier = self._build_dossier(company, bundles, snapshot, cards, relations, summaries)
             if ledger_merge is not None:
                 dossier = dossier.model_copy(
@@ -426,7 +481,7 @@ class MoatUniverseRunner:
                 model_context_tokens=self.config.context_tokens,
                 prompt_reserve_tokens=self.config.prompt_reserve_tokens,
             ).allocate([], relevance={})
-            pack = self.pack_builder.build(scoring_dossier, snapshot, [])
+            pack = self.pack_builder.build(scoring_dossier, snapshot, [], claim_clusters)
             self.store.write_json(company_dir / "context-allocation.json", allocation)
             self.store.write_json(company_dir / "evidence-pack.json", pack)
             self.store.write_text(company_dir / "evidence-pack.md", pack.markdown)
@@ -454,24 +509,110 @@ class MoatUniverseRunner:
             )
             reducer_sha256 = hashlib.sha256(reducer_json.encode("utf-8")).hexdigest()
             self.store.write_json(company_dir / "moat-reducer-input.json", reducer_payload)
+            score_coverage = self._coverage(
+                bundles,
+                chunks,
+                selected_scoring_units,
+                total_evidence=len(structural_score_ids),
+                selected_evidence=len(scoring_dossier.evidence),
+            )
             if self.config.resume and score_path.is_file():
                 score = MoatScore.model_validate(self.store.read_json(score_path))
             else:
-                total_structural_evidence = len(structural_score_ids)
                 score = derive_moat_score(
                     None,
                     scoring_dossier.evidence,
                     issuer_id=dossier.issuer_id,
                     as_of=self.config.as_of.date(),
-                    document_coverage=self._coverage(
-                        bundles,
-                        chunks,
-                        selected_scoring_units,
-                        total_evidence=total_structural_evidence,
-                        selected_evidence=len(scoring_dossier.evidence),
-                    ),
+                    document_coverage=score_coverage,
                 )
                 self.store.write_json(score_path, score)
+
+            expected_claim_ids = {
+                card.claim_id for card in scoring_dossier.evidence if card.claim_id
+            }
+            packed_claim_ids = set(pack.claim_ids)
+            claim_union = expected_claim_ids | packed_claim_ids
+            claim_jaccard = (
+                len(expected_claim_ids & packed_claim_ids) / len(claim_union)
+                if claim_union
+                else 1.0
+            )
+            expected_counter_ids = {
+                card.evidence_id
+                for card in scoring_dossier.evidence
+                if card.direction == EvidenceDirection.MOAT_NEGATIVE
+            }
+            packed_counter_ids = set(pack.counterevidence_ids)
+            counter_recall = (
+                len(expected_counter_ids & packed_counter_ids) / len(expected_counter_ids)
+                if expected_counter_ids
+                else 1.0
+            )
+            compressed_cards = [
+                card
+                for card in scoring_dossier.evidence
+                if card.claim_id in packed_claim_ids
+            ]
+            compressed_score = derive_moat_score(
+                None,
+                compressed_cards,
+                issuer_id=dossier.issuer_id,
+                as_of=self.config.as_of.date(),
+                document_coverage=score_coverage,
+            )
+            score_delta = compressed_score.economic_moat_score - score.economic_moat_score
+            factor_scores = {
+                item.evidence_type.value: item.score for item in score.mechanisms
+            }
+            compressed_factor_scores = {
+                item.evidence_type.value: item.score for item in compressed_score.mechanisms
+            }
+            semantic_passed = (
+                claim_jaccard == 1.0
+                and counter_recall == 1.0
+                and score_delta == 0.0
+                and factor_scores == compressed_factor_scores
+            )
+            summary_manifest = self.store.read_json(company_dir / "section-summary-manifest.json")
+            token_budget_audit = self.store.read_json(company_dir / "llm-token-budget.json")
+            usage_so_far = self._sum_usage(audits)
+            compression_audit = {
+                "schema_version": "compression-invariance/1",
+                "passed": semantic_passed,
+                "claim_jaccard": claim_jaccard,
+                "counterevidence_recall": counter_recall,
+                "moat_score_delta": score_delta,
+                "factor_scores_equal": factor_scores == compressed_factor_scores,
+                "expected_claim_ids": sorted(expected_claim_ids),
+                "packed_claim_ids": sorted(packed_claim_ids),
+                "expected_counterevidence_ids": sorted(expected_counter_ids),
+                "packed_counterevidence_ids": sorted(packed_counter_ids),
+                "compact_pack_tokens_estimated": pack.token_count,
+                "expanded_context_tokens_estimated": pack.expanded_context_token_count,
+                "pack_token_reduction_fraction": pack.token_reduction_fraction,
+                "summary_llm_calls_avoided": summary_manifest["llm_calls_avoided"],
+                "summary_input_tokens_avoided_estimated": summary_manifest[
+                    "estimated_llm_input_tokens_avoided"
+                ],
+                "atomic_schema_token_reduction_fraction_estimated": token_budget_audit[
+                    "schema_token_reduction_fraction"
+                ],
+                "atomic_schema_tokens_avoided_estimated": token_budget_audit[
+                    "estimated_schema_tokens_avoided"
+                ],
+                "actual_llm_call_count": len(audits),
+                "replayed_llm_call_count": sum(audit.replayed for audit in audits),
+                "actual_input_tokens": usage_so_far.input_tokens,
+                "actual_output_tokens": usage_so_far.output_tokens,
+                "cached_input_tokens": usage_so_far.cached_input_tokens,
+                "cache_write_tokens": usage_so_far.cache_write_tokens,
+            }
+            self.store.write_json(company_dir / "compression-audit.json", compression_audit)
+            if not semantic_passed:
+                raise ValueError(
+                    "compression invariance gate failed: claims, factor scores, or counterevidence changed"
+                )
 
             metamorphic_audit = audit_company_metamorphs(
                 company_dir,
@@ -622,11 +763,11 @@ class MoatUniverseRunner:
                     judgment = candidate
             if judgment is None:
                 request = build_atomic_evidence_request(chunk, issuer_id=issuer_id)
-                judgment = self._execute_validated(
+                extraction = self._execute_validated(
                     request,
-                    AtomicEvidenceJudgment,
+                    AtomicEvidenceExtraction,
                     lambda value, c=chunk: self._validate_atomic_judgment(
-                        value,
+                        atomic_extraction_to_judgment(value, c),
                         c,
                         bundle_by_document[c.document_id],
                         issuer_id=issuer_id,
@@ -634,6 +775,7 @@ class MoatUniverseRunner:
                     audits,
                     company_dir,
                 )
+                judgment = atomic_extraction_to_judgment(extraction, chunk)
             self.store.write_json(checkpoint, judgment)
             if judgment.is_investment_relevant:
                 cards.append(
@@ -706,38 +848,69 @@ class MoatUniverseRunner:
         cards: list[EvidenceCard],
         audits: list[LLMCallAudit],
     ) -> list[SectionSummary]:
+        _ = audits
         path = company_dir / "section-summaries.json"
-        checkpoint_dir = company_dir / "section-summary-by-path"
         path_by_chunk = {chunk.chunk_id: chunk.section_path for chunk in chunks}
-        grouped: dict[tuple[str, ...], list[EvidenceCard]] = defaultdict(list)
-        if self.config.consolidate_section_summaries and cards:
-            grouped[("Selected MOAT evidence",)] = list(cards)
-        else:
-            for card in cards:
-                grouped[tuple(path_by_chunk.get(card.source_chunk_id, []))].append(card)
-        summaries: list[SectionSummary] = []
-        for path_tuple, section_cards in grouped.items():
-            allowed = {card.evidence_id for card in section_cards}
-            checkpoint = checkpoint_dir / f"{stable_id('SS', *path_tuple)}.json"
-            summary = None
-            if self.config.resume and checkpoint.is_file():
-                candidate = SectionSummary.model_validate(self.store.read_json(checkpoint))
-                if not self._validate_summary(candidate, list(path_tuple), allowed):
-                    summary = candidate
-            if summary is None:
-                request = build_section_summary_request(list(path_tuple), section_cards)
-                summary = self._execute_validated(
-                    request,
-                    SectionSummary,
-                    lambda value, path_value=list(path_tuple), ids=allowed: self._validate_summary(value, path_value, ids),
-                    audits,
-                    company_dir,
+        summaries = build_evidence_preserving_summaries(
+            cards,
+            section_path_by_chunk=path_by_chunk,
+            consolidate=self.config.consolidate_section_summaries,
+        )
+        self.store.write_json(path, summaries)
+
+        # Estimate the input eliminated by replacing the former generative
+        # summary pass. This is deliberately local and conservative; exact API
+        # usage remains sourced from provider response usage fields.
+        token_counter = HeuristicTokenCounter()
+        card_by_id = {card.evidence_id: card for card in cards}
+        manifest_items: list[dict[str, Any]] = []
+        estimated_avoided = 0
+        for summary in summaries:
+            evidence_ids = list(
+                dict.fromkeys(
+                    [*summary.positive_evidence_ids, *summary.negative_evidence_ids]
+                    + [
+                        evidence_id
+                        for claim in [
+                            *summary.key_mechanisms,
+                            *summary.key_kpis,
+                            *summary.uncertainties,
+                        ]
+                        for evidence_id in claim.evidence_ids
+                    ]
                 )
-            self.store.write_json(checkpoint, summary)
-            summaries.append(summary)
-            self.store.write_json(path, [item.model_dump(mode="json") for item in summaries])
-        if not grouped:
-            self.store.write_json(path, [])
+            )
+            section_cards = [card_by_id[item] for item in evidence_ids if item in card_by_id]
+            avoided = 0
+            if section_cards:
+                legacy_request = build_section_summary_request(summary.section_path, section_cards)
+                avoided = token_counter.count(
+                    legacy_request.system
+                    + legacy_request.user
+                    + json.dumps(legacy_request.response_schema, ensure_ascii=False, sort_keys=True)
+                )
+                estimated_avoided += avoided
+            manifest_items.append(
+                {
+                    "summary_id": stable_id("SS", *summary.section_path, *sorted(evidence_ids)),
+                    "summary_version": "canonical-evidence-summary/1",
+                    "as_of_date": self.config.as_of.date().isoformat(),
+                    "source_evidence_ids": sorted(evidence_ids),
+                    "prompt_version": None,
+                    "model_snapshot": None,
+                    "generator": "deterministic-python",
+                    "estimated_llm_input_tokens_avoided": avoided,
+                }
+            )
+        self.store.write_json(
+            company_dir / "section-summary-manifest.json",
+            {
+                "schema_version": "section-summary-manifest/1",
+                "llm_calls_avoided": len(summaries),
+                "estimated_llm_input_tokens_avoided": estimated_avoided,
+                "summaries": manifest_items,
+            },
+        )
         return summaries
 
     def _calculate_dcf(
@@ -815,6 +988,52 @@ class MoatUniverseRunner:
                 "financial_snapshot_series": [series.concept for series in snapshot.series],
             },
         )
+        value_fields = (
+            "base_revenue",
+            "revenue_growth",
+            "ebit_margin",
+            "tax_rate",
+            "depreciation_pct_revenue",
+            "capex_pct_revenue",
+            "nwc_pct_revenue",
+            "wacc",
+            "terminal_growth",
+            "net_debt",
+            "diluted_shares",
+        )
+        assumption_payload = assumptions.model_dump(mode="json")
+        valuation_items = [
+            {
+                "name": field,
+                "value": assumption_payload[field],
+                "assumption_type": assumptions.type_for(field).value,
+                "supporting_evidence_ids_or_source_refs": assumptions.assumption_sources.get(field, []),
+            }
+            for field in value_fields
+        ]
+        valuation_summary = {
+            "schema_version": "valuation-summary/1",
+            "as_of": self.config.as_of.isoformat(),
+            "calculation": "deterministic-python",
+            "items": valuation_items,
+        }
+        self.store.write_json(company_dir / "valuation-summary.json", valuation_summary)
+        valuation_lines = [
+            "# VALUATION SUMMARY",
+            f"as_of={self.config.as_of.isoformat()}",
+            "calculation=deterministic-python",
+            "format=ASSUMPTION|VALUE|TYPE|SOURCES",
+            "",
+            *[
+                f"{item['name']}|{item['value']}|{item['assumption_type']}|"
+                f"src={','.join(item['supporting_evidence_ids_or_source_refs'])}"
+                for item in valuation_items
+            ],
+        ]
+        self.store.write_text(
+            company_dir / "valuation-summary.md",
+            "\n".join(valuation_lines).rstrip() + "\n",
+        )
         self.store.write_json(company_dir / "dcf.json", dcf)
         return dcf
 
@@ -871,6 +1090,7 @@ class MoatUniverseRunner:
                     "model": result.model,
                     "provider": result.provider,
                     "response_id": result.response_id,
+                    "prompt_cache_key": current.prompt_cache_key,
                     "raw_output_text": raw_output,
                     "raw_response_sha256": raw_response_sha256,
                     "normalized_output": result.parsed,
@@ -891,6 +1111,7 @@ class MoatUniverseRunner:
                     raw_response_path=str(raw_path),
                     raw_response_sha256=raw_response_sha256,
                     normalized_output_sha256=normalized_output_sha256,
+                    prompt_cache_key=current.prompt_cache_key,
                     replayed=replayed,
                     replay_cache_key=replay_cache_key,
                 )
@@ -1227,10 +1448,14 @@ class MoatUniverseRunner:
             for builder in (
                 build_atomic_evidence_request,
                 build_section_summary_request,
+                build_evidence_preserving_summaries,
+                EvidencePackBuilder.build,
+                build_financial_feature_vector,
             )
         )
         schema_contract = json.dumps(
             {
+                "atomic_extraction": AtomicEvidenceExtraction.model_json_schema(),
                 "atomic_judgment": AtomicEvidenceJudgment.model_json_schema(),
                 "section_summary": SectionSummary.model_json_schema(),
                 "moat_score": MoatScore.model_json_schema(),
@@ -1299,6 +1524,7 @@ class MoatUniverseRunner:
             input_tokens=sum(audit.usage.input_tokens for audit in audits),
             output_tokens=sum(audit.usage.output_tokens for audit in audits),
             cached_input_tokens=sum(audit.usage.cached_input_tokens for audit in audits),
+            cache_write_tokens=sum(audit.usage.cache_write_tokens for audit in audits),
         )
 
     @staticmethod

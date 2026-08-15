@@ -8,7 +8,7 @@ DART, SEC EDGAR, IR처럼 포맷이 다른 금융 문서를 하나의 source-neu
 - AST는 사람이 읽는 문서 구조, `StructuredFact`는 DCF 등 계산용 숫자입니다.
 - 모든 AST node, fact, asset, evidence는 원문 위치까지 역추적할 수 있어야 합니다.
 - `available_at`은 timezone-aware 필수값이며 PIT(point-in-time) 필터에 사용합니다.
-- LLM은 구조 복원, DCF 산술, 최종 MOAT 채점을 하지 않습니다. 결정론적으로 분리된 atomic evidence 한 건을 고정 rubric으로 분류하고 표시용 요약만 만듭니다.
+- LLM은 구조 복원, DCF 산술, 요약문 생성, 최종 MOAT 채점을 하지 않습니다. 결정론적으로 분리된 atomic evidence 한 건만 고정 rubric으로 분류합니다.
 
 ## 현재 구현 범위
 
@@ -28,10 +28,11 @@ DART, SEC EDGAR, IR처럼 포맷이 다른 금융 문서를 하나의 source-neu
 - inline XBRL context/fact 추출
 - semantic chunking, 큰 표의 row-group chunking, cross-filing exact/near dedup과 숫자 변경 보존
 - 구조화 Markdown renderer
-- OpenAI Responses API Structured Outputs 기반 atomic evidence 분류/표시용 summary 실행, retry와 deterministic schema repair
+- OpenAI Responses API Structured Outputs 기반 atomic evidence 분류, compact response schema, retry와 deterministic schema repair
 - 근거 ID·node ID·숫자·인용문 validator와 atomic-key/section 단위 재개 체크포인트
 - evidence-level replay, canonical claim set과 경제적 질문별 BM25 검색
-- L1 summary / L2 evidence / L3 raw source의 Company Evidence Pack
+- Claim→Evidence ID→RawQuote 연결을 보존한 factor별 compact pack과 deterministic positive/counter summary
+- PIT financial snapshot에서 Python으로 만든 financial feature vector와 provenance 포함 valuation summary
 - PIT financial snapshot, Python 파생지표, deterministic unlevered DCF
 - MOAT·DCF 할인·신뢰도·coverage 기반 종목 필터/랭커
 - 단일/복수/전체 유니버스 병렬 실행과 종목별 실패 격리
@@ -238,7 +239,7 @@ foreach ($row in $dates) {
 python scripts\approve_moat_preflight.py @gateArgs
 ```
 
-두 번째 표본 실행은 experiment-scoped evidence-level cache를 사용하므로 동일 atomic evidence에 API 비용을 다시 쓰지 않습니다. 기본 승인 기준은 반복 점수 Spearman `1.0`, evidence Jaccard `1.0`, claim Jaccard `1.0`, 종목별 점수 차이 `0`, 인접 시점 Spearman `0.50`입니다. 각 baseline 회사는 sentence/paragraph shuffle, evidence duplicate, generated-summary 삽입, whitespace/heading 변경, 무관 boilerplate 삽입, node 순서 변경에 대해 atomic/claim Jaccard `1.0`과 점수 차이 `0`인 metamorphic gate도 통과해야 합니다. 모든 표본 점수가 같아 상관계수가 무의미해지는 것을 막기 위해 날짜별로 최소 2개 점수 수준과 전체 기간 중 최소 1개 positive-MOAT 종목도 요구합니다.
+두 번째 표본 실행은 experiment-scoped evidence-level cache를 사용하므로 동일 atomic evidence에 API 비용을 다시 쓰지 않습니다. 기본 승인 기준은 반복 점수 Spearman `1.0`, evidence Jaccard `1.0`, claim Jaccard `1.0`, 종목별 점수 차이 `0`, 인접 시점 Spearman `0.50`입니다. 각 baseline 회사는 sentence/paragraph shuffle, evidence duplicate, generated-summary 삽입, whitespace/heading 변경, 무관 boilerplate 삽입, node 순서 변경에 대해 atomic/claim Jaccard `1.0`과 점수 차이 `0`인 metamorphic gate도 통과해야 합니다. compact pack은 claim Jaccard `1.0`, factor score 차이 `0`, counterevidence recall `1.0`인 compression-invariance gate를 별도로 통과해야 합니다. 모든 표본 점수가 같아 상관계수가 무의미해지는 것을 막기 위해 날짜별로 최소 2개 점수 수준과 전체 기간 중 최소 1개 positive-MOAT 종목도 요구합니다.
 
 승인 후에만 전체 또는 shard 실행이 가능합니다. `--preflight-report`가 없거나 universe/date/model/reasoning/prompt 계약이 표본 실행과 다르면 실행 전에 실패합니다.
 
@@ -280,7 +281,7 @@ moatrader screen rank `
   --minimum-document-coverage 0.60
 ```
 
-LLM은 작업별로 라우팅됩니다. 표시용 섹션 요약은 `gpt-5-nano`, atomic MOAT evidence 분류는 실제 API ID인 `gpt-5.6-luna`를 사용합니다. `-latest` MOAT alias는 거부하며 모델 ID 변경 시 execution-contract hash가 바뀌어 preflight 전체를 다시 통과해야 합니다. 최종 MOAT와 DCF는 LLM을 호출하지 않고 Python reducer와 deterministic unlevered DCF 엔진으로 계산합니다.
+실행 경로의 LLM은 atomic MOAT evidence 분류에 실제 API ID인 `gpt-5.6-luna`를 사용합니다. 표시용 요약은 canonical claim에서 Python으로 만들며 `gpt-5-nano`는 향후 선택적 문장 요약용 설정으로만 남습니다. `-latest` MOAT alias는 거부하며 모델 ID 변경 시 execution-contract hash가 바뀌어 preflight 전체를 다시 통과해야 합니다. 최종 MOAT와 DCF는 LLM을 호출하지 않고 Python reducer와 deterministic unlevered DCF 엔진으로 계산합니다.
 
 ```powershell
 moatrader moat run `
@@ -362,8 +363,13 @@ moatrader ingest-html `
 bundle.json                 canonical source of truth
 document.md                 구조화 Markdown
 financial-snapshot.md       fact 기반 숫자/파생지표
+financial-feature-vector.md LLM용 결정론적 수치 압축
+valuation-summary.md        DCF 가정·유형·출처 압축
 chunks.jsonl                semantic chunks
 evidence-requests.jsonl     모델 독립적 LLM 요청 + response JSON Schema
+llm-token-budget.json       atomic schema/input 절감 추정과 output cap
+evidence-pack.md            factor별 canonical claim pack(원문은 Evidence ID로 조회)
+compression-audit.json      claim/score/counterevidence 불변성 및 토큰 계측
 context-allocation.json     token budget 선택 결과
 ```
 
@@ -386,8 +392,8 @@ python -m pytest -q
 3. parser retention/table/numeric 지표가 기준을 통과한 문서만 다음 단계로 보냅니다.
 4. 모든 원문 chunk를 결정론적 atomic evidence set으로 바꾸고 각 항목을 독립적으로 분류합니다.
 5. 원문 `evidence_id`와 canonical `claim_id`를 만들고 claim set으로 중복 제거합니다.
-6. 생성 요약을 judge context에서 격리하고 metamorphic gate를 통과시킵니다.
-7. Python claim reducer가 MOAT를, StructuredFact 기반 DCF 엔진이 공정가치를 계산합니다.
+6. Python이 factor별 compact claim pack과 positive/counter summary를 만들고 원문은 Evidence ID로 필요할 때만 조회합니다.
+7. compression-invariance 및 metamorphic gate를 통과시킨 뒤 Python claim reducer가 MOAT를, StructuredFact 기반 DCF 엔진이 공정가치를 계산합니다.
 8. 동일한 signal timestamp의 시장가격을 결합해 screening합니다.
 9. parser/model/prompt/input hash를 `RunManifest`로 남기고 PIT 백테스트합니다.
 

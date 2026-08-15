@@ -145,38 +145,62 @@ class CanonicalClaimSignature(ContractModel):
     scoring identity; evidence_id remains the source-span audit identity.
     """
 
-    model_config = ConfigDict(extra="ignore")
+    # The API-facing aliases keep the Structured Outputs schema compact while
+    # populate_by_name preserves the expanded internal/checkpoint contract.
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    moat_source: EvidenceType = EvidenceType.OTHER
+    moat_source: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
     subject: str = Field(default="company", min_length=1)
     predicate: str = Field(default="unspecified", min_length=1)
     direction: EvidenceDirection = EvidenceDirection.NEUTRAL
     horizon: str = "UNSPECIFIED"
     metric: str | None = None
-    value_bucket: str | None = None
+    value_bucket: str | None = Field(default=None, alias="bucket")
+
+
+class AtomicEvidenceExtraction(ContractModel):
+    """Minimal sufficient LLM output for one atomic source unit.
+
+    Numeric parsing, statement provenance, forward-driver routing, DCF links,
+    strength and final claim identity are deterministic Python responsibilities.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    is_investment_relevant: bool = Field(default=False, alias="relevant")
+    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
+    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
+    fact: str = "No investment-relevant evidence"
+    mechanism: list[str] = Field(default_factory=list)
+    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="scope")
+    segment: str | None = None
+    claim_subject: str = Field(default="company", alias="subject")
+    claim_predicate: str = Field(default="unspecified", alias="predicate")
+    claim_horizon: str | None = Field(default=None, alias="horizon")
+    claim_metric: str | None = Field(default=None, alias="metric")
 
 
 class AtomicEvidenceJudgment(ContractModel):
     """Classification of one deterministic, source-grounded atomic unit."""
 
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    is_investment_relevant: bool = False
-    evidence_type: EvidenceType = EvidenceType.OTHER
-    statement_type: StatementType = StatementType.MANAGEMENT_CLAIM
+    is_investment_relevant: bool = Field(default=False, alias="relevant")
+    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
+    statement_type: StatementType = Field(default=StatementType.MANAGEMENT_CLAIM, alias="stmt")
     fact: str = "No investment-relevant evidence"
     mechanism: list[str] = Field(default_factory=list)
     direction: EvidenceDirection = EvidenceDirection.NEUTRAL
     strength: float = Field(default=0.5, ge=0.0, le=1.0)
-    economic_scope: EconomicScope = EconomicScope.COMPANY
+    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="scope")
     segment: str | None = None
     metrics: list[EvidenceMetric] = Field(default_factory=list)
     unit: str | None = None
     period: str | None = None
-    forward_driver_type: ForwardDriverType | None = None
-    dcf_links: list[DcfLink] = Field(default_factory=list)
-    forecast_horizon: str | None = None
-    claim_signature: CanonicalClaimSignature | None = None
+    forward_driver_type: ForwardDriverType | None = Field(default=None, alias="driver")
+    dcf_links: list[DcfLink] = Field(default_factory=list, alias="dcf")
+    forecast_horizon: str | None = Field(default=None, alias="horizon")
+    claim_signature: CanonicalClaimSignature | None = Field(default=None, alias="claim")
 
 
 class EvidenceCard(ContractModel):

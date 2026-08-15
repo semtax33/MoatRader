@@ -16,7 +16,7 @@
 | 23~28 local evidence extraction/validation | 완료 | Structured Outputs, source-only prompt, node/numeric/quote validation, retry/repair | human review queue 미구현 |
 | 29 canonical evidence dedup | 완료 | `evidence-clusters.json`에 canonical/supporting IDs를 보존하고 scoring dossier에는 canonical evidence만 반영 | 대표 corpus로 threshold calibration 필요 |
 | 30 supports/contradicts/weakens/updates | 완료 | 다섯 typed relation을 deterministic similarity/direction/numeric rules로 생성 | semantic calibration corpus 필요 |
-| 31~32 section hierarchical summary/citations | 완료 | positive/negative IDs와 mechanism/KPI/uncertainty claim별 evidence ID allowlist를 검증 | human calibration 필요 |
+| 31~32 section hierarchical summary/citations | 완료 | LLM 재요약 없이 canonical fact를 positive/negative/KPI lane으로 분리하고 모든 claim에 evidence ID 유지 | human calibration 필요 |
 | 33 company dossier | 완료 | `CompanyDossier`와 internal-reference validation | 없음 |
 | 34 segment preservation/weighted score | 부분 | evidence `segment` 보존 | segment별 MOAT와 revenue/EBIT 가중 aggregation 미구현 |
 | 35~36 economic-question retrieval | 완료 | 7개 MOAT 질문과 BM25/strength/reliability ranking | embedding hybrid는 선택적 후속 |
@@ -30,7 +30,7 @@
 | 56 JSON 관계 저장, Graph DB 회피 | 완료 | JSON/JSONL 관계와 artifact store | 없음 |
 | 57 원문/AST/Markdown 디버깅 화면 | 미구현 | 파일 artifact는 각각 생성됨 | 3-pane linked viewer 필요 |
 | 58 golden document set | 미구현 | 합성/샘플 fixtures만 존재 | 표·깨진 HTML·대형 복합기업 실제 corpus 필요 |
-| 59 대형문서 구조적 압축 | 완료 | cross-filing dedup, question retrieval, evidence pruning, token allocation | 대형 실제 corpus 성능 calibration 필요 |
+| 59 대형문서 구조적 압축 | 완료 | cross-filing/claim dedup, factor별 compact pack, on-demand raw lookup, numeric feature vector, delta replay, compression-invariance gate | 대형 실제 corpus 토큰·성능 calibration 필요 |
 | DART/SEC API 수집/rate-limit/revision | 완료 | OpenDART/SEC 공식 API collector, immutable versions, safe PIT policy | scheduler/queue/monitoring은 서비스 계층 과제 |
 
 ## 이번 검토에서 새로 발견해 반영한 항목

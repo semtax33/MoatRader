@@ -78,6 +78,7 @@ class LLMCallAudit(ContractModel):
     raw_response_path: str | None = None
     raw_response_sha256: str | None = None
     normalized_output_sha256: str | None = None
+    prompt_cache_key: str | None = None
     replayed: bool = False
     replay_cache_key: str | None = None
 

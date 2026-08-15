@@ -48,6 +48,7 @@ class TransportUsage(ContractModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cached_input_tokens: int = Field(default=0, ge=0)
+    cache_write_tokens: int = Field(default=0, ge=0)
 
 
 class TransportResult(ContractModel, Generic[ResponseT]):
@@ -116,13 +117,14 @@ class OpenAIResponsesTransport:
                     from openai.lib._pydantic import to_strict_json_schema
                 except ImportError as exc:
                     raise RuntimeError("installed OpenAI SDK cannot build a strict response schema") from exc
-                response = self.client.responses.create(
+                create_kwargs: dict[str, Any] = dict(
                     model=request_model,
                     input=[
                         {"role": "system", "content": request.system},
                         {"role": "user", "content": request.user},
                     ],
                     text={
+                        "verbosity": "low",
                         "format": {
                             "type": "json_schema",
                             "name": response_model.__name__,
@@ -133,9 +135,19 @@ class OpenAIResponsesTransport:
                         }
                     },
                     reasoning={"effort": self._effort_for(request.task)},
-                    max_output_tokens=self.max_output_tokens,
+                    max_output_tokens=self._max_output_tokens_for(request.task),
                     store=False,
                 )
+                if request.prompt_cache_key:
+                    create_kwargs["prompt_cache_key"] = request.prompt_cache_key
+                if request_model.startswith("gpt-5.6"):
+                    # The stable atomic instruction block is below GPT-5.6's
+                    # 1,024-token cache minimum. Explicit-only mode with no
+                    # breakpoint prevents a cache write for every changing
+                    # source unit; exact unchanged units use the local replay
+                    # cache instead.
+                    create_kwargs["prompt_cache_options"] = {"mode": "explicit"}
+                response = self.client.responses.create(**create_kwargs)
                 output_text = str(getattr(response, "output_text", "") or "")
                 if not output_text:
                     refusal = self._refusal_text(response)
@@ -164,6 +176,7 @@ class OpenAIResponsesTransport:
                         input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
                         output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
                         cached_input_tokens=int(getattr(input_details, "cached_tokens", 0) or 0),
+                        cache_write_tokens=int(getattr(input_details, "cache_write_tokens", 0) or 0),
                     ),
                 )
             except Exception as exc:  # SDK exceptions are optional at import time.
@@ -361,6 +374,16 @@ class OpenAIResponsesTransport:
         if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
+
+    def _max_output_tokens_for(self, task: LLMTask) -> int:
+        # Atomic classification is one source unit and should never consume a
+        # company-level answer budget. Caps prevent malformed verbose outputs
+        # while the configured global maximum remains a compatibility ceiling.
+        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+            return min(self.max_output_tokens, 2_000)
+        if task == LLMTask.SECTION_SUMMARY:
+            return min(self.max_output_tokens, 3_000)
+        return min(self.max_output_tokens, 4_000)
 
     @staticmethod
     def _retryable(exc: Exception) -> bool:

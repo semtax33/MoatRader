@@ -123,6 +123,29 @@ def _metamorphic_audit(result: UniverseRunResult) -> tuple[dict[str, Any], list[
     return reports, failures
 
 
+def _compression_audit(result: UniverseRunResult) -> tuple[dict[str, Any], list[str]]:
+    reports: dict[str, Any] = {}
+    failures: list[str] = []
+    for company in result.companies:
+        path = Path(company.artifact_directory) / "compression-audit.json"
+        if not path.is_file():
+            failures.append(f"{company.ticker}: missing compression audit")
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        reports[company.ticker] = payload
+        if (
+            payload.get("passed") is not True
+            or payload.get("claim_jaccard") != 1.0
+            or payload.get("counterevidence_recall") != 1.0
+            or payload.get("moat_score_delta") != 0.0
+            or payload.get("factor_scores_equal") is not True
+        ):
+            failures.append(
+                f"{company.ticker}: compression changed claims, counterevidence, or score"
+            )
+    return reports, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Approve a 3..5-company repeated-run and adjacent-date MOAT preflight before a large run."
@@ -172,6 +195,7 @@ def main() -> int:
     replay_total = 0
     replay_hits = 0
     metamorphic_reports: dict[str, Any] = {}
+    compression_reports: dict[str, Any] = {}
     for date in dates:
         report = compare_runs(
             baselines[date],
@@ -200,6 +224,14 @@ def main() -> int:
         date_metamorphic, metamorphic_failures = _metamorphic_audit(baselines[date])
         metamorphic_reports[date] = date_metamorphic
         failures.extend(f"{date}: {failure}" for failure in metamorphic_failures)
+        baseline_compression, baseline_compression_failures = _compression_audit(baselines[date])
+        candidate_compression, candidate_compression_failures = _compression_audit(candidates[date])
+        compression_reports[date] = {
+            "baseline": baseline_compression,
+            "candidate": candidate_compression,
+        }
+        failures.extend(f"{date}: baseline {failure}" for failure in baseline_compression_failures)
+        failures.extend(f"{date}: candidate {failure}" for failure in candidate_compression_failures)
         baseline_scores = [
             float(company.moat_score.economic_moat_score)
             for company in baselines[date].companies
@@ -269,6 +301,7 @@ def main() -> int:
         "candidate_replay_hits": replay_hits,
         "repeatability": repeat_reports,
         "metamorphic": metamorphic_reports,
+        "compression_invariance": compression_reports,
         "adjacent_stability": adjacent_reports,
         "inputs": {
             "universe_sha256": hashlib.sha256((workspace / "inputs" / "universe.csv").read_bytes()).hexdigest(),

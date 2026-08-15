@@ -596,7 +596,7 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument(
         "--summary-model",
         default=os.getenv("MOATRADER_SUMMARY_MODEL", "gpt-5-nano"),
-        help="model for sentence/section summaries only (default: gpt-5-nano)",
+        help="model reserved for optional generative sentence summaries (default path uses deterministic summaries)",
     )
     moat_run.add_argument(
         "--moat-model",
@@ -645,7 +645,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--consolidate-section-summaries",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="summarize all selected evidence cards in one company-level section-summary call",
+        help="group deterministic evidence-preserving summaries at company level",
     )
     moat_run.add_argument("--workers", type=int, default=1)
     moat_run.add_argument("--validation-attempts", type=int, default=2)

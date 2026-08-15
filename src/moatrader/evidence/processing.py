@@ -2,24 +2,30 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import defaultdict
 from difflib import SequenceMatcher
 
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
+    AtomicEvidenceExtraction,
     AtomicEvidenceJudgment,
     DcfLink,
     CanonicalClaimSignature,
     ClaimCluster,
+    CitedSummaryClaim,
     EconomicScope,
     EvidenceCard,
     EvidenceCluster,
     EvidenceDirection,
+    EvidenceMetric,
     EvidenceRelation,
     EvidenceRelationType,
     EvidenceType,
     ForwardDriverCard,
     ForwardDriverType,
+    SectionSummary,
+    STRUCTURAL_MOAT_TYPES,
 )
 from moatrader.semantic.chunker import SemanticChunk
 
@@ -37,6 +43,35 @@ _RECURRING_CATEGORY_RE = re.compile(
 _RETENTION_RE = re.compile(
     r"고객\s*(?:유지|이탈률|재구매율)|갱신률|renewal|retention|churn|switching|전환\s*비용",
     re.IGNORECASE,
+)
+_FORWARD_LANGUAGE_RE = re.compile(
+    r"전망|계획|예상|기대|목표|가이던스|추정|will|expect|plan|target|forecast|guidance",
+    re.IGNORECASE,
+)
+_ATOMIC_METRIC_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?P<value>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?P<unit>%p|pp|%|억원|백만원|천원|원|달러|USD|KRW|개월|년|배)?",
+    re.IGNORECASE,
+)
+_ATOMIC_PERIOD_RE = re.compile(
+    r"(?:20\d{2}\s*년(?:\s*\d{1,2}\s*월)?|"
+    r"20\d{2}(?:[./-]\d{1,2}(?:[./-]\d{1,2})?)?|"
+    r"(?:향후|최근)\s*\d+\s*(?:년|개월)|"
+    r"\d+\s*[~-]\s*\d+\s*(?:년|개월))",
+    re.IGNORECASE,
+)
+_FORWARD_DRIVER_RULES: tuple[tuple[ForwardDriverType, re.Pattern[str], tuple[DcfLink, ...]], ...] = (
+    (ForwardDriverType.UTILIZATION, re.compile(r"가동률|capacity\s+utili[sz]ation", re.I), (DcfLink.REVENUE, DcfLink.CAPEX)),
+    (ForwardDriverType.CAPACITY, re.compile(r"생산능력|CAPA|production\s+capacity", re.I), (DcfLink.REVENUE, DcfLink.CAPEX)),
+    (ForwardDriverType.ASP, re.compile(r"ASP|평균\s*판매\s*가격|판매단가", re.I), (DcfLink.REVENUE, DcfLink.EBIT_MARGIN)),
+    (ForwardDriverType.EXPORT_MIX, re.compile(r"수출\s*(?:비중|믹스)|export\s+mix", re.I), (DcfLink.REVENUE, DcfLink.EBIT_MARGIN)),
+    (ForwardDriverType.PRODUCT_MIX, re.compile(r"제품\s*믹스|product\s+mix", re.I), (DcfLink.REVENUE, DcfLink.EBIT_MARGIN)),
+    (ForwardDriverType.RAW_MATERIAL_COST, re.compile(r"원재료|raw\s+material|input\s+cost", re.I), (DcfLink.EBIT_MARGIN,)),
+    (ForwardDriverType.WORKING_CAPITAL, re.compile(r"운전\s*자본|working\s+capital", re.I), (DcfLink.NWC,)),
+    (ForwardDriverType.CAPEX, re.compile(r"CAPEX|설비\s*투자|자본적\s*지출", re.I), (DcfLink.CAPEX, DcfLink.DEPRECIATION)),
+    (ForwardDriverType.MARGIN, re.compile(r"마진|이익률|margin", re.I), (DcfLink.EBIT_MARGIN,)),
+    (ForwardDriverType.VOLUME, re.compile(r"판매량|출하량|생산량|volume|shipments?", re.I), (DcfLink.REVENUE,)),
+    (ForwardDriverType.MARKET_GROWTH, _DEMAND_RE, (DcfLink.REVENUE,)),
 )
 
 
@@ -83,6 +118,84 @@ def calibrate_card_reliability(card: EvidenceCard) -> EvidenceCard:
     # self-confidence. Using the model-proposed value made identical evidence
     # affect the public score differently between executions.
     return card.model_copy(update={"reliability": round(max(0.0, cap), 2)})
+
+
+def atomic_extraction_to_judgment(
+    extraction: AtomicEvidenceExtraction,
+    chunk: SemanticChunk,
+) -> AtomicEvidenceJudgment:
+    """Deterministically enrich the minimal LLM classification from source text."""
+
+    text = chunk.markdown
+    source_type = chunk.source_refs[0].source_type if chunk.source_refs else SourceType.OTHER
+    if source_type == SourceType.ANALYST:
+        statement_type = StatementType.ANALYST_INTERPRETATION
+    elif source_type == SourceType.INDUSTRY:
+        statement_type = StatementType.INDUSTRY_INTERPRETATION
+    elif _FORWARD_LANGUAGE_RE.search(text):
+        statement_type = (
+            StatementType.MANAGEMENT_CLAIM
+            if source_type in {SourceType.DART, SourceType.SEC_EDGAR, SourceType.IR}
+            else StatementType.FORECAST
+        )
+    else:
+        statement_type = StatementType.DISCLOSED_FACT
+
+    metrics: list[EvidenceMetric] = []
+    for match in _ATOMIC_METRIC_RE.finditer(text):
+        value = match.group("value")
+        unit = match.group("unit")
+        try:
+            calendar_year = int(value.replace(",", ""))
+        except ValueError:
+            calendar_year = -1
+        if unit in {None, "년"} and 1900 <= calendar_year <= 2100:
+            continue
+        metrics.append(
+            EvidenceMetric(
+                name=f"source_numeric_{len(metrics) + 1}",
+                value=value,
+                unit=unit,
+            )
+        )
+        if len(metrics) >= 8:
+            break
+    periods = list(dict.fromkeys(match.group(0).strip() for match in _ATOMIC_PERIOD_RE.finditer(text)))
+    period = "; ".join(periods[:4]) or None
+    forward_driver_type = None
+    dcf_links: list[DcfLink] = []
+    for driver, pattern, links in _FORWARD_DRIVER_RULES:
+        if pattern.search(text):
+            forward_driver_type = driver
+            dcf_links = list(links)
+            break
+    claim = CanonicalClaimSignature(
+        moat_source=extraction.evidence_type,
+        subject=extraction.claim_subject or "company",
+        predicate=extraction.claim_predicate or "unspecified",
+        direction=extraction.direction,
+        horizon=(extraction.claim_horizon or period or "UNSPECIFIED"),
+        metric=extraction.claim_metric,
+    )
+    return AtomicEvidenceJudgment(
+        is_investment_relevant=extraction.is_investment_relevant,
+        evidence_type=extraction.evidence_type,
+        statement_type=statement_type,
+        fact=extraction.fact,
+        mechanism=extraction.mechanism,
+        direction=extraction.direction,
+        # Strength is not a model opinion and is not used in public scoring.
+        strength=0.5,
+        economic_scope=extraction.economic_scope,
+        segment=extraction.segment,
+        metrics=metrics,
+        unit=next((metric.unit for metric in metrics if metric.unit), None),
+        period=period,
+        forward_driver_type=forward_driver_type,
+        dcf_links=dcf_links,
+        forecast_horizon=extraction.claim_horizon,
+        claim_signature=claim,
+    )
 
 
 def grounded_evidence_id(card: EvidenceCard, chunk: SemanticChunk) -> str:
@@ -188,12 +301,20 @@ def assign_canonical_claim_identity(card: EvidenceCard, *, issuer_id: str | None
         metric=(
             _canonical_slot(proposed.metric, "unspecified")
             if proposed and proposed.metric
-            else (_canonical_slot(card.metrics[0].name, "unspecified") if card.metrics else None)
+            else (
+                None
+                if proposed is not None
+                else (_canonical_slot(card.metrics[0].name, "unspecified") if card.metrics else None)
+            )
         ),
         value_bucket=(
             _canonical_slot(proposed.value_bucket, "unspecified")
             if proposed and proposed.value_bucket
-            else _metric_value_bucket(card)
+            else (
+                _metric_value_bucket(card)
+                if proposed is None or proposed.metric is not None
+                else None
+            )
         ),
     )
     claim_id = stable_id(
@@ -310,6 +431,61 @@ def build_forward_driver_cards(cards: list[EvidenceCard]) -> list[ForwardDriverC
             )
         )
     return result
+
+
+def build_evidence_preserving_summaries(
+    cards: list[EvidenceCard],
+    *,
+    section_path_by_chunk: dict[str, list[str]],
+    consolidate: bool,
+) -> list[SectionSummary]:
+    """Create display summaries without a second generative interpretation.
+
+    Every line is an existing canonical fact attached to one Evidence ID.
+    Positive, counter, and KPI/context lanes remain separate, so compression
+    cannot erase adverse evidence or count a quote and its summary twice.
+    """
+
+    grouped: dict[tuple[str, ...], list[EvidenceCard]] = defaultdict(list)
+    if consolidate and cards:
+        grouped[("Selected MOAT evidence",)] = list(cards)
+    else:
+        for card in cards:
+            grouped[tuple(section_path_by_chunk.get(card.source_chunk_id, []))].append(card)
+    summaries: list[SectionSummary] = []
+    for path, values in sorted(grouped.items()):
+        ordered = sorted(values, key=lambda item: (item.claim_id or "", item.evidence_id))
+        positive = [item for item in ordered if item.direction == EvidenceDirection.MOAT_POSITIVE]
+        negative = [item for item in ordered if item.direction == EvidenceDirection.MOAT_NEGATIVE]
+        mechanisms = [
+            CitedSummaryClaim(text=item.fact, evidence_ids=[item.evidence_id])
+            for item in positive
+            if item.evidence_type in STRUCTURAL_MOAT_TYPES
+        ]
+        kpis = [
+            CitedSummaryClaim(text=item.fact, evidence_ids=[item.evidence_id])
+            for item in ordered
+            if item.direction != EvidenceDirection.MOAT_NEGATIVE
+            and not (
+                item.direction == EvidenceDirection.MOAT_POSITIVE
+                and item.evidence_type in STRUCTURAL_MOAT_TYPES
+            )
+        ]
+        uncertainties = [
+            CitedSummaryClaim(text=item.fact, evidence_ids=[item.evidence_id])
+            for item in negative
+        ]
+        summaries.append(
+            SectionSummary(
+                section_path=list(path),
+                positive_evidence_ids=[item.evidence_id for item in positive],
+                negative_evidence_ids=[item.evidence_id for item in negative],
+                key_mechanisms=mechanisms,
+                key_kpis=kpis,
+                uncertainties=uncertainties,
+            )
+        )
+    return summaries
 
 
 def build_evidence_relations(

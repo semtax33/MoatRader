@@ -9,7 +9,7 @@ from moatrader.runner.models import UniverseRunConfig
 from moatrader.evidence.atomic import ATOMIC_RUBRIC_VERSION, ATOMIC_SEGMENTATION_VERSION
 
 
-PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/2"
+PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/3"
 EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
@@ -46,6 +46,9 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["atomic_rubric_version"] = ATOMIC_RUBRIC_VERSION
     contract["scoring_reducer_version"] = "canonical-claim-reducer/1"
     contract["generated_summary_in_judge_context"] = False
+    contract["section_summary_generator"] = "deterministic-python"
+    contract["compact_factor_pack_version"] = "compact-factor-pack/1"
+    contract["compression_invariance_gate_required"] = True
     contract["metamorphic_gate_required"] = True
     contract["moat_model_snapshot_policy"] = "EXACT_ID_NO_LATEST_ALIAS"
     return contract
