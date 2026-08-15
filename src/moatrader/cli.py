@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -42,6 +43,32 @@ from moatrader.runner.report import rank_run_result, ranking_csv
 from moatrader.runstore import RunStore
 from moatrader.screening import SelectorConfig
 from moatrader.universe import load_universe_manifest
+
+
+def _preflight_universe_tickers(
+    workspace_manifest: Path | None,
+    fallback_tickers: list[str],
+) -> list[str]:
+    """Return the experiment universe, including companies with no PIT filing.
+
+    Date manifests intentionally omit companies for which no source document was
+    available.  The preflight approval, however, covers the original experiment
+    universe so the final signal panel can retain those companies as
+    ``NO_PIT_DOCUMENT`` rows.
+    """
+
+    if workspace_manifest is None:
+        return fallback_tickers
+    universe_path = workspace_manifest.parent / "inputs" / "universe.csv"
+    if not universe_path.is_file():
+        return fallback_tickers
+    with universe_path.open("r", encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    tickers = [
+        str(row.get("stock_code") or row.get("ticker") or "").strip().zfill(6)
+        for row in rows
+    ]
+    return [ticker for ticker in tickers if ticker] or fallback_tickers
 
 
 def _ingest(args: argparse.Namespace) -> int:
@@ -316,7 +343,10 @@ def _moat_run(args: argparse.Namespace) -> int:
             )
         validate_preflight_approval(
             approval_path,
-            universe_tickers=(company.ticker for company in manifest.companies),
+            universe_tickers=_preflight_universe_tickers(
+                workspace_manifest,
+                [company.ticker for company in manifest.companies],
+            ),
             as_of_date=config.as_of.date().isoformat(),
             config=config,
             runner_version=RUNNER_VERSION,

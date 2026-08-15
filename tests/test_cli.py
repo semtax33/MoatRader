@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from moatrader.cli import _identifier_values, main
+from moatrader.cli import _identifier_values, _preflight_universe_tickers, main
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +98,24 @@ def test_identifier_files_support_large_comma_or_newline_universes(tmp_path: Pat
     path.write_text("AAPL, MSFT\n# comment\nNVDA # leader\nAAPL\n", encoding="utf-8")
 
     assert _identifier_values(["GOOG"], [str(path)]) == ["GOOG", "AAPL", "MSFT", "NVDA"]
+
+
+def test_preflight_uses_original_workspace_universe_when_a_date_has_no_pit_document(
+    tmp_path: Path,
+) -> None:
+    workspace_manifest = tmp_path / "workspace-manifest.json"
+    workspace_manifest.write_text("{}", encoding="utf-8")
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "universe.csv").write_text(
+        "stock_code,name\n005930,Samsung\n094800,No PIT filing\n",
+        encoding="utf-8",
+    )
+
+    assert _preflight_universe_tickers(workspace_manifest, ["005930"]) == [
+        "005930",
+        "094800",
+    ]
 
 
 def test_large_manifest_is_blocked_without_preflight_report(tmp_path: Path, capsys: object) -> None:

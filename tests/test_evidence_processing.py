@@ -200,6 +200,26 @@ def test_validation_drops_only_an_ungrounded_numeric_metric() -> None:
     assert result.cards[0].metrics == []
 
 
+def test_validation_accepts_grounded_decimal_followed_by_source_punctuation() -> None:
+    card = _card("E1", "The contract date is 2013.12", EvidenceDirection.NEUTRAL)
+    card.raw_quote = "Contract date: 2013.12."
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Contract date: 2013.12.",
+        token_count=4,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
 def test_validation_rejects_a_card_without_verbatim_grounding() -> None:
     card = _card("E1", "Paraphrased claim.", EvidenceDirection.MOAT_POSITIVE)
     card.raw_quote = "Text that is not present"

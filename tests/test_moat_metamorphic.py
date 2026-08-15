@@ -7,6 +7,7 @@ from moatrader.canonical.models import SectionRole, SourceRef, SourceType, State
 from moatrader.evidence.atomic import (
     build_atomic_evidence_units,
     select_atomic_evidence_units,
+    split_atomic_evidence_text,
 )
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
@@ -19,6 +20,7 @@ from moatrader.evidence.models import (
     ForwardDriverType,
 )
 from moatrader.evidence.processing import atomic_extraction_to_judgment, build_canonical_claim_set
+from moatrader.evidence.metamorphic import _is_reducer_input
 from moatrader.evidence.validation import derive_moat_score
 from moatrader.llm.contracts import build_atomic_evidence_request
 from moatrader.llm.replay import LLMReplayCache
@@ -84,6 +86,30 @@ def test_atomic_evidence_set_ignores_order_duplicate_summary_and_formatting() ->
     assert _selected_keys(formatted) == expected
     assert _selected_keys([summary, *baseline]) == expected
     assert _selected_keys([*baseline, boilerplate]) == expected
+
+
+def test_atomic_split_is_idempotent_for_long_single_cell_dart_table() -> None:
+    sentences = [
+        f"계약 고객은 통합 시스템을 사용하며 전환에는 검증 비용이 발생합니다. 문장 {index}"
+        for index in range(40)
+    ]
+    markdown = "| Column 1 |\n|---|\n| " + "<br><br>".join(sentences) + " |"
+
+    first = split_atomic_evidence_text(markdown)
+    rebuilt = "\n\n".join(reversed(first))
+    second = split_atomic_evidence_text(rebuilt)
+
+    assert len(first) > 1
+    assert set(second) == set(first)
+
+
+def test_atomic_split_preserves_short_relational_table_row() -> None:
+    markdown = "| 고객 | 계약기간 | 갱신율 |\n|---|---:|---:|\n| A사 | 5년 | 93% |"
+
+    assert split_atomic_evidence_text(markdown) == [
+        "A사 | 5년 | 93%",
+        "고객 | 계약기간 | 갱신율",
+    ]
 
 
 def test_atomic_replay_identity_uses_evidence_key_not_full_prompt(tmp_path) -> None:
@@ -240,3 +266,15 @@ def test_claim_set_and_python_reducer_are_commutative_associative_idempotent() -
             for item in scores[0].mechanisms
         )
     }
+
+
+def test_metamorphic_reducer_contract_keeps_out_of_scope_negative_claims() -> None:
+    negative = _card("E-NEG", "industry regulation pressure")
+    negative.direction = EvidenceDirection.MOAT_NEGATIVE
+    negative.economic_scope = EconomicScope.INDUSTRY
+    neutral = _card("E-NEUTRAL", "industry context")
+    neutral.direction = EvidenceDirection.NEUTRAL
+    neutral.economic_scope = EconomicScope.INDUSTRY
+
+    assert _is_reducer_input(negative) is True
+    assert _is_reducer_input(neutral) is False

@@ -607,6 +607,35 @@ def _direct_rows(table: etree._Element) -> list[etree._Element]:
     return [row for row in table.iterdescendants() if _tag(row) == "tr" and _nearest_table(row) is table]
 
 
+def _recent_standalone_table_unit(events: list[BlockEvent]) -> UnitSpec | None:
+    """Find a nearby DART unit-marker table without crossing a heading.
+
+    DART sometimes emits ``(단위 : 원)`` as its own one-cell table, followed
+    by a short caption and multiple related financial tables.  A completed
+    data table is not a safe generic unit source, but the explicit standalone
+    marker remains valid for the small local block.
+    """
+
+    for event in reversed(events[-8:]):
+        if event.event_type == "HEADING":
+            break
+        if event.event_type != "TABLE":
+            continue
+        table: TableNode = event.payload
+        has_numeric = any(
+            cell.numeric_value is not None
+            for row in table.rows
+            for cell in row.cells
+        )
+        if (
+            not has_numeric
+            and table.unit is not None
+            and _UNIT_RE.search(table.normalized_text)
+        ):
+            return table.unit
+    return None
+
+
 def _dart_primary_statement_info(
     element: etree._Element,
 ) -> tuple[str, ConsolidationScope] | None:
@@ -941,7 +970,24 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
     prior_table_unit = None
     if state.events and state.events[-1].event_type == "TABLE":
         prior_table_unit = getattr(state.events[-1].payload, "unit", None)
-    unit = _unit_from_text(header_text) or _unit_from_text(context_text) or prior_table_unit
+    nearby_financial_context = bool(
+        re.search(
+            r"요약[^\n]{0,20}재무|재무[^\n]{0,20}정보|재무상태표|손익계산서|포괄손익|현금흐름표|자본변동표|financial\s+statements?",
+            "\n".join([context_text, header_text]),
+            re.IGNORECASE,
+        )
+    )
+    standalone_marker_unit = (
+        _recent_standalone_table_unit(state.events)
+        if nearby_financial_context
+        else None
+    )
+    unit = (
+        _unit_from_text(header_text)
+        or _unit_from_text(context_text)
+        or prior_table_unit
+        or standalone_marker_unit
+    )
     caption_elements = [child for child in element if _tag(child) == "caption"]
     caption = _inline_text(caption_elements[0]) if caption_elements else None
     if not caption:

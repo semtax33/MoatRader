@@ -197,6 +197,28 @@ def test_immediately_preceding_financial_table_unit_is_inherited() -> None:
     assert tables[-1].unit.canonical == "KRW_MILLION"
 
 
+def test_standalone_dart_unit_marker_survives_captions_and_related_financial_tables() -> None:
+    bundle = build_dart_bundle(
+        """<DOCUMENT><BODY>
+        <TABLE><TR><TD>(단위 : 원)</TD></TR></TABLE>
+        <P>가. 요약연결재무정보</P>
+        <TABLE><TR><TH>과목</TH><TH>제25기 3분기말</TH></TR>
+        <TR><TD>자산총계</TD><TD>70,277,930,552</TD></TR></TABLE>
+        <P>나. 요약별도재무정보</P>
+        <TABLE><TR><TH>과목</TH><TH>제25기 3분기말</TH></TR>
+        <TR><TD>자산총계</TD><TD>69,279,119,425</TD></TR></TABLE>
+        </BODY></DOCUMENT>"""
+    )
+
+    data_tables = [
+        node
+        for node in bundle.ast.walk()
+        if isinstance(node, TableNode) and "자산총계" in node.normalized_text
+    ]
+    assert len(data_tables) == 2
+    assert {table.unit.canonical for table in data_tables if table.unit is not None} == {"KRW"}
+
+
 def test_document_reporting_period_fills_relative_fiscal_header() -> None:
     bundle = build_dart_bundle(
         """<DOCUMENT><BODY><TABLE>

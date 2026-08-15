@@ -15,7 +15,6 @@ from moatrader.evidence.atomic import (
 )
 from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
-    EconomicScope,
     EvidenceCard,
     EvidenceDirection,
     STRUCTURAL_MOAT_TYPES,
@@ -26,6 +25,20 @@ from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 
 METAMORPHIC_SCHEMA_VERSION = "moatrader-moat-metamorphic/1"
+
+
+def _is_reducer_input(card: EvidenceCard) -> bool:
+    """Mirror the production reducer input contract exactly.
+
+    All negative claims remain in the audited canonical claim set even when
+    their scope prevents them from affecting the public score.  The reducer
+    itself applies that scoring-scope rule.
+    """
+
+    return card.direction == EvidenceDirection.MOAT_NEGATIVE or (
+        card.direction == EvidenceDirection.MOAT_POSITIVE
+        and card.evidence_type in STRUCTURAL_MOAT_TYPES
+    )
 
 
 def _read_jsonl(path: Path, model: type[SemanticChunk] | type[EvidenceCard]) -> list[object]:
@@ -143,18 +156,7 @@ def audit_company_metamorphs(
         for path in (directory / "atomic-judgment-by-key").glob("*.json")
     }
     baseline_score = json.loads((directory / "moat-score.json").read_text(encoding="utf-8-sig"))
-    scoring_cards = [
-        card
-        for card in claim_cards
-        if (
-            card.direction == EvidenceDirection.MOAT_NEGATIVE
-            or (
-                card.direction == EvidenceDirection.MOAT_POSITIVE
-                and card.evidence_type in STRUCTURAL_MOAT_TYPES
-            )
-        )
-        and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
-    ]
+    scoring_cards = [card for card in claim_cards if _is_reducer_input(card)]
     as_of = baseline_score["as_of"]
     baseline_claim_ids = set(baseline_score.get("canonical_claim_ids") or [])
     baseline_evidence_ids = {
@@ -211,16 +213,7 @@ def audit_company_metamorphs(
             issuer_id=issuer_id,
         )
         transformed_scoring = [
-            card
-            for card in transformed_claims
-            if (
-                card.direction == EvidenceDirection.MOAT_NEGATIVE
-                or (
-                    card.direction == EvidenceDirection.MOAT_POSITIVE
-                    and card.evidence_type in STRUCTURAL_MOAT_TYPES
-                )
-            )
-            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+            card for card in transformed_claims if _is_reducer_input(card)
         ]
         transformed_score = derive_moat_score(
             None,

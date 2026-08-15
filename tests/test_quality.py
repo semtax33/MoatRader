@@ -104,3 +104,22 @@ def test_quality_gate_recognizes_statement_specific_korean_heading() -> None:
     assessment = assess_parser_quality(bundle)
 
     assert any("column-header mapping" in failure for failure in assessment.failures)
+
+
+def test_dart_summary_financial_table_preserves_unknown_source_omitted_unit() -> None:
+    bundle = build_dart_bundle(
+        "<html><body><h1>1. 요약재무정보</h1><table>"
+        "<tr><th>과목</th><th>제25기 3분기말</th><th>제24기말</th></tr>"
+        "<tr><td>자산총계</td><td>70,277,930,552</td><td>74,421,441,480</td></tr>"
+        "<tr><td>부채총계</td><td>19,399,346,522</td><td>19,904,477,492</td></tr>"
+        "</table></body></html>",
+        period_end="2025-09-30",
+    )
+
+    assessment = assess_parser_quality(bundle)
+
+    assert assessment.passed is True
+    assert any(
+        "preserves unknown unit because the source section omits unit context" in warning
+        for warning in assessment.warnings
+    )

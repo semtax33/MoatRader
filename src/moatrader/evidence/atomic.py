@@ -10,10 +10,11 @@ from moatrader.canonical.models import SectionRole, SourceRef, SourceType
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 
-ATOMIC_SEGMENTATION_VERSION = "atomic-evidence/1"
+ATOMIC_SEGMENTATION_VERSION = "atomic-evidence/2"
 ATOMIC_RUBRIC_VERSION = "structural-moat-rubric/3"
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+")
 _LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 _TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$")
@@ -49,6 +50,7 @@ def normalize_atomic_text(value: str) -> str:
 
     text = unicodedata.normalize("NFKC", value)
     text = _HTML_COMMENT_RE.sub(" ", text)
+    text = _HTML_BREAK_RE.sub(" ", text)
     text = _HEADING_RE.sub("", text)
     text = _LIST_PREFIX_RE.sub("", text)
     text = text.replace("\u00a0", " ")
@@ -60,6 +62,42 @@ def _bounded_fragments(value: str, maximum_words: int = 180) -> list[str]:
     if len(words) <= maximum_words:
         return [value]
     return [" ".join(words[index : index + maximum_words]) for index in range(0, len(words), maximum_words)]
+
+
+def _prose_fragments(value: str) -> list[str]:
+    """Return sentence-bounded units that are stable when parsed again."""
+
+    normalized_value = normalize_atomic_text(value)
+    fragments: list[str] = []
+    for sentence in _SENTENCE_BOUNDARY_RE.split(normalized_value):
+        normalized_sentence = normalize_atomic_text(sentence)
+        if normalized_sentence:
+            fragments.extend(_bounded_fragments(normalized_sentence))
+    return fragments
+
+
+def _table_fragments(cells: list[str], maximum_words: int = 180) -> list[str]:
+    """Keep ordinary rows intact and canonically split narrative table cells.
+
+    DART commonly stores entire note paragraphs in a one-cell HTML table with
+    ``<br>`` separators.  Treating those paragraphs as one table row made the
+    first segmentation differ from a rebuild of the same atomic text.  Short
+    relational rows remain rows; long narrative rows are atomized per cell so
+    every emitted unit is safe to feed back through the splitter.
+    """
+
+    content_cells = [normalize_atomic_text(cell) for cell in cells]
+    content_cells = [cell for cell in content_cells if cell]
+    if not content_cells:
+        return []
+    row = " | ".join(content_cells)
+    if len(content_cells) > 1 and len(row.split()) <= maximum_words:
+        return [row]
+    return [
+        fragment
+        for cell in content_cells
+        for fragment in _prose_fragments(cell)
+    ]
 
 
 def split_atomic_evidence_text(markdown: str) -> list[str]:
@@ -77,12 +115,9 @@ def split_atomic_evidence_text(markdown: str) -> list[str]:
     def flush_paragraph() -> None:
         if not paragraph:
             return
-        value = normalize_atomic_text(" ".join(paragraph))
+        value = " ".join(paragraph)
         paragraph.clear()
-        for sentence in _SENTENCE_BOUNDARY_RE.split(value):
-            normalized = normalize_atomic_text(sentence)
-            if normalized:
-                candidates.extend(_bounded_fragments(normalized))
+        candidates.extend(_prose_fragments(value))
 
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
@@ -94,10 +129,7 @@ def split_atomic_evidence_text(markdown: str) -> list[str]:
             continue
         if "|" in line:
             flush_paragraph()
-            cells = [normalize_atomic_text(cell) for cell in line.strip("|").split("|")]
-            row = " | ".join(cell for cell in cells if cell)
-            if row:
-                candidates.extend(_bounded_fragments(row))
+            candidates.extend(_table_fragments(line.strip("|").split("|")))
             continue
         paragraph.append(_LIST_PREFIX_RE.sub("", line))
     flush_paragraph()

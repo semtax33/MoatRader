@@ -29,7 +29,11 @@ def _number_tokens(value: str) -> set[str]:
         suffix_match = re.search(r"(%|배|개|명|원|년|월|일)$", token)
         suffix = suffix_match.group(1) if suffix_match else ""
         number = token[: -len(suffix)] if suffix else token
-        candidate = number.replace(",", "")
+        # The source token regex intentionally accepts decimal separators, but
+        # that also captures sentence/table punctuation after a number (for
+        # example ``2013.12.``).  Strip only trailing punctuation so an exact
+        # grounded decimal/date can compare with a claim ending at the number.
+        candidate = number.rstrip(".,").replace(",", "")
         try:
             normalized = format(Decimal(candidate), "f")
             if "." in normalized:
