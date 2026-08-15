@@ -261,7 +261,16 @@ class OpenAIResponsesTransport:
                 if len(matches) == 1:
                     card["source_chunk_id"] = matches[0]
             card.setdefault("evidence_id", f"pending-{index}")
-            if card.get("fact") and isinstance(card.get("node_ids"), list) and card["node_ids"]:
+            source_chunk_id = card.get("source_chunk_id")
+            has_grounded_source = isinstance(source_chunk_id, str) and (
+                not isinstance(nodes_by_chunk, dict) or source_chunk_id in nodes_by_chunk
+            )
+            if (
+                card.get("fact")
+                and isinstance(card.get("node_ids"), list)
+                and card["node_ids"]
+                and (isinstance(single_chunk_id, str) or has_grounded_source)
+            ):
                 normalized_cards.append(card)
         payload["cards"] = normalized_cards
         return payload

@@ -139,6 +139,24 @@ def test_evidence_metric_ignores_repaired_json_fragment_keys() -> None:
     assert metric.value == 8780
 
 
+def test_evidence_metric_unwraps_provider_scalar_objects() -> None:
+    metric = EvidenceMetric.model_validate(
+        {"name": "fiscal_year", "value": {"type": "number", "value": 2024}}
+    )
+
+    assert metric.value == 2024
+
+
+def test_forward_driver_type_unwraps_provider_containers() -> None:
+    payload = _card("E1", "Capacity will increase.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+
+    for wrapped in (["CAPACITY"], {"ForwardDriverType": "CAPACITY"}):
+        payload["forward_driver_type"] = wrapped
+        card = EvidenceCard.model_validate(payload)
+
+        assert card.forward_driver_type == ForwardDriverType.CAPACITY
+
+
 def test_empty_card_confidence_fields_use_neutral_defaults() -> None:
     payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
     payload["strength"] = ""
@@ -183,6 +201,20 @@ def test_malformed_metric_string_fragments_are_dropped() -> None:
 
     assert len(card.metrics) == 1
     assert card.metrics[0].name == "revenue"
+
+    payload["metrics"] = ""
+    assert EvidenceCard.model_validate(payload).metrics == []
+
+
+def test_evidence_type_and_dcf_links_normalize_provider_containers() -> None:
+    payload = _card("E1", "Grounded fact.", EvidenceDirection.NEUTRAL).model_dump(mode="json")
+    payload["evidence_type"] = ["FORECAST", "DERIVED_METRIC"]
+    payload["dcf_links"] = {"items": [{"name": "REVENUE"}, {"type": "OTHER"}]}
+
+    card = EvidenceCard.model_validate(payload)
+
+    assert card.evidence_type == EvidenceType.OTHER
+    assert card.dcf_links == [DcfLink.REVENUE]
 
 
 def test_empty_mechanism_values_are_normalized_to_empty_list() -> None:

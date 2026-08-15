@@ -199,6 +199,35 @@ def test_openai_transport_flattens_list_wrapped_evidence_batch() -> None:
     assert result.cards[0].source_chunk_id == "C1"
 
 
+def test_openai_transport_drops_an_ungrounded_batch_card() -> None:
+    from moatrader.evidence.models import EvidenceBatchExtractionResult
+
+    request = LLMRequest(
+        task=LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+        system="system",
+        user="user",
+        response_schema=EvidenceBatchExtractionResult.model_json_schema(),
+        input_sha256="0" * 64,
+        metadata={"node_ids_by_chunk": {"C1": ["N1"]}},
+    )
+    payload = {
+        "cards": [
+            {
+                "evidence_id": "E1",
+                "node_ids": ["UNKNOWN_NODE"],
+                "fact": "Cannot be grounded to a requested chunk.",
+            }
+        ]
+    }
+
+    normalized = OpenAIResponsesTransport._normalize_grounding_fields(
+        request, EvidenceBatchExtractionResult, payload
+    )
+    result = EvidenceBatchExtractionResult.model_validate(normalized)
+
+    assert result.cards == []
+
+
 def test_openai_transport_treats_blank_evidence_payload_as_no_cards() -> None:
     from moatrader.evidence.models import EvidenceBatchExtractionResult
 

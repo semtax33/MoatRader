@@ -94,12 +94,16 @@ def main() -> int:
                 usage[key] += int(value or 0)
     if invalid_lines or len(response_ids) != len(set(response_ids)):
         raise RuntimeError("LLM audit log integrity failed")
-    if tasks["FINAL_MOAT_SCORING"] != 596 or models["gpt-5.6-luna"] != 596:
+    status_counts = Counter(row["status"] for row in rows)
+    expected_moat_calls = status_counts["COMPLETE"]
+    if (
+        tasks["FINAL_MOAT_SCORING"] != expected_moat_calls
+        or models["gpt-5.6-luna"] != expected_moat_calls
+    ):
         raise RuntimeError("MOAT model audit count mismatch")
     if set(models) != {"gpt-5-nano-2025-08-07", "gpt-5.6-luna"}:
         raise RuntimeError(f"unexpected model IDs: {sorted(models)}")
 
-    status_counts = Counter(row["status"] for row in rows)
     eligible_counts = Counter(row["date"] for row in rows if row["signal_eligible"] == "1")
     audit = {
         "schema_version": "moatrader-kr-signal-audit/1",

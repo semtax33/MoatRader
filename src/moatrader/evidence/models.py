@@ -82,6 +82,33 @@ class EvidenceMetric(ContractModel):
     value: Decimal | str
     unit: str | None = None
 
+    @field_validator("value", mode="before")
+    @classmethod
+    def unwrap_scalar_value(cls, value: object) -> object:
+        """Recover provider wrappers while keeping metric values scalar."""
+        candidate = value
+        for _ in range(3):
+            if isinstance(candidate, list):
+                if len(candidate) != 1:
+                    return value
+                candidate = candidate[0]
+                continue
+            if isinstance(candidate, dict):
+                nested = next(
+                    (
+                        candidate[key]
+                        for key in ("value", "decimal", "number", "amount")
+                        if key in candidate
+                    ),
+                    None,
+                )
+                if nested is None:
+                    return value
+                candidate = nested
+                continue
+            break
+        return candidate
+
 
 class EvidenceCard(ContractModel):
     # Provider models occasionally add harmless presentation-only fields such
@@ -114,7 +141,7 @@ class EvidenceCard(ContractModel):
     @field_validator("metrics", mode="before")
     @classmethod
     def null_metrics_are_empty(cls, value: object) -> object:
-        if value is None:
+        if value is None or value == "" or value == {}:
             return []
         if isinstance(value, list):
             return [
@@ -153,6 +180,10 @@ class EvidenceCard(ContractModel):
     @field_validator("evidence_type", mode="before")
     @classmethod
     def unknown_evidence_type_is_other(cls, value: object) -> object:
+        if isinstance(value, list):
+            if len(value) != 1:
+                return EvidenceType.OTHER
+            value = value[0]
         if isinstance(value, str):
             normalized = value.strip().upper()
             if normalized not in {item.value for item in EvidenceType}:
@@ -237,27 +268,73 @@ class EvidenceCard(ContractModel):
     def normalize_forward_driver_type(cls, value: object) -> object:
         if value is None or value == "":
             return None
-        if isinstance(value, str):
-            normalized = value.strip().upper().replace(" ", "_")
+        candidate = value
+        for _ in range(3):
+            if isinstance(candidate, list):
+                if len(candidate) != 1:
+                    return None
+                candidate = candidate[0]
+                continue
+            if isinstance(candidate, dict):
+                nested = next(
+                    (
+                        candidate[key]
+                        for key in (
+                            "forward_driver_type",
+                            "ForwardDriverType",
+                            "driver_type",
+                            "value",
+                        )
+                        if key in candidate
+                    ),
+                    None,
+                )
+                if nested is None:
+                    return None
+                candidate = nested
+                continue
+            break
+        if isinstance(candidate, str):
+            normalized = candidate.strip().upper().replace(" ", "_")
             if normalized not in {item.value for item in ForwardDriverType}:
                 return None
             return normalized
-        return value
+        return None
 
     @field_validator("dcf_links", mode="before")
     @classmethod
     def normalize_dcf_links(cls, value: object) -> object:
         if value is None or value == "":
             return []
+        if isinstance(value, dict):
+            value = next(
+                (
+                    value[key]
+                    for key in ("dcf_links", "items", "values")
+                    if isinstance(value.get(key), list)
+                ),
+                [],
+            )
         if not isinstance(value, list):
-            return value
+            return []
         allowed = {item.value for item in DcfLink}
-        return [
-            normalized
-            for item in value
-            if isinstance(item, str)
-            and (normalized := item.strip().upper().replace(" ", "_")) in allowed
-        ]
+        normalized_links = []
+        for item in value:
+            if isinstance(item, dict):
+                item = next(
+                    (
+                        item[key]
+                        for key in ("dcf_link", "name", "value", "type")
+                        if isinstance(item.get(key), str)
+                    ),
+                    None,
+                )
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip().upper().replace(" ", "_")
+            if normalized in allowed:
+                normalized_links.append(normalized)
+        return normalized_links
 
 
 class ForwardDriverCard(ContractModel):
