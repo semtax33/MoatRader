@@ -154,7 +154,7 @@ class SemanticChunker:
                 markdown = self.renderer.render_node(node)
                 if not markdown:
                     continue
-                yield _Atom(
+                atom = _Atom(
                     node_ids=[node.node_id],
                     section_path=node.section_path,
                     section_role=role,
@@ -162,11 +162,56 @@ class SemanticChunker:
                     markdown=markdown,
                     source_refs=node.source_refs,
                 )
+                yield from self._bounded_text_atom(atom)
 
         yield from descend(bundle.ast.children)
 
+    def _bounded_text_atom(self, atom: _Atom) -> Iterable[_Atom]:
+        if self.tokens.count(atom.markdown) <= self.max_tokens:
+            yield atom
+            return
+        prefix = ""
+        content = atom.markdown
+        if content.startswith("<!--") and "-->\n" in content:
+            marker_end = content.index("-->\n") + len("-->\n")
+            prefix, content = content[:marker_end], content[marker_end:]
+        start = 0
+        while start < len(content):
+            low, high = start + 1, len(content)
+            best = start
+            while low <= high:
+                end = (low + high) // 2
+                rendered = prefix + content[start:end]
+                if self.tokens.count(rendered) <= self.max_tokens:
+                    best = end
+                    low = end + 1
+                else:
+                    high = end - 1
+            if best == start:
+                yield atom
+                return
+            if best < len(content):
+                line_break = content.rfind("\n", start + 1, best)
+                word_break = content.rfind(" ", start + 1, best)
+                boundary = max(line_break, word_break)
+                if boundary > start + (best - start) // 2:
+                    best = boundary + 1
+            yield _Atom(
+                node_ids=atom.node_ids,
+                section_path=atom.section_path,
+                section_role=atom.section_role,
+                chunk_type=f"{atom.chunk_type}_fragment",
+                markdown=prefix + content[start:best],
+                source_refs=atom.source_refs,
+                metadata={"text_fragment_start": start, "text_fragment_end": best},
+            )
+            start = best
+
     def _table_atoms(self, table: TableNode, role: SectionRole | None) -> Iterable[_Atom]:
-        full = self.renderer.render_table(table)
+        # Notes remain first-class AST nodes and are chunked independently. Repeating
+        # every attached footnote in every table slice can make otherwise tiny slices
+        # exceed the token budget and duplicates evidence in the LLM context.
+        full = self.renderer.render_table(table, include_footnotes=False)
         if self.tokens.count(full) <= self.max_tokens:
             yield _Atom(
                 node_ids=[table.node_id],
@@ -181,14 +226,14 @@ class SemanticChunker:
         group: list[TableRow] = []
         for row in body:
             candidate = [*group, row]
-            rendered = self.renderer.render_table(table, rows=candidate)
+            rendered = self.renderer.render_table(table, rows=candidate, include_footnotes=False)
             if group and self.tokens.count(rendered) > self.max_tokens:
-                yield self._table_slice(table, role, group)
+                yield from self._bounded_table_slices(table, role, group)
                 group = [row]
             else:
                 group = candidate
         if group:
-            yield self._table_slice(table, role, group)
+            yield from self._bounded_table_slices(table, role, group)
         elif not body:
             yield _Atom(
                 node_ids=[table.node_id],
@@ -199,13 +244,210 @@ class SemanticChunker:
                 source_refs=table.source_refs,
             )
 
-    def _table_slice(self, table: TableNode, role: SectionRole | None, rows: list[TableRow]) -> _Atom:
+    def _bounded_table_slices(
+        self,
+        table: TableNode,
+        role: SectionRole | None,
+        rows: list[TableRow],
+    ) -> Iterable[_Atom]:
+        rendered = self.renderer.render_table(table, rows=rows, include_footnotes=False)
+        if self.tokens.count(rendered) <= self.max_tokens:
+            yield self._table_slice(table, role, rows)
+            return
+        if len(rows) > 1:
+            for row in rows:
+                yield from self._bounded_table_slices(table, role, [row])
+            return
+
+        width = len(rows[0].cells)
+        if width <= 1:
+            yield from self._single_cell_slices(table, role, rows[0])
+            return
+        key_columns = [0]
+        current = list(key_columns)
+        for column in range(1, width):
+            single_column_text = self.renderer.render_table(
+                table,
+                rows=rows,
+                columns=[*key_columns, column],
+                include_footnotes=False,
+            )
+            if self.tokens.count(single_column_text) > self.max_tokens:
+                if len(current) > len(key_columns):
+                    yield self._table_slice(table, role, rows, columns=current)
+                yield from self._long_table_cell_slices(
+                    table,
+                    role,
+                    rows[0],
+                    key_columns=key_columns,
+                    target_column=column,
+                )
+                current = list(key_columns)
+                continue
+            candidate = [*current, column]
+            candidate_text = self.renderer.render_table(
+                table,
+                rows=rows,
+                columns=candidate,
+                include_footnotes=False,
+            )
+            if len(current) > len(key_columns) and self.tokens.count(candidate_text) > self.max_tokens:
+                yield self._table_slice(table, role, rows, columns=current)
+                current = [*key_columns, column]
+            else:
+                current = candidate
+        if current:
+            if len(current) > len(key_columns):
+                yield self._table_slice(table, role, rows, columns=current)
+
+    def _long_table_cell_slices(
+        self,
+        table: TableNode,
+        role: SectionRole | None,
+        row: TableRow,
+        *,
+        key_columns: list[int],
+        target_column: int,
+    ) -> Iterable[_Atom]:
+        text = row.cells[target_column].normalized_text
+        start = 0
+        while start < len(text):
+            low, high = start + 1, len(text)
+            best = start
+            while low <= high:
+                end = (low + high) // 2
+                fragment_cell = row.cells[target_column].model_copy(
+                    update={"raw_text": text[start:end], "normalized_text": text[start:end]}
+                )
+                fragment_cells = list(row.cells)
+                fragment_cells[target_column] = fragment_cell
+                fragment_row = row.model_copy(update={"cells": fragment_cells})
+                rendered = self.renderer.render_table(
+                    table,
+                    rows=[fragment_row],
+                    columns=[*key_columns, target_column],
+                    include_footnotes=False,
+                )
+                if self.tokens.count(rendered) <= self.max_tokens:
+                    best = end
+                    low = end + 1
+                else:
+                    high = end - 1
+            if best == start:
+                yield self._table_slice(
+                    table,
+                    role,
+                    [row],
+                    columns=[*key_columns, target_column],
+                )
+                return
+            if best < len(text):
+                line_break = text.rfind("\n", start + 1, best)
+                word_break = text.rfind(" ", start + 1, best)
+                boundary = max(line_break, word_break)
+                if boundary > start + (best - start) // 2:
+                    best = boundary + 1
+            fragment_cell = row.cells[target_column].model_copy(
+                update={"raw_text": text[start:best], "normalized_text": text[start:best]}
+            )
+            fragment_cells = list(row.cells)
+            fragment_cells[target_column] = fragment_cell
+            fragment_row = row.model_copy(update={"cells": fragment_cells})
+            yield self._table_slice(
+                table,
+                role,
+                [fragment_row],
+                columns=[*key_columns, target_column],
+                chunk_type="table_cell_fragment",
+                metadata_extra={
+                    "cell_column": target_column,
+                    "cell_fragment_start": start,
+                    "cell_fragment_end": best,
+                },
+            )
+            start = best
+
+    def _single_cell_slices(
+        self,
+        table: TableNode,
+        role: SectionRole | None,
+        row: TableRow,
+    ) -> Iterable[_Atom]:
+        text = row.cells[0].normalized_text
+        start = 0
+        while start < len(text):
+            low, high = start + 1, len(text)
+            best = start
+            while low <= high:
+                end = (low + high) // 2
+                fragment_cell = row.cells[0].model_copy(
+                    update={"raw_text": text[start:end], "normalized_text": text[start:end]}
+                )
+                fragment_row = row.model_copy(update={"cells": [fragment_cell]})
+                rendered = self.renderer.render_table(
+                    table,
+                    rows=[fragment_row],
+                    columns=[0],
+                    include_footnotes=False,
+                )
+                if self.tokens.count(rendered) <= self.max_tokens:
+                    best = end
+                    low = end + 1
+                else:
+                    high = end - 1
+            if best == start:
+                yield self._table_slice(table, role, [row])
+                return
+            if best < len(text):
+                line_break = text.rfind("\n", start + 1, best)
+                word_break = text.rfind(" ", start + 1, best)
+                boundary = max(line_break, word_break)
+                if boundary > start + (best - start) // 2:
+                    best = boundary + 1
+            fragment_cell = row.cells[0].model_copy(
+                update={"raw_text": text[start:best], "normalized_text": text[start:best]}
+            )
+            fragment_row = row.model_copy(update={"cells": [fragment_cell]})
+            yield self._table_slice(
+                table,
+                role,
+                [fragment_row],
+                columns=[0],
+                chunk_type="table_cell_fragment",
+                metadata_extra={"cell_fragment_start": start, "cell_fragment_end": best},
+            )
+            start = best
+
+    def _table_slice(
+        self,
+        table: TableNode,
+        role: SectionRole | None,
+        rows: list[TableRow],
+        *,
+        columns: list[int] | None = None,
+        chunk_type: str | None = None,
+        metadata_extra: dict[str, Any] | None = None,
+    ) -> _Atom:
+        metadata: dict[str, Any] = {
+            "table_id": table.node_id,
+            "row_start": rows[0].index,
+            "row_end": rows[-1].index,
+        }
+        if columns is not None:
+            metadata["column_indices"] = columns
+        if metadata_extra:
+            metadata.update(metadata_extra)
         return _Atom(
             node_ids=[table.node_id],
             section_path=table.section_path,
             section_role=role,
-            chunk_type="table_slice",
-            markdown=self.renderer.render_table(table, rows=rows),
+            chunk_type=chunk_type or ("table_column_slice" if columns is not None else "table_slice"),
+            markdown=self.renderer.render_table(
+                table,
+                rows=rows,
+                columns=columns,
+                include_footnotes=False,
+            ),
             source_refs=table.source_refs,
-            metadata={"table_id": table.node_id, "row_start": rows[0].index, "row_end": rows[-1].index},
+            metadata=metadata,
         )

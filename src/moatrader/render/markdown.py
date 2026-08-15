@@ -81,6 +81,8 @@ class CanonicalMarkdownRenderer:
                 f"- Tables: {bundle.quality.ast_table_count}/{bundle.quality.raw_table_count}",
                 f"- Numeric cells: {bundle.quality.numeric_cell_count}/{bundle.quality.raw_numeric_cell_count}",
                 f"- Numeric retention: {self._ratio(bundle.quality.numeric_retention)}",
+                f"- Structured facts: {bundle.quality.structured_fact_count}/{bundle.quality.raw_structured_fact_count}",
+                f"- Structured fact retention: {self._ratio(bundle.quality.structured_fact_retention)}",
                 f"- Paragraphs: {bundle.quality.paragraph_count}",
                 f"- Headings: {bundle.quality.heading_count}",
                 f"- Unknown blocks: {bundle.quality.unknown_block_count}",
@@ -131,7 +133,14 @@ class CanonicalMarkdownRenderer:
                 lines.extend([rendered, ""])
         return "\n".join(lines).rstrip()
 
-    def render_table(self, table: TableNode, *, rows: Iterable[TableRow] | None = None) -> str:
+    def render_table(
+        self,
+        table: TableNode,
+        *,
+        rows: Iterable[TableRow] | None = None,
+        columns: Iterable[int] | None = None,
+        include_footnotes: bool = True,
+    ) -> str:
         selected_rows = list(rows) if rows is not None else table.rows[table.header_row_count :]
         title = table.caption or "Table"
         heading = f"### {title}" + (f" [{table.node_id}]" if self.include_node_ids else "")
@@ -148,24 +157,37 @@ class CanonicalMarkdownRenderer:
         if len(lines) > 2:
             lines.append("")
 
-        width = len(table.column_headers)
-        if not width and selected_rows:
-            width = len(selected_rows[0].cells)
-        headers = [" > ".join(item.path) or f"Column {item.col + 1}" for item in table.column_headers]
-        if not headers:
-            headers = [f"Column {index + 1}" for index in range(width)]
+        full_width = len(table.column_headers)
+        if not full_width and selected_rows:
+            full_width = len(selected_rows[0].cells)
+        selected_columns = list(columns) if columns is not None else list(range(full_width))
+        if any(column < 0 or column >= full_width for column in selected_columns):
+            raise ValueError("table column selection is out of bounds")
+        headers = [
+            (
+                " > ".join(table.column_headers[column].path)
+                if table.column_headers and table.column_headers[column].path
+                else f"Column {column + 1}"
+            )
+            for column in selected_columns
+        ]
         lines.append("| " + " | ".join(_escape_cell(value) for value in headers) + " |")
         numeric_columns = []
-        for col in range(width):
+        for col in selected_columns:
             values = [row.cells[col].numeric_value for row in selected_rows if col < len(row.cells) and row.cells[col].normalized_text]
             numeric_columns.append(bool(values) and len(values) == sum(1 for value in values if value is not None))
         lines.append("|" + "|".join("---:" if numeric else "---" for numeric in numeric_columns) + "|")
         for row in selected_rows:
-            values = [_escape_cell(cell.normalized_text) for cell in row.cells]
+            values = [
+                _escape_cell(row.cells[column].normalized_text)
+                if column < len(row.cells)
+                else ""
+                for column in selected_columns
+            ]
             lines.append("| " + " | ".join(values) + " |")
         if not selected_rows:
-            lines.append("| " + " | ".join(" " for _ in range(width)) + " |")
-        if table.footnotes:
+            lines.append("| " + " | ".join(" " for _ in selected_columns) + " |")
+        if include_footnotes and table.footnotes:
             lines.append("")
             lines.extend(f"- Footnote {note.marker or ''}: {note.text}".rstrip() for note in table.footnotes)
         return "\n".join(lines)

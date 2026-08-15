@@ -7,6 +7,10 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceType,
+    DcfLink,
+    EconomicScope,
+    ForwardDriverCard,
+    ForwardDriverType,
     MoatScore,
 )
 from moatrader.evidence.validation import validate_evidence_result, validate_moat_score
@@ -14,6 +18,8 @@ from moatrader.evidence.processing import (
     build_evidence_relations,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
+    build_forward_driver_cards,
+    normalize_card_semantics,
 )
 
 __all__ = [
@@ -25,10 +31,16 @@ __all__ = [
     "EvidenceDirection",
     "EvidenceExtractionResult",
     "EvidenceType",
+    "DcfLink",
+    "EconomicScope",
+    "ForwardDriverCard",
+    "ForwardDriverType",
     "MoatScore",
     "validate_evidence_result",
     "validate_moat_score",
     "build_evidence_relations",
     "calibrate_card_reliability",
     "cluster_duplicate_evidence",
+    "build_forward_driver_cards",
+    "normalize_card_semantics",
 ]

@@ -344,6 +344,11 @@ def test_assumptions_use_ttm_as_base_without_treating_it_as_annual_growth() -> N
     )
     assert assumptions["base_revenue"] == "1100"
     assert assumptions["ebit_margin"][0] == "0.12"  # type: ignore[index]
+    assert assumptions["method"] == "FCFF"
+    assert assumptions["base_period"] == "2025H1"
+    assert assumptions["assumption_types"]["revenue_growth"] == "MODEL_INFERENCE"  # type: ignore[index]
+    assert assumptions["assumption_types"]["tax_rate"] == "DEFAULT"  # type: ignore[index]
+    assert assumptions["assumption_sources"]["base_revenue"] == ["PIT_TTM:2025H1"]  # type: ignore[index]
     assert audit["base_financial_period"] == "2025H1"
     assert audit["base_financial_basis"] == "TTM"
     assert audit["history_years"] == [2022, 2023, 2024]

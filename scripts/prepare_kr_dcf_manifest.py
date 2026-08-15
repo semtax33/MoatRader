@@ -485,7 +485,7 @@ def assumptions_from_history(
     base_metrics: dict[str, Decimal | None] | None = None,
     base_period: str | None = None,
     base_basis: str = "FY",
-) -> tuple[dict[str, str | list[str]], dict[str, object]]:
+) -> tuple[dict[str, object], dict[str, object]]:
     valid = [(year, metrics) for year, metrics in history if metrics["revenue"] and metrics["revenue"] > 0]
     if not valid:
         raise ValueError("no positive annual revenue")
@@ -562,7 +562,11 @@ def assumptions_from_history(
     def texts(values: list[Decimal]) -> list[str]:
         return [format(value, "f") for value in values]
 
-    assumptions: dict[str, str | list[str]] = {
+    history_source = "ANNUAL_HISTORY:" + ",".join(str(year) for year, _metrics in valid)
+    base_source = f"PIT_{base_basis}:{base_period or f'{latest_year}FY'}"
+    assumptions: dict[str, object] = {
+        "method": "FCFF",
+        "base_period": base_period or f"{latest_year}FY",
         "base_revenue": format(revenue, "f"),
         "revenue_growth": texts(growth_forecast),
         "ebit_margin": texts(margin_forecast),
@@ -574,6 +578,37 @@ def assumptions_from_history(
         "terminal_growth": format(terminal_growth, "f"),
         "net_debt": format(net_debt, "f"),
         "diluted_shares": format(shares, "f"),
+        "assumption_sources": {
+            "base_revenue": [base_source],
+            "revenue_growth": [history_source, "HISTORICAL_MEDIAN_WITH_LINEAR_FADE"],
+            "ebit_margin": [base_source, history_source, "HISTORICAL_MEDIAN_WITH_LINEAR_FADE"],
+            "tax_rate": ["POLICY_DEFAULT:KOREA_BASELINE_24_PERCENT"],
+            "depreciation_pct_revenue": [base_source, history_source],
+            "capex_pct_revenue": [history_source],
+            "nwc_pct_revenue": [base_source],
+            "wacc": [f"UNIVERSE_SIZE_BUCKET:{size_bucket.upper() or 'MID'}"],
+            "terminal_growth": ["POLICY_DEFAULT:LONG_RUN_GROWTH_2_PERCENT"],
+            "net_debt": [base_source],
+            "diluted_shares": ["KRX_MARKET_SNAPSHOT"],
+        },
+        "assumption_types": {
+            "base_revenue": "DETERMINISTIC",
+            "revenue_growth": "MODEL_INFERENCE",
+            "ebit_margin": "MODEL_INFERENCE",
+            "tax_rate": "DEFAULT",
+            "depreciation_pct_revenue": "MODEL_INFERENCE",
+            "capex_pct_revenue": "MODEL_INFERENCE",
+            "nwc_pct_revenue": "MODEL_INFERENCE",
+            "wacc": "DETERMINISTIC",
+            "terminal_growth": "DEFAULT",
+            "net_debt": "DETERMINISTIC",
+            "diluted_shares": "DETERMINISTIC",
+        },
+        "provenance_warnings": [
+            "Revenue growth is a historical-median heuristic with a linear fade, not company guidance.",
+            "EBIT margin is a historical normalization heuristic, not a forward operating model.",
+            "Tax rate and terminal growth are policy defaults.",
+        ],
     }
     audit = {
         "latest_financial_year": latest_year,
@@ -596,6 +631,8 @@ def assumptions_from_history(
         "wacc_method": "size-bucket-baseline/1",
         "net_debt": str(net_debt),
         "method": "pit-ttm-historical-normalization/2",
+        "assumption_types": json.dumps(assumptions["assumption_types"], sort_keys=True),
+        "default_assumption_count": 2,
     }
     return assumptions, audit
 
@@ -779,7 +816,7 @@ def main() -> int:
                     base_basis=str(pit_details["financial_period_basis"]),
                 )
                 input_payload = {
-                    "schema_version": "moatrader-dcf-input/2",
+                    "schema_version": "moatrader-dcf-input/3",
                     "ticker": ticker,
                     "issuer_name": source.get("name", ""),
                     "as_of": as_of.isoformat(),
@@ -797,6 +834,7 @@ def main() -> int:
                     ],
                     "annual_sources": annual_sources,
                     "assumption_method": details["method"],
+                    "assumptions": assumptions,
                 }
                 input_hash = json_sha256(input_payload)
                 input_payload["input_sha256"] = input_hash

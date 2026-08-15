@@ -57,3 +57,21 @@ def test_quality_gate_can_allow_nested_table_count_difference() -> None:
     )
 
     assert assessment.passed is True
+
+
+def test_quality_gate_rejects_tagged_facts_that_were_not_canonicalized() -> None:
+    assessment = assess_parser_quality(
+        _bundle(
+            QualityMetrics(
+                text_retention=1.0,
+                raw_structured_fact_count=10,
+                structured_fact_count=8,
+                structured_fact_retention=0.8,
+            )
+        )
+    )
+
+    assert assessment.passed is False
+    assert assessment.failures == [
+        "structured fact retention 0.8000 is below 0.9900"
+    ]

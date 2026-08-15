@@ -8,6 +8,7 @@ from moatrader.canonical.models import CanonicalDocumentBundle, ContractModel
 class ParserQualityGateConfig(ContractModel):
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
+    minimum_structured_fact_retention: float = Field(default=0.99, ge=0.0, le=1.0)
     require_table_count_match: bool = True
 
 
@@ -42,6 +43,16 @@ def assess_parser_quality(
         failures.append(
             f"numeric cell retention {quality.numeric_retention:.4f} is below "
             f"{config.minimum_numeric_retention:.4f}"
+        )
+    if quality.raw_structured_fact_count and quality.structured_fact_retention is None:
+        failures.append("structured fact retention is unavailable")
+    elif (
+        quality.structured_fact_retention is not None
+        and quality.structured_fact_retention < config.minimum_structured_fact_retention
+    ):
+        failures.append(
+            f"structured fact retention {quality.structured_fact_retention:.4f} is below "
+            f"{config.minimum_structured_fact_retention:.4f}"
         )
     return ParserQualityAssessment(
         source_document_id=bundle.metadata.source_document_id,

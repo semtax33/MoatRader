@@ -32,6 +32,7 @@ class UniverseRunConfig(ContractModel):
     max_output_tokens: int = Field(default=8_000, ge=1_000, le=100_000)
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
+    minimum_structured_fact_retention: float = Field(default=0.99, ge=0.0, le=1.0)
     require_table_count_match: bool = True
     allow_low_quality: bool = False
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)

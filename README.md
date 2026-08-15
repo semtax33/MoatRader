@@ -147,12 +147,14 @@ python scripts\prepare_kr_dcf_manifest.py `
 
 `--year`를 생략하면 최신 PIT 보고서 기준으로 직전 3개 완료 사업연도를 자동 선택합니다. 명시적으로 고정하려면 `--year 2022 --year 2023 --year 2024`처럼 반복합니다.
 
-- `dcf-inputs\TICKER.json`: TTM 숫자, 산식, 사용한 접수번호·공시시점·재무제표 범위, annual history, 입력 hash
-- `assumptions\TICKER.json`: deterministic DCF 엔진 입력
+- `dcf-inputs\TICKER.json`: TTM 숫자, 산식, 사용한 접수번호·공시시점·재무제표 범위, annual history, 가정 provenance, 입력 hash
+- `assumptions\TICKER.json`: deterministic DCF 엔진 입력과 가정별 `DETERMINISTIC`/`MODEL_INFERENCE`/`DEFAULT` 유형·출처
 - `dcf-audit.csv`: 종목별 PIT·TTM 요약과 입력 경로/hash
 - `exclusions.csv`: 미래공시, TTM 구성요소 부족, 금융사 모델 불일치 등 제외 사유
 
 분기 누적금액이 없거나 동일한 `CFS`/`OFS` 범위의 전기 연간·전년 동기 보고서를 확보하지 못하면 분기값을 임의로 혼합하지 않고 해당 DCF를 제외합니다. 현재 한국 주식 준비기는 12월 결산을 전제로 하며 이 가정은 입력 감사정보에 기록됩니다.
+
+Runner의 `dcf.json`은 결과뿐 아니라 사용 가정, 출처, 유형, 가정 신뢰도 감점과 terminal-value 비중을 함께 저장합니다. Financial Snapshot이 비어 있으면 DCF는 hard fail하며, 출처가 없는 구형 assumptions는 `UNSPECIFIED`로 처리되어 낮은 신뢰도와 경고를 남깁니다.
 
 ## 한 종목·여러 종목·전체 유니버스 MOAT 실행
 

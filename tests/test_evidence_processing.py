@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
+    DcfLink,
+    EconomicScope,
     EvidenceBatchExtractionResult,
     EvidenceCard,
     EvidenceDirection,
@@ -11,11 +13,14 @@ from moatrader.evidence.models import (
     EvidenceMetric,
     EvidenceRelationType,
     EvidenceType,
+    ForwardDriverType,
 )
 from moatrader.evidence.processing import (
+    build_forward_driver_cards,
     build_evidence_relations,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
+    normalize_card_semantics,
 )
 from moatrader.evidence.validation import validate_evidence_batch_result, validate_evidence_result
 from moatrader.semantic.chunker import SemanticChunk
@@ -199,3 +204,40 @@ def test_empty_mechanism_values_are_normalized_to_empty_list() -> None:
     card = EvidenceCard.model_validate(payload)
 
     assert card.mechanism == []
+
+
+def test_market_demand_is_not_kept_as_company_market_share() -> None:
+    card = _card("E1", "외국인 피부과 환자가 전년 대비 증가했다.", EvidenceDirection.MOAT_POSITIVE)
+    card.evidence_type = EvidenceType.MARKET_SHARE
+
+    normalized = normalize_card_semantics(card)
+
+    assert normalized.evidence_type == EvidenceType.MARKET_DEMAND
+    assert normalized.economic_scope == EconomicScope.INDUSTRY
+    assert normalized.direction == EvidenceDirection.NEUTRAL
+    assert normalized.forward_driver_type == ForwardDriverType.MARKET_GROWTH
+    assert normalized.dcf_links == [DcfLink.REVENUE]
+
+
+def test_recurring_category_treatment_is_not_customer_retention() -> None:
+    card = _card("E1", "스킨부스터는 3~6개월마다 재시술이 필요하다.", EvidenceDirection.MOAT_POSITIVE)
+    card.evidence_type = EvidenceType.CUSTOMER_RETENTION
+
+    normalized = normalize_card_semantics(card)
+
+    assert normalized.evidence_type == EvidenceType.CATEGORY_RECURRING_DEMAND
+    assert normalized.economic_scope == EconomicScope.PRODUCT_CATEGORY
+    assert normalized.direction == EvidenceDirection.NEUTRAL
+    assert normalized.forward_driver_type == ForwardDriverType.VOLUME
+
+
+def test_utilization_evidence_is_promoted_to_forward_driver_card() -> None:
+    card = _card("E1", "2공장 가동률은 61%에서 110%로 상승했다.", EvidenceDirection.NEUTRAL)
+    normalized = normalize_card_semantics(card)
+
+    drivers = build_forward_driver_cards([normalized])
+
+    assert normalized.forward_driver_type == ForwardDriverType.UTILIZATION
+    assert normalized.dcf_links == [DcfLink.REVENUE, DcfLink.CAPEX]
+    assert len(drivers) == 1
+    assert drivers[0].source_evidence_id == "E1"

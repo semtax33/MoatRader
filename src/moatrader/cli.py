@@ -249,6 +249,7 @@ def _moat_run(args: argparse.Namespace) -> int:
         max_output_tokens=args.max_output_tokens,
         minimum_text_retention=args.minimum_text_retention,
         minimum_numeric_retention=args.minimum_numeric_retention,
+        minimum_structured_fact_retention=args.minimum_structured_fact_retention,
         require_table_count_match=not args.allow_table_count_mismatch,
         allow_low_quality=args.allow_low_quality,
         maximum_price_age_days=args.maximum_price_age_days,
@@ -526,6 +527,7 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument("--max-output-tokens", type=int, default=8_000)
     moat_run.add_argument("--minimum-text-retention", type=float, default=0.95)
     moat_run.add_argument("--minimum-numeric-retention", type=float, default=0.99)
+    moat_run.add_argument("--minimum-structured-fact-retention", type=float, default=0.99)
     moat_run.add_argument("--allow-table-count-mismatch", action="store_true")
     moat_run.add_argument(
         "--allow-low-quality",

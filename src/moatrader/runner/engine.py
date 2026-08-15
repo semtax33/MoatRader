@@ -23,6 +23,7 @@ from moatrader.evidence.models import (
     EvidenceCard,
     EvidenceExtractionResult,
     EvidenceRelation,
+    EvidenceType,
     MoatScore,
     SectionSummary,
 )
@@ -33,8 +34,10 @@ from moatrader.evidence.validation import (
 )
 from moatrader.evidence.processing import (
     build_evidence_relations,
+    build_forward_driver_cards,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
+    normalize_card_semantics,
 )
 from moatrader.financial import DcfAssumptions, DcfEngine, FinancialSnapshot, FinancialSnapshotBuilder
 from moatrader.llm import (
@@ -64,7 +67,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.3.1"
+RUNNER_VERSION = "0.4.1"
 
 
 class MoatUniverseRunner:
@@ -191,6 +194,7 @@ class MoatUniverseRunner:
                     ParserQualityGateConfig(
                         minimum_text_retention=self.config.minimum_text_retention,
                         minimum_numeric_retention=self.config.minimum_numeric_retention,
+                        minimum_structured_fact_retention=self.config.minimum_structured_fact_retention,
                         require_table_count_match=self.config.require_table_count_match,
                     ),
                 )
@@ -207,7 +211,7 @@ class MoatUniverseRunner:
             snapshot = self.snapshots.build(bundles, as_of=self.config.as_of)
             self.store.write_json(company_dir / "financial-snapshot.json", snapshot)
             self.store.write_text(company_dir / "financial-snapshot.md", snapshot.to_markdown())
-            dcf = self._calculate_dcf(company, company_dir)
+            dcf = self._calculate_dcf(company, company_dir, snapshot)
 
             dedup = deduplicate_chunks(chunks)
             chunks = dedup.kept
@@ -260,6 +264,10 @@ class MoatUniverseRunner:
 
             self._checkpoint(checkpoint_path, signature, "EXTRACTING_EVIDENCE")
             cards = self._load_or_extract_evidence(company_dir, evidence_chunks, bundles, audits)
+            self.store.write_json(
+                company_dir / "forward-driver-cards.json",
+                build_forward_driver_cards(cards),
+            )
             relations = build_evidence_relations(cards)
             evidence_clusters = cluster_duplicate_evidence(cards, relations)
             self.store.write_json(company_dir / "evidence-clusters.json", evidence_clusters)
@@ -328,7 +336,16 @@ class MoatUniverseRunner:
                 score = self._execute_validated(
                     score_request,
                     MoatScore,
-                    lambda value: self._validate_score(value, set(pack.evidence_ids)),
+                    lambda value: self._validate_score(
+                        value,
+                        set(pack.evidence_ids),
+                        {
+                            card.evidence_id
+                            for card in scoring_dossier.evidence
+                            if card.evidence_type
+                            in {EvidenceType.MARKET_DEMAND, EvidenceType.CATEGORY_RECURRING_DEMAND}
+                        },
+                    ),
                     audits,
                     company_dir,
                 )
@@ -529,17 +546,20 @@ class MoatUniverseRunner:
                     if source_chunk.source_refs
                     else card.source_type
                 )
+                normalized = normalize_card_semantics(
+                    card.model_copy(update={"source_type": source_type})
+                )
                 evidence_id = stable_id(
                     "E",
-                    card.source_chunk_id,
+                    normalized.source_chunk_id,
                     index,
-                    card.evidence_type.value,
-                    card.direction.value,
-                    card.fact,
+                    normalized.evidence_type.value,
+                    normalized.direction.value,
+                    normalized.fact,
                 )
                 chunk_cards.append(
                     calibrate_card_reliability(
-                        card.model_copy(update={"evidence_id": evidence_id, "source_type": source_type})
+                        normalized.model_copy(update={"evidence_id": evidence_id})
                     )
                 )
             normalized_result: EvidenceExtractionResult | EvidenceBatchExtractionResult
@@ -593,9 +613,19 @@ class MoatUniverseRunner:
             self.store.write_json(path, [])
         return summaries
 
-    def _calculate_dcf(self, company: CompanyInput, company_dir: Path):
+    def _calculate_dcf(
+        self,
+        company: CompanyInput,
+        company_dir: Path,
+        snapshot: FinancialSnapshot,
+    ):
         if not company.dcf_assumptions_path:
             return None
+        if not snapshot.series:
+            raise ValueError(
+                "DCF hard fail: FinancialSnapshot has no canonical numeric series; "
+                "a fair value must not be generated from detached assumptions"
+            )
         assumptions_text = Path(company.dcf_assumptions_path).read_text(encoding="utf-8-sig")
         assumptions = DcfAssumptions.model_validate_json(assumptions_text)
         assumptions_hash = hashlib.sha256(assumptions_text.encode("utf-8")).hexdigest()
@@ -606,9 +636,21 @@ class MoatUniverseRunner:
             {
                 "valuation_as_of": self.config.as_of.isoformat(),
                 "assumptions_input_sha256": assumptions_hash,
-                "engine_version": "unlevered-dcf/1",
+                "engine_version": "unlevered-dcf/2",
                 "calculation_mode": "deterministic_python",
                 "llm_model": None,
+                "method": dcf.method,
+                "base_period": dcf.base_period,
+                "assumption_sources": assumptions.assumption_sources,
+                "assumption_types": {
+                    key: value.value for key, value in assumptions.assumption_types.items()
+                },
+                "assumption_confidence": dcf.assumption_confidence,
+                "confidence_penalty": dcf.confidence_penalty,
+                "default_assumptions": dcf.default_assumptions,
+                "terminal_value_share": dcf.terminal_value_share,
+                "provenance_warnings": dcf.provenance_warnings,
+                "financial_snapshot_series": [series.concept for series in snapshot.series],
             },
         )
         self.store.write_json(company_dir / "dcf.json", dcf)
@@ -879,12 +921,22 @@ class MoatUniverseRunner:
         summary.uncertainties = grounded_claims(summary.uncertainties)
         return []
 
-    def _validate_score(self, score: MoatScore, evidence_ids: set[str]) -> list[str]:
+    def _validate_score(
+        self,
+        score: MoatScore,
+        evidence_ids: set[str],
+        context_only_evidence_ids: set[str] | None = None,
+    ) -> list[str]:
         score.as_of = self.config.as_of.date()
+        context_only = context_only_evidence_ids or set()
         score.counterevidence_ids = [item for item in score.counterevidence_ids if item in evidence_ids]
         mechanisms = []
         for mechanism in score.mechanisms:
-            grounded = [item for item in mechanism.evidence_ids if item in evidence_ids]
+            grounded = [
+                item
+                for item in mechanism.evidence_ids
+                if item in evidence_ids and item not in context_only
+            ]
             if grounded:
                 mechanisms.append(mechanism.model_copy(update={"evidence_ids": grounded}))
         if not mechanisms and score.economic_moat_score > 0:
@@ -913,40 +965,51 @@ class MoatUniverseRunner:
             for node in bundle.ast.walk()
             if isinstance(node, TableNode)
         }
-        selected_table_rows: dict[str, set[int] | None] = {}
+        selected_table_cells: dict[str, set[tuple[int, int]] | None] = {}
         for chunk in selected:
             table_id = chunk.metadata.get("table_id")
             if not table_id:
                 for node_id in chunk.node_ids:
                     if node_id in all_tables:
-                        selected_table_rows[node_id] = None
+                        selected_table_cells[node_id] = None
                 continue
-            if selected_table_rows.get(table_id) is None and table_id in selected_table_rows:
+            if selected_table_cells.get(table_id) is None and table_id in selected_table_cells:
                 continue
             row_start = chunk.metadata.get("row_start")
             row_end = chunk.metadata.get("row_end")
             if isinstance(row_start, int) and isinstance(row_end, int):
-                selected_table_rows.setdefault(table_id, set())
-                rows = selected_table_rows[table_id]
-                if rows is not None:
-                    rows.update(range(row_start, row_end + 1))
+                selected_table_cells.setdefault(table_id, set())
+                cells = selected_table_cells[table_id]
+                table = all_tables.get(table_id)
+                columns = chunk.metadata.get("column_indices")
+                if not isinstance(columns, list) and table is not None:
+                    columns = list(range(len(table.column_headers)))
+                if cells is not None and isinstance(columns, list):
+                    cells.update(
+                        (row_index, column)
+                        for row_index in range(row_start, row_end + 1)
+                        for column in columns
+                        if isinstance(column, int)
+                    )
             else:
-                selected_table_rows[table_id] = None
+                selected_table_cells[table_id] = None
         total_numeric = 0
         selected_numeric = 0
         for table_id, table in all_tables.items():
             for row in table.rows:
-                count = sum(cell.numeric_value is not None for cell in row.cells)
-                total_numeric += count
-                selection = selected_table_rows.get(table_id, set())
-                if selection is None or row.index in selection:
-                    selected_numeric += count
+                selection = selected_table_cells.get(table_id, set())
+                for cell in row.cells:
+                    if cell.numeric_value is None:
+                        continue
+                    total_numeric += 1
+                    if selection is None or (row.index, cell.col) in selection:
+                        selected_numeric += 1
         return CoverageMetrics(
             char_retention=min(1.0, ast_chars / raw_chars) if raw_chars else None,
             token_retention=min(1.0, selected_tokens / total_tokens) if total_tokens else None,
             evidence_retention=min(1.0, selected_evidence / total_evidence) if total_evidence else None,
             section_retention=min(1.0, len(selected_sections & all_sections) / len(all_sections)) if all_sections else None,
-            table_retention=min(1.0, len(selected_table_rows) / len(all_tables)) if all_tables else None,
+            table_retention=min(1.0, len(selected_table_cells) / len(all_tables)) if all_tables else None,
             numeric_retention=min(1.0, selected_numeric / total_numeric) if total_numeric else None,
         )
 
@@ -966,6 +1029,7 @@ class MoatUniverseRunner:
                     "max_output_tokens": self.config.max_output_tokens,
                     "minimum_text_retention": self.config.minimum_text_retention,
                     "minimum_numeric_retention": self.config.minimum_numeric_retention,
+                    "minimum_structured_fact_retention": self.config.minimum_structured_fact_retention,
                     "require_table_count_match": self.config.require_table_count_match,
                     "allow_low_quality": self.config.allow_low_quality,
                     "maximum_price_age_days": self.config.maximum_price_age_days,

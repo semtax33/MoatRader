@@ -45,6 +45,10 @@ def build_evidence_request(chunk: SemanticChunk) -> LLMRequest:
 Do not score the company or infer facts not explicitly supported by this chunk.
 Do not use outside knowledge. Every card must cite source_chunk_id and node_ids from the input.
 Preserve periods, units, segments, uncertainty, and whether text is a disclosed fact or management claim.
+Keep company competitive position separate from category or industry demand:
+- Industry growth, patient growth, or TAM growth is MARKET_DEMAND, not MARKET_SHARE, unless company share is explicitly stated.
+- Repeat treatment cadence is CATEGORY_RECURRING_DEMAND, not CUSTOMER_RETENTION or switching cost, unless retention, churn, renewal, or switching behavior is explicitly stated.
+For grounded forward operating evidence (volume, ASP, capacity, utilization, mix, exports, margin, capex, working capital, or input costs), populate forward_driver_type and dcf_links. A DCF link identifies a line item; it is not permission to invent a forecast.
 Return an empty cards list when there is no investment-relevant evidence."""
     user = f"""Extract evidence cards from this canonical semantic chunk.
 
@@ -76,6 +80,10 @@ def build_evidence_batch_request(chunks: list[SemanticChunk]) -> LLMRequest:
 Do not score the company or infer facts not explicitly supported by the supplied chunks.
 Do not use outside knowledge. Every card must cite exactly one supplied source_chunk_id and only node_ids allowed for that chunk.
 Preserve periods, units, segments, uncertainty, and whether text is a disclosed fact or management claim.
+Keep company competitive position separate from category or industry demand:
+- Industry growth, patient growth, or TAM growth is MARKET_DEMAND, not MARKET_SHARE, unless company share is explicitly stated.
+- Repeat treatment cadence is CATEGORY_RECURRING_DEMAND, not CUSTOMER_RETENTION or switching cost, unless retention, churn, renewal, or switching behavior is explicitly stated.
+For grounded forward operating evidence (volume, ASP, capacity, utilization, mix, exports, margin, capex, working capital, or input costs), populate forward_driver_type and dcf_links. A DCF link identifies a line item; it is not permission to invent a forecast.
 Return an empty cards list when there is no investment-relevant evidence."""
     blocks: list[str] = []
     for chunk in chunks:
@@ -182,6 +190,7 @@ def build_moat_pack_request(dossier: CompanyDossier, pack: CompanyEvidencePack) 
     system = """You are the final economic-moat scorer.
 Use only the supplied three-layer evidence pack. Every mechanism and counterevidence must cite an evidence_id present in the pack.
 Separate document coverage from model confidence. Do not perform DCF arithmetic or invent financial figures.
+MARKET_DEMAND and CATEGORY_RECURRING_DEMAND are contextual demand evidence, not a company moat by themselves. Do not convert them into MARKET_SHARE, CUSTOMER_RETENTION, or SWITCHING_COST without explicit company-level evidence.
 Weigh positive evidence, counterevidence, reliability, durability, and segment scope before scoring."""
     user = pack.markdown
     return LLMRequest(

@@ -117,6 +117,13 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None
+    assert dcf_manifest["method"] == "FCFF"
+    assert dcf_manifest["assumption_confidence"] == "0.10"
+    assert dcf_manifest["confidence_penalty"] == "0.90"
+    dcf_payload = json.loads((company_dir / "dcf.json").read_text(encoding="utf-8"))
+    assert dcf_payload["method"] == "FCFF"
+    assert dcf_payload["assumptions"]["base_revenue"] == "1000"
+    assert "terminal_value_share" in dcf_payload
     run_manifest = json.loads((company_dir / "run-manifest.json").read_text(encoding="utf-8"))
     assert run_manifest["input_sha256"] == json.loads(
         (company_dir / "moat-request.json").read_text(encoding="utf-8")
@@ -381,3 +388,41 @@ def test_failure_before_company_signature_is_isolated(tmp_path: Path) -> None:
 
     assert result.companies[0].status == CompanyRunStatus.FAILED
     assert "FileNotFoundError" in (result.companies[0].error or "")
+
+
+def test_empty_financial_snapshot_hard_fails_before_dcf_output(tmp_path: Path) -> None:
+    source = tmp_path / "no-financials.html"
+    source.write_text("<html><body><p>Only qualitative disclosure.</p></body></html>", encoding="utf-8")
+    metadata = tmp_path / "metadata.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "rcept_no": "20250515000123",
+                "corp_code": "00126380",
+                "issuer_name": "No Financials",
+                "available_at": "2025-05-15T09:01:02+09:00",
+                "period_start": "2024-01-01",
+                "period_end": "2024-12-31",
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "empty-universe.csv"
+    manifest.write_text(
+        "ticker,source,input,metadata,current_price,price_as_of,dcf_assumptions\n"
+        f"EMPTY,DART,{source},{metadata},10,2025-05-15T16:00:00+09:00,"
+        f"{ROOT / 'examples' / 'sample-dcf-assumptions.json'}\n",
+        encoding="utf-8",
+    )
+    universe = load_universe_manifest(manifest)
+
+    result = MoatUniverseRunner(
+        config=_config("empty-hard-fail", dry_run=True),
+        output_directory=tmp_path,
+        transport=None,
+    ).run(universe, universe.companies)
+
+    company = result.companies[0]
+    assert company.status == CompanyRunStatus.FAILED
+    assert "DCF hard fail" in (company.error or "")
+    assert not (tmp_path / "empty-hard-fail" / "companies" / "EMPTY" / "dcf.json").exists()

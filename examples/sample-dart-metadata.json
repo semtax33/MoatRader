@@ -1,0 +1,15 @@
+{
+  "rcept_no": "20250515000123",
+  "corp_code": "00126380",
+  "issuer_name": "샘플전자",
+  "stock_code": "000000",
+  "market": "KOSPI",
+  "report_name": "사업보고서",
+  "available_at": "2025-05-15T09:01:02+09:00",
+  "availability_source": "DART receipt timestamp",
+  "period_start": "2024-01-01",
+  "period_end": "2024-12-31",
+  "language": "ko",
+  "jurisdiction": "KR"
+}
+

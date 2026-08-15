@@ -27,6 +27,11 @@ class EvidenceType(StrEnum):
     CAPITAL_INTENSITY = "CAPITAL_INTENSITY"
     ROIC_QUALITY = "ROIC_QUALITY"
     FCF_QUALITY = "FCF_QUALITY"
+    MARKET_DEMAND = "MARKET_DEMAND"
+    CATEGORY_RECURRING_DEMAND = "CATEGORY_RECURRING_DEMAND"
+    CAPACITY_UTILIZATION = "CAPACITY_UTILIZATION"
+    EXPORT_MIX = "EXPORT_MIX"
+    OPERATING_DRIVER = "OPERATING_DRIVER"
     OTHER = "OTHER"
 
 
@@ -34,6 +39,38 @@ class EvidenceDirection(StrEnum):
     MOAT_POSITIVE = "MOAT_POSITIVE"
     MOAT_NEGATIVE = "MOAT_NEGATIVE"
     NEUTRAL = "NEUTRAL"
+
+
+class EconomicScope(StrEnum):
+    COMPANY = "COMPANY"
+    SEGMENT = "SEGMENT"
+    PRODUCT_CATEGORY = "PRODUCT_CATEGORY"
+    INDUSTRY = "INDUSTRY"
+    MACRO = "MACRO"
+
+
+class ForwardDriverType(StrEnum):
+    VOLUME = "VOLUME"
+    ASP = "ASP"
+    CAPACITY = "CAPACITY"
+    UTILIZATION = "UTILIZATION"
+    PRODUCT_MIX = "PRODUCT_MIX"
+    EXPORT_MIX = "EXPORT_MIX"
+    MARKET_GROWTH = "MARKET_GROWTH"
+    MARGIN = "MARGIN"
+    CAPEX = "CAPEX"
+    WORKING_CAPITAL = "WORKING_CAPITAL"
+    RAW_MATERIAL_COST = "RAW_MATERIAL_COST"
+
+
+class DcfLink(StrEnum):
+    REVENUE = "REVENUE"
+    EBIT_MARGIN = "EBIT_MARGIN"
+    CAPEX = "CAPEX"
+    DEPRECIATION = "DEPRECIATION"
+    NWC = "NWC"
+    WACC = "WACC"
+    TERMINAL_GROWTH = "TERMINAL_GROWTH"
 
 
 class EvidenceMetric(ContractModel):
@@ -63,12 +100,16 @@ class EvidenceCard(ContractModel):
     strength: float = Field(default=0.5, ge=0.0, le=1.0)
     source_type: SourceType = SourceType.OTHER
     company_scope: str = "COMPANY"
+    economic_scope: EconomicScope = EconomicScope.COMPANY
     segment: str | None = None
     metrics: list[EvidenceMetric] = Field(default_factory=list)
     unit: str | None = None
     period: str | None = None
     raw_quote: str | None = None
     reliability: float = Field(default=0.5, ge=0.0, le=1.0)
+    forward_driver_type: ForwardDriverType | None = None
+    dcf_links: list[DcfLink] = Field(default_factory=list)
+    forecast_horizon: str | None = None
 
     @field_validator("metrics", mode="before")
     @classmethod
@@ -178,6 +219,62 @@ class EvidenceCard(ContractModel):
     @classmethod
     def null_scope_is_company(cls, value: object) -> object:
         return "COMPANY" if value is None else value
+
+    @field_validator("economic_scope", mode="before")
+    @classmethod
+    def normalize_economic_scope(cls, value: object) -> object:
+        if value is None:
+            return EconomicScope.COMPANY
+        if isinstance(value, str):
+            normalized = value.strip().upper().replace(" ", "_")
+            if normalized not in {item.value for item in EconomicScope}:
+                return EconomicScope.COMPANY
+            return normalized
+        return value
+
+    @field_validator("forward_driver_type", mode="before")
+    @classmethod
+    def normalize_forward_driver_type(cls, value: object) -> object:
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().upper().replace(" ", "_")
+            if normalized not in {item.value for item in ForwardDriverType}:
+                return None
+            return normalized
+        return value
+
+    @field_validator("dcf_links", mode="before")
+    @classmethod
+    def normalize_dcf_links(cls, value: object) -> object:
+        if value is None or value == "":
+            return []
+        if not isinstance(value, list):
+            return value
+        allowed = {item.value for item in DcfLink}
+        return [
+            normalized
+            for item in value
+            if isinstance(item, str)
+            and (normalized := item.strip().upper().replace(" ", "_")) in allowed
+        ]
+
+
+class ForwardDriverCard(ContractModel):
+    driver_id: str
+    source_evidence_id: str
+    source_chunk_id: str
+    node_ids: list[str] = Field(min_length=1)
+    driver_type: ForwardDriverType
+    evidence: str = Field(min_length=1)
+    implication: list[str] = Field(default_factory=list)
+    dcf_links: list[DcfLink] = Field(min_length=1)
+    statement_type: StatementType
+    economic_scope: EconomicScope
+    segment: str | None = None
+    period: str | None = None
+    forecast_horizon: str | None = None
+    reliability: float = Field(ge=0.0, le=1.0)
 
 
 class EvidenceExtractionResult(ContractModel):

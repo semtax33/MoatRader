@@ -235,6 +235,10 @@ Retrieval relevance는 다음 경제적 질문별 top-k 결과를 넣는 것을 
 
 DCF assumptions와 source facts는 분리합니다. `DcfEngine`은 revenue growth, EBIT margin, tax, D&A, Capex, NWC, WACC, terminal growth, net debt, diluted shares로 unlevered FCF를 계산합니다. WACC가 terminal growth보다 크고 forecast 배열 길이가 같은지 schema가 검증합니다.
 
+각 DCF 가정은 `DISCLOSED_FACT`, `DETERMINISTIC`, `MODEL_INFERENCE`, `MANAGEMENT_GUIDANCE`, `EXTERNAL_FORECAST`, `DEFAULT`, `UNSPECIFIED` 중 하나로 분류하고 source ID를 보존합니다. 결과 계약은 assumptions 원문, base period, 가정 신뢰도/감점, default 목록과 terminal-value 비중을 포함합니다. Financial Snapshot에 canonical numeric series가 하나도 없으면 DCF 계산은 중단합니다.
+
+Evidence Card는 회사 경쟁지위와 시장 수요를 분리합니다. 시장·환자·TAM 성장은 `MARKET_DEMAND`, 반복 시술 주기는 `CATEGORY_RECURRING_DEMAND`이며, 회사 점유율·고객 유지·전환비용의 직접 증거로 사용하지 않습니다. Capacity, utilization, ASP, product/export mix, 원재료비 등의 근거는 Forward Driver Card로 승격하고 영향을 받는 DCF line item을 명시합니다.
+
 종목 screening은 최소 MOAT, margin of safety, model confidence, document coverage를 모두 통과한 후보만 대상으로 합니다. 기본 ranking 식은 코드에 공개되어 있으며, 다른 연구식으로 교체할 수 있습니다.
 
 시장가격은 반드시 `price_as_of`, valuation은 `valuation_as_of`를 가져야 합니다. 같은 시점에서 실제 매매 가능했던 가격과 정보만 사용해야 합니다.

@@ -11,6 +11,7 @@ from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk, Tok
 class CompanyEvidencePack(ContractModel):
     issuer_name: str
     evidence_ids: list[str] = Field(default_factory=list)
+    forward_driver_evidence_ids: list[str] = Field(default_factory=list)
     raw_chunk_ids: list[str] = Field(default_factory=list)
     markdown: str
     token_count: int = Field(ge=1)
@@ -30,6 +31,11 @@ class EvidencePackBuilder:
     ) -> CompanyEvidencePack:
         positive = [card for card in dossier.evidence if card.direction == EvidenceDirection.MOAT_POSITIVE]
         negative = [card for card in dossier.evidence if card.direction == EvidenceDirection.MOAT_NEGATIVE]
+        forward_drivers = [
+            card
+            for card in dossier.evidence
+            if card.forward_driver_type is not None and card.dcf_links
+        ]
         lines = [
             "# COMPANY EVIDENCE PACK",
             "",
@@ -48,15 +54,22 @@ class EvidencePackBuilder:
             "",
             "## Financial Economics",
             "",
-            dossier.financial_summary or "_Not supplied._",
+            dossier.financial_summary or financial_snapshot.to_markdown(),
             "",
-            financial_snapshot.to_markdown(),
+            "## Forward Driver Cards",
+            "",
+        ]
+        if forward_drivers:
+            lines.extend(self._render_forward_driver(card) for card in forward_drivers)
+        else:
+            lines.append("_No grounded forward drivers were promoted._")
+        lines.extend([
             "",
             "# L2. Evidence Cards",
             "",
             "## Positive Moat Evidence",
             "",
-        ]
+        ])
         lines.extend(self._render_card(card) for card in positive)
         lines.extend(["", "## Counterevidence", ""])
         lines.extend(self._render_card(card) for card in negative)
@@ -84,6 +97,7 @@ class EvidencePackBuilder:
         return CompanyEvidencePack(
             issuer_name=dossier.issuer_name,
             evidence_ids=[card.evidence_id for card in dossier.evidence],
+            forward_driver_evidence_ids=[card.evidence_id for card in forward_drivers],
             raw_chunk_ids=[chunk.chunk_id for chunk in raw_chunks],
             markdown=markdown,
             token_count=self.tokens.count(markdown),
@@ -101,6 +115,7 @@ class EvidencePackBuilder:
                 f"- Statement Type: {card.statement_type.value}",
                 f"- Strength: {card.strength:.2f}",
                 f"- Reliability: {card.reliability:.2f}",
+                f"- Economic Scope: {card.economic_scope.value}",
                 f"- Mechanism: {mechanisms}",
                 f"- Source Chunk: {card.source_chunk_id}",
                 f"- Node IDs: {', '.join(card.node_ids)}",
@@ -108,3 +123,23 @@ class EvidencePackBuilder:
             ]
         )
 
+    @staticmethod
+    def _render_forward_driver(card) -> str:
+        implication = " → ".join(card.mechanism) if card.mechanism else "Not specified"
+        return "\n".join(
+            [
+                f"### [{card.evidence_id}] {card.forward_driver_type.value}",
+                "",
+                f"- Evidence: {card.fact}",
+                f"- Implication: {implication}",
+                f"- DCF Link: {', '.join(link.value for link in card.dcf_links)}",
+                f"- Scope: {card.economic_scope.value}",
+                f"- Statement Type: {card.statement_type.value}",
+                f"- Period: {card.period or 'Not specified'}",
+                f"- Horizon: {card.forecast_horizon or 'Not specified'}",
+                f"- Reliability: {card.reliability:.2f}",
+                f"- Source Chunk: {card.source_chunk_id}",
+                f"- Node IDs: {', '.join(card.node_ids)}",
+                "",
+            ]
+        )

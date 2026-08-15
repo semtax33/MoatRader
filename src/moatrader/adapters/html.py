@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import re
+from calendar import monthrange
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -48,15 +49,26 @@ from moatrader.canonical.models import (
 )
 
 
-PARSER_VERSION = "html-ast/0.2.0"
+PARSER_VERSION = "html-ast/0.4.2"
 _DROP_TAGS = {"script", "style", "meta", "link", "noscript", "template", "head"}
 _XBRL_INFRA_TAGS = {"context", "unit", "schemaref", "resources", "references", "hidden"}
+_TABLE_CELL_TAGS = {"th", "td", "te"}
 _DART_SECTION_TAG_RE = re.compile(r"^section-(\d+)$")
+_DART_CONTEXT_RE = re.compile(
+    r"^(?P<relative>BP|P|C)FY(?P<year>\d{4})(?P<kind>[de])"
+    r"(?P<period>FY|FQ|HY|TQ)(?P<mode>[AQ]?)$",
+    re.IGNORECASE,
+)
+_DART_PRIMARY_STATEMENT_RE = re.compile(
+    r"^\{XBRL\}(?P<statement>BS|IS|CF)_(?P<scope>C|S)(?:\d+)?$",
+    re.IGNORECASE,
+)
 _BLOCK_TAGS = {
     "address",
     "article",
     "aside",
     "blockquote",
+    "correction",
     "div",
     "document",
     "dl",
@@ -80,11 +92,20 @@ _BLOCK_TAGS = {
     "pre",
     "section",
     "table",
+    "table-group",
+    "library",
     "ul",
 }
 _NOTE_RE = re.compile(r"^\s*(?P<marker>주\s*\d+\)|※|\*|주석\s*[:：])")
-_UNIT_RE = re.compile(r"(?:\(\s*)?단위\s*[:：]\s*(?P<unit>[^)\n]+)\)?", re.IGNORECASE)
-_YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?:\s*년)?(?:\s*(Q[1-4]|[1-4]Q|[1-4]분기|반기))?")
+_UNIT_RE = re.compile(
+    r"(?:\(\s*)?단위\s*[:：]\s*(?P<unit>[^)\n\r,;。.]{1,40})\)?",
+    re.IGNORECASE,
+)
+_YEAR_RE = re.compile(
+    r"(?<!\d)(?P<year>20\d{2})(?P<year_marker>\s*년)?"
+    r"(?:\s*(?P<period>Q[1-4]|[1-4]Q|[1-4]분기|반기|FY|H[12]))?",
+    re.IGNORECASE,
+)
 _HIDDEN_RE = re.compile(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)", re.IGNORECASE)
 _NUMBER_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?%?$")
 _PAREN_NUMBER_RE = re.compile(r"^\((\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?\)$")
@@ -127,6 +148,7 @@ class ParsedHtml:
     raw_visible_chars: int
     raw_table_count: int
     raw_numeric_cell_count: int
+    raw_structured_fact_count: int
 
 
 @dataclass(slots=True)
@@ -293,20 +315,37 @@ def _section_role(title: str) -> SectionRole | None:
 def _canonical_unit(raw: str) -> UnitSpec:
     compact = re.sub(r"\s+", "", raw).upper()
     mappings: list[tuple[re.Pattern[str], str, Decimal, str | None]] = [
-        (re.compile(r"백만(?:원|KRW)|KRW백만"), "KRW_MILLION", Decimal("1000000"), "KRW"),
-        (re.compile(r"천(?:원|KRW)|KRW천"), "KRW_THOUSAND", Decimal("1000"), "KRW"),
-        (re.compile(r"억(?:원|KRW)"), "KRW_HUNDRED_MILLION", Decimal("100000000"), "KRW"),
-        (re.compile(r"백만USD|USD백만"), "USD_MILLION", Decimal("1000000"), "USD"),
-        (re.compile(r"천USD|USD천"), "USD_THOUSAND", Decimal("1000"), "USD"),
-        (re.compile(r"USD|달러"), "USD", Decimal("1"), "USD"),
-        (re.compile(r"KRW|원"), "KRW", Decimal("1"), "KRW"),
-        (re.compile(r"%|PERCENT"), "PERCENT", Decimal("1"), None),
-        (re.compile(r"명|PERSON"), "PERSON", Decimal("1"), None),
+        (re.compile(r"(?:백만원|백만KRW|KRW백만)"), "KRW_MILLION", Decimal("1000000"), "KRW"),
+        (re.compile(r"(?:천원|천KRW|KRW천)"), "KRW_THOUSAND", Decimal("1000"), "KRW"),
+        (re.compile(r"(?:억원|억KRW|KRW억)"), "KRW_HUNDRED_MILLION", Decimal("100000000"), "KRW"),
+        (re.compile(r"(?:백만USD|USD백만)"), "USD_MILLION", Decimal("1000000"), "USD"),
+        (re.compile(r"(?:천USD|USD천)"), "USD_THOUSAND", Decimal("1000"), "USD"),
+        (re.compile(r"(?:USD|달러)"), "USD", Decimal("1"), "USD"),
+        (re.compile(r"(?:KRW|원)"), "KRW", Decimal("1"), "KRW"),
+        (re.compile(r"(?:%|PERCENT)"), "PERCENT", Decimal("1"), None),
+        (re.compile(r"(?:명|PERSON)"), "PERSON", Decimal("1"), None),
+        (re.compile(r"(?:KG|킬로그램)"), "KILOGRAM", Decimal("1"), None),
+        (re.compile(r"(?:TON|TONNE|톤)"), "TONNE", Decimal("1"), None),
+        (re.compile(r"(?:EA|개|대|건|주)"), "COUNT", Decimal("1"), None),
     ]
     for pattern, canonical, scale, currency in mappings:
-        if pattern.search(compact):
+        if pattern.fullmatch(compact):
             return UnitSpec(raw=raw, canonical=canonical, scale=scale, currency=currency)
     return UnitSpec(raw=raw, canonical=None)
+
+
+def _unit_from_text(text: str) -> UnitSpec | None:
+    """Return only a bounded unit marker, never a prose footnote containing a currency word."""
+
+    matches = list(_UNIT_RE.finditer(text))
+    for match in reversed(matches):
+        raw = normalize_text(match.group("unit")).strip(" ()[]")
+        if not raw or len(raw) > 20 or re.search(r"\s(?:임|이며|하고|또는|기준|당)\b", raw):
+            continue
+        unit = _canonical_unit(raw)
+        if unit.canonical is not None:
+            return unit
+    return None
 
 
 def _numeric_value(raw: str) -> tuple[Decimal | None, UnitSpec | None]:
@@ -334,16 +373,175 @@ def _numeric_value(raw: str) -> tuple[Decimal | None, UnitSpec | None]:
     return parsed, None
 
 
-def _period_from_text(text: str) -> ReportingPeriod | None:
-    match = _YEAR_RE.search(text)
-    if not match:
+def _period_from_text(text: str, *, allow_bare_year: bool = False) -> ReportingPeriod | None:
+    matches = [
+        match
+        for match in _YEAR_RE.finditer(text)
+        if allow_bare_year or match.group("year_marker") or match.group("period")
+    ]
+    if not matches:
         return None
+    # Multi-period tables conventionally present the current period beside
+    # comparatives. Selecting the newest explicit header avoids treating an
+    # older year mentioned in a caption or footnote as table metadata.
+    match = max(matches, key=lambda item: (int(item.group("year")), item.start()))
     return ReportingPeriod(
         kind=PeriodKind.UNKNOWN,
-        fiscal_year=int(match.group(1)),
-        fiscal_period=match.group(2),
+        fiscal_year=int(match.group("year")),
+        fiscal_period=match.group("period"),
         raw_label=match.group(0),
     )
+
+
+def _shift_months(value: date, months: int) -> date:
+    absolute_month = value.year * 12 + value.month - 1 + months
+    year, zero_based_month = divmod(absolute_month, 12)
+    month = zero_based_month + 1
+    source_is_month_end = value.day == monthrange(value.year, value.month)[1]
+    target_day = monthrange(year, month)[1] if source_is_month_end else min(
+        value.day,
+        monthrange(year, month)[1],
+    )
+    return date(year, month, target_day)
+
+
+def _date_in_year(value: date, year: int) -> date:
+    return date(year, value.month, min(value.day, monthrange(year, value.month)[1]))
+
+
+def _dart_reporting_period(context_id: str, metadata: DocumentMetadata) -> ReportingPeriod:
+    """Decode OpenDART's compact ACONTEXT prefix into a canonical period.
+
+    DART primary documents do not include normal XBRL ``context`` elements.
+    Instead, ``TE`` cells carry identifiers such as ``CFY2026dFQA`` (current
+    fiscal-year first-quarter accumulated duration) or ``PFY2025eFQ`` (prior
+    fiscal-year-end instant shown in a first-quarter filing).
+    """
+
+    prefix = context_id.split("_", 1)[0]
+    match = _DART_CONTEXT_RE.fullmatch(prefix)
+    fallback = metadata.reporting_period or ReportingPeriod(kind=PeriodKind.UNKNOWN)
+    if not match:
+        return fallback
+
+    fiscal_year = int(match.group("year"))
+    period_code = match.group("period").upper()
+    mode = match.group("mode").upper()
+    report_end = fallback.instant or fallback.end
+    if report_end is None:
+        return ReportingPeriod(
+            kind=PeriodKind.UNKNOWN,
+            fiscal_year=fiscal_year,
+            fiscal_period=period_code,
+            raw_label=prefix,
+        )
+
+    months_to_year_end = {"FY": 0, "FQ": 9, "HY": 6, "TQ": 3}[period_code]
+    annual_end_template = _shift_months(report_end, months_to_year_end)
+    annual_end = _date_in_year(annual_end_template, fiscal_year)
+    previous_annual_end = _date_in_year(annual_end, fiscal_year - 1)
+    fiscal_start = previous_annual_end + timedelta(days=1)
+    elapsed_months = {"FY": 12, "FQ": 3, "HY": 6, "TQ": 9}[period_code]
+    interim_end = _shift_months(fiscal_start, elapsed_months) - timedelta(days=1)
+    fiscal_period = {"FY": "FY", "FQ": "Q1", "HY": "H1", "TQ": "Q3"}[period_code]
+
+    if match.group("kind").lower() == "e":
+        instant = interim_end if mode == "A" else annual_end
+        return ReportingPeriod(
+            kind=PeriodKind.INSTANT,
+            instant=instant,
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
+            raw_label=prefix,
+        )
+
+    if period_code == "FY" or not mode:
+        start, end = fiscal_start, annual_end
+    elif mode == "Q":
+        start = _shift_months(fiscal_start, max(0, elapsed_months - 3))
+        end = interim_end
+    else:
+        start, end = fiscal_start, interim_end
+    return ReportingPeriod(
+        kind=PeriodKind.DURATION,
+        start=start,
+        end=end,
+        fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period,
+        raw_label=prefix,
+    )
+
+
+def _dart_context_dimensions(context_id: str) -> tuple[ConsolidationScope, list[FactDimension]]:
+    parts = context_id.split("_")[1:]
+    scope = ConsolidationScope.UNKNOWN
+    dimensions: list[FactDimension] = []
+    index = 0
+    while index + 3 < len(parts):
+        axis_namespace, axis_name, member_namespace, member_name = parts[index : index + 4]
+        if axis_name.endswith("Axis") and member_name.endswith("Member"):
+            axis = f"{axis_namespace}_{axis_name}"
+            member = f"{member_namespace}_{member_name}"
+            if member.endswith("ConsolidatedMember"):
+                scope = ConsolidationScope.CONSOLIDATED
+            elif member.endswith("SeparateMember"):
+                scope = ConsolidationScope.SEPARATE
+            else:
+                dimensions.append(FactDimension(axis=axis, member=member))
+            index += 4
+            continue
+        index += 1
+    return scope, dimensions
+
+
+def _dart_fact_label(element: etree._Element) -> str | None:
+    row = element.getparent()
+    while row is not None and _tag(row) != "tr":
+        row = row.getparent()
+    if row is None:
+        return None
+    cells = [child for child in row if _tag(child) in _TABLE_CELL_TAGS]
+    try:
+        position = cells.index(element)
+    except ValueError:
+        return None
+    labels = [
+        _inline_text(cell)
+        for cell in cells[:position]
+        if _inline_text(cell)
+        and _attribute(cell, "acode") is None
+        and _attribute(cell, "acontext") is None
+    ]
+    return " | ".join(labels) or None
+
+
+def _dart_fact_unit(
+    element: etree._Element,
+    inferred: UnitSpec | None,
+    cache: dict[str, UnitSpec | None] | None = None,
+) -> UnitSpec | None:
+    if inferred is not None:
+        return inferred
+    table = _nearest_table(element)
+    if table is None:
+        return None
+    table_key = _xpath(table)
+    if cache is not None and table_key in cache:
+        return cache[table_key]
+    candidates = [table]
+    for prior in table.itersiblings(preceding=True):
+        if len(candidates) >= 4 or _tag(prior) in {"title", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            break
+        candidates.append(prior)
+    for candidate in candidates:
+        unit = _unit_from_text(_inline_text(candidate))
+        if unit is not None:
+            if cache is not None:
+                cache[table_key] = unit
+            return unit
+    if cache is not None:
+        cache[table_key] = None
+    return None
 
 
 def _nearest_table(element: etree._Element) -> etree._Element | None:
@@ -359,6 +557,214 @@ def _direct_rows(table: etree._Element) -> list[etree._Element]:
     return [row for row in table.iterdescendants() if _tag(row) == "tr" and _nearest_table(row) is table]
 
 
+def _dart_primary_statement_info(
+    element: etree._Element,
+) -> tuple[str, ConsolidationScope] | None:
+    for ancestor in element.iterancestors():
+        if _tag(ancestor) != "table-group":
+            continue
+        match = _DART_PRIMARY_STATEMENT_RE.fullmatch(_attribute(ancestor, "aclass") or "")
+        if not match:
+            return None
+        scope = (
+            ConsolidationScope.CONSOLIDATED
+            if match.group("scope").upper() == "C"
+            else ConsolidationScope.SEPARATE
+        )
+        return match.group("statement").upper(), scope
+    return None
+
+
+def _dart_table_header_context(
+    element: etree._Element,
+    cache: dict[
+        str,
+        dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]],
+    ]
+    | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]] | None:
+    """Return the target column's header path and every header in its table.
+
+    Some OpenDART primary statements carry ``ACODE`` but omit ``ACONTEXT``.
+    Their period context is encoded in multi-row table headers instead. This
+    routine expands header row/column spans against the original DOM so the
+    target numeric cell can be matched to its exact column without depending
+    on visible-text heuristics alone.
+    """
+
+    table = _nearest_table(element)
+    if table is None:
+        return None
+    table_key = _xpath(table)
+    if cache is not None and table_key in cache:
+        return cache[table_key].get(_xpath(element))
+    rows = _direct_rows(table)
+    grid: dict[tuple[int, int], etree._Element] = {}
+    origins: dict[str, tuple[int, int]] = {}
+    for row_index, row in enumerate(rows):
+        col_index = 0
+        cells = [child for child in row if _tag(child) in _TABLE_CELL_TAGS]
+        for cell in cells:
+            while (row_index, col_index) in grid:
+                col_index += 1
+            try:
+                rowspan = max(1, int(_attribute(cell, "rowspan") or "1"))
+            except ValueError:
+                rowspan = 1
+            try:
+                colspan = max(1, int(_attribute(cell, "colspan") or "1"))
+            except ValueError:
+                colspan = 1
+            origins[_xpath(cell)] = (row_index, col_index)
+            for target_row in range(row_index, row_index + rowspan):
+                for target_col in range(col_index, col_index + colspan):
+                    grid[(target_row, target_col)] = cell
+            col_index += colspan
+    def entry(header: etree._Element) -> tuple[str, str]:
+        return (
+            normalize_text(_attribute(header, "eng") or ""),
+            normalize_text(_inline_text(header)),
+        )
+
+    contexts: dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]] = {}
+    all_headers_by_row: dict[int, list[tuple[str, str]]] = {}
+    for target_row in {row_index for row_index, _col_index in origins.values()}:
+        all_headers: list[tuple[str, str]] = []
+        seen: set[int] = set()
+        for (row_index, _col_index), header in sorted(grid.items()):
+            if row_index >= target_row or _tag(header) != "th" or id(header) in seen:
+                continue
+            seen.add(id(header))
+            all_headers.append(entry(header))
+        all_headers_by_row[target_row] = all_headers
+    for cell_key, (target_row, target_col) in origins.items():
+        target_headers: list[tuple[str, str]] = []
+        seen: set[int] = set()
+        for row_index in range(target_row):
+            header = grid.get((row_index, target_col))
+            if header is None or _tag(header) != "th" or id(header) in seen:
+                continue
+            seen.add(id(header))
+            target_headers.append(entry(header))
+        contexts[cell_key] = (target_headers, all_headers_by_row[target_row])
+    if cache is not None:
+        cache[table_key] = contexts
+    return contexts.get(_xpath(element))
+
+
+def _dart_header_period_code(headers: list[tuple[str, str]]) -> str:
+    combined = " ".join(f"{eng} {text}" for eng, text in headers).upper()
+    if re.search(r"(?:\b1\s*Q\b|1\s*분기)", combined):
+        return "FQ"
+    if re.search(r"(?:\bHY\b|반기)", combined):
+        return "HY"
+    if re.search(r"(?:\b3\s*Q\b|3\s*분기)", combined):
+        return "TQ"
+    return "FY"
+
+
+def _dart_legacy_table_context(
+    element: etree._Element,
+    metadata: DocumentMetadata,
+    header_cache: dict[
+        str,
+        dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]],
+    ]
+    | None = None,
+) -> tuple[str, ReportingPeriod, ConsolidationScope] | None:
+    statement_info = _dart_primary_statement_info(element)
+    header_context = _dart_table_header_context(element, header_cache)
+    fallback = metadata.reporting_period
+    report_end = (fallback.instant or fallback.end) if fallback else None
+    if statement_info is None or header_context is None or report_end is None:
+        return None
+    statement, scope = statement_info
+    target_headers, all_headers = header_context
+    if not target_headers:
+        return None
+
+    explicit_years = [
+        int(match.group(1))
+        for eng, _text in all_headers
+        for match in [re.search(r"\bFY\s*(20\d{2})\b", eng, re.IGNORECASE)]
+        if match
+    ]
+    current_explicit_year = max(explicit_years, default=report_end.year)
+    target_explicit_year = next(
+        (
+            int(match.group(1))
+            for eng, _text in target_headers
+            for match in [re.search(r"\bFY\s*(20\d{2})\b", eng, re.IGNORECASE)]
+            if match
+        ),
+        None,
+    )
+    relative_marker = next(
+        (
+            match.group(1).upper()
+            for eng, _text in target_headers
+            for match in [re.match(r"^\s*([CP])F", eng, re.IGNORECASE)]
+            if match
+        ),
+        None,
+    )
+    if target_explicit_year is not None:
+        year_offset = max(0, current_explicit_year - target_explicit_year)
+        fiscal_year = target_explicit_year
+    elif relative_marker is not None:
+        year_offset = 0 if relative_marker == "C" else 1
+        fiscal_year = current_explicit_year - year_offset
+    else:
+        return None
+
+    current_headers = [
+        (eng, text)
+        for eng, text in all_headers
+        if re.match(r"^\s*CF", eng, re.IGNORECASE)
+        or re.search(rf"\bFY\s*{current_explicit_year}\b", eng, re.IGNORECASE)
+    ]
+    target_code = _dart_header_period_code(target_headers)
+    current_code = _dart_header_period_code(current_headers) if current_headers else target_code
+    elapsed_months = {"FQ": 3, "HY": 6, "TQ": 9, "FY": 12}
+    current_fiscal_start = _shift_months(
+        report_end,
+        -elapsed_months[current_code],
+    ) + timedelta(days=1)
+    previous_annual_end = current_fiscal_start - timedelta(days=1)
+    if target_code == "FY" and current_code != "FY" and year_offset >= 1:
+        target_end = _shift_months(previous_annual_end, -12 * (year_offset - 1))
+    else:
+        target_end = _shift_months(report_end, -12 * year_offset)
+
+    raw_label = " > ".join(text or eng for eng, text in target_headers if text or eng)
+    if statement == "BS":
+        period = ReportingPeriod(
+            kind=PeriodKind.INSTANT,
+            instant=target_end,
+            fiscal_year=fiscal_year,
+            fiscal_period={"FQ": "Q1", "HY": "H1", "TQ": "Q3", "FY": "FY"}[target_code],
+            raw_label=raw_label,
+        )
+    else:
+        accumulated = not any(
+            re.search(r"THREE\s*MONTH|3\s*개월", f"{eng} {text}", re.IGNORECASE)
+            for eng, text in target_headers
+        )
+        duration_months = elapsed_months[target_code] if accumulated else 3
+        period = ReportingPeriod(
+            kind=PeriodKind.DURATION,
+            start=_shift_months(target_end, -duration_months) + timedelta(days=1),
+            end=target_end,
+            fiscal_year=fiscal_year,
+            fiscal_period={"FQ": "Q1", "HY": "H1", "TQ": "Q3", "FY": "FY"}[target_code],
+            raw_label=raw_label,
+        )
+    context_id = "TABLE:" + ":".join(
+        [statement, scope.value, *(eng or text for eng, text in target_headers)]
+    )
+    return context_id, period, scope
+
+
 def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
     source_ref = _source_ref(element, state)
     original_rows = _direct_rows(element)
@@ -368,7 +774,7 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
 
     for row_index, row_element in enumerate(original_rows):
         col_index = 0
-        cells = [child for child in row_element if _tag(child) in {"th", "td"}]
+        cells = [child for child in row_element if _tag(child) in _TABLE_CELL_TAGS]
         for cell_element in cells:
             while (row_index, col_index) in grid:
                 col_index += 1
@@ -446,10 +852,13 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
         payload_text = getattr(event.payload, "normalized_text", "")
         if payload_text:
             previous_texts.append(payload_text)
+        # A completed data table is a hard context boundary. Its preceding
+        # unit marker belongs to that table, not to the next operating table.
+        if event.event_type == "TABLE":
+            break
     previous_texts.reverse()
     context_text = "\n".join(previous_texts)
-    unit_match = _UNIT_RE.search(context_text)
-    unit = _canonical_unit(unit_match.group("unit").strip()) if unit_match else None
+    unit = _unit_from_text(context_text)
     caption_elements = [child for child in element if _tag(child) == "caption"]
     caption = _inline_text(caption_elements[0]) if caption_elements else None
     if not caption:
@@ -457,7 +866,15 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
             if not _UNIT_RE.search(candidate) and not _NOTE_RE.search(candidate) and len(candidate) <= 160:
                 caption = candidate
                 break
-    period = _period_from_text("\n".join(filter(None, [caption or "", context_text])))
+    header_text = "\n".join(
+        cell.normalized_text
+        for row in canonical_rows[: max(1, min(3, header_row_count or 1))]
+        for cell in row.cells
+        if cell.normalized_text
+    )
+    period = _period_from_text(header_text, allow_bare_year=True) or _period_from_text(
+        "\n".join(filter(None, [caption or "", context_text]))
+    )
     normalized_table_text = "\n".join(
         " | ".join(cell.normalized_text for cell in row.cells) for row in canonical_rows
     )
@@ -678,7 +1095,17 @@ def _walk_dom(element: etree._Element, state: ParseState) -> None:
 
     if not _has_direct_block_children(element):
         text = _inline_text(element)
-        if text and tag not in {"html", "body", "tbody", "thead", "tfoot", "tr", "td", "th"}:
+        if text and tag not in {
+            "html",
+            "body",
+            "tbody",
+            "thead",
+            "tfoot",
+            "tr",
+            "td",
+            "th",
+            "te",
+        }:
             _emit_text_event(element, text, state, forced_rule="R007_LEAF_CONTAINER")
         return
 
@@ -808,7 +1235,29 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
         raw_numeric_cells = sum(
             1
             for element in root.iter()
-            if _tag(element) in {"th", "td"} and _numeric_value(_inline_text(element))[0] is not None
+            if _tag(element) in _TABLE_CELL_TAGS
+            and _numeric_value(_inline_text(element))[0] is not None
+        )
+        raw_structured_facts = sum(
+            1
+            for element in root.iter()
+            if (
+                _tag(element) in {"nonfraction", "nonnumeric"}
+                and _attribute(element, "name") is not None
+            )
+            or (
+                self.source_type == SourceType.DART
+                and _tag(element) == "te"
+                and _attribute(element, "acode") is not None
+                and bool(_inline_text(element))
+                and (
+                    _attribute(element, "acontext") is not None
+                    or (
+                        _numeric_value(_inline_text(element))[0] is not None
+                        and _dart_primary_statement_info(element) is not None
+                    )
+                )
+            )
         )
         return ParsedHtml(
             root=root,
@@ -817,6 +1266,7 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
             raw_visible_chars=len(re.sub(r"\s+", "", raw_visible)),
             raw_table_count=raw_tables,
             raw_numeric_cell_count=raw_numeric_cells,
+            raw_structured_fact_count=raw_structured_facts,
         )
 
     def extract_metadata(self, source: RawDocument) -> DocumentMetadata:
@@ -833,7 +1283,7 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
         if hints.get("availability_precision"):
             precision = AvailabilityPrecision(str(hints["availability_precision"]).upper())
         start = _optional_date(hints.get("period_start"))
-        end = _optional_date(hints.get("period_end"))
+        end = _optional_date(hints.get("period_end") or hints.get("report_date"))
         instant = _optional_date(hints.get("period_instant"))
         reporting_period: ReportingPeriod | None = None
         if start and end:
@@ -851,8 +1301,26 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
                 fiscal_year=hints.get("fiscal_year"),
                 fiscal_period=hints.get("fiscal_period"),
             )
+        elif end:
+            reporting_period = ReportingPeriod(
+                kind=PeriodKind.UNKNOWN,
+                end=end,
+                fiscal_year=hints.get("fiscal_year") or end.year,
+                fiscal_period=hints.get("fiscal_period"),
+                raw_label=end.isoformat(),
+            )
         source_specific = dict(hints.get("source_specific", {}))
-        for key in ("rcept_no", "corp_code", "accession_number", "form_type", "cik"):
+        for key in (
+            "rcept_no",
+            "corp_code",
+            "accession_number",
+            "form_type",
+            "cik",
+            "report_date",
+            "period_start",
+            "period_end",
+            "period_instant",
+        ):
             if hints.get(key) is not None:
                 source_specific[key] = hints[key]
         return DocumentMetadata(
@@ -932,8 +1400,84 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
     ) -> list[StructuredFact]:
         contexts = self._context_index(parsed)
         facts: list[StructuredFact] = []
+        dart_header_cache: dict[
+            str,
+            dict[str, tuple[list[tuple[str, str]], list[tuple[str, str]]]],
+        ] = {}
+        dart_unit_cache: dict[str, UnitSpec | None] = {}
         for element in parsed.root.iter():
-            if _tag(element) not in {"nonfraction", "nonnumeric"}:
+            tag = _tag(element)
+            if tag == "te" and self.source_type == SourceType.DART:
+                concept = _attribute(element, "acode")
+                context_id = _attribute(element, "acontext")
+                raw = _inline_text(element)
+                if not concept or not raw:
+                    continue
+                numeric, inferred_unit = _numeric_value(raw)
+                if context_id:
+                    period = _dart_reporting_period(context_id, metadata)
+                    scope, dimensions = _dart_context_dimensions(context_id)
+                    fact_prefix = "DF"
+                else:
+                    inferred_context = _dart_legacy_table_context(
+                        element,
+                        metadata,
+                        dart_header_cache,
+                    )
+                    if numeric is None or inferred_context is None:
+                        continue
+                    context_id, period, scope = inferred_context
+                    dimensions = []
+                    fact_prefix = "DI"
+                if (
+                    numeric is not None
+                    and numeric > 0
+                    and (_attribute(element, "anegated") or "").upper() == "Y"
+                ):
+                    numeric = -numeric
+                decimals_raw = _attribute(element, "adecimal")
+                decimals: int | Literal["INF"] | None = None
+                if decimals_raw:
+                    try:
+                        decimals = int(decimals_raw)
+                    except ValueError:
+                        if decimals_raw.upper() == "INF":
+                            decimals = "INF"
+                source_ref = SourceRef(
+                    source_type=self.source_type,
+                    document_id=metadata.source_document_id,
+                    uri=uri,
+                    xpath=_xpath(element),
+                    source_hash=parsed.raw_sha256,
+                )
+                fact_id = stable_id(
+                    fact_prefix,
+                    metadata.source_document_id,
+                    source_ref.xpath,
+                    concept,
+                    context_id,
+                    raw,
+                )
+                facts.append(
+                    StructuredFact(
+                        fact_id=fact_id,
+                        concept=concept,
+                        label=_dart_fact_label(element),
+                        value=numeric if numeric is not None else raw,
+                        numeric_value=numeric,
+                        unit=_dart_fact_unit(element, inferred_unit, dart_unit_cache),
+                        period=period,
+                        scope=scope,
+                        dimensions=dimensions,
+                        context_id=context_id,
+                        decimals=decimals,
+                        available_at=metadata.available_at,
+                        source_refs=[source_ref],
+                    )
+                )
+                continue
+
+            if tag not in {"nonfraction", "nonnumeric"}:
                 continue
             concept = _attribute(element, "name")
             if not concept:
@@ -1035,7 +1579,13 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
                 object_id=fact.fact_id,
                 source_refs=fact.source_refs,
                 derived_from_ids=fact.derived_from_ids,
-                transform="inline_xbrl_extract",
+                transform=(
+                    "dart_te_xbrl_extract"
+                    if fact.fact_id.startswith("DF_")
+                    else "dart_te_table_context_inference"
+                    if fact.fact_id.startswith("DI_")
+                    else "inline_xbrl_extract"
+                ),
                 transform_version=PARSER_VERSION,
             )
         for asset in assets:
@@ -1061,6 +1611,11 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
         numeric_retention = (
             numeric_count / parsed.raw_numeric_cell_count if parsed.raw_numeric_cell_count else None
         )
+        structured_fact_retention = (
+            len(facts) / parsed.raw_structured_fact_count
+            if parsed.raw_structured_fact_count
+            else None
+        )
         text_values = [
             normalize_text(node.normalized_text).casefold()
             for node in nodes
@@ -1078,6 +1633,8 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
             warnings.append("canonical table count differs from raw DOM table count (nested tables may explain this)")
         if numeric_retention is not None and numeric_retention < 0.99:
             warnings.append("numeric cell retention is below the 99% MVP target")
+        if structured_fact_retention is not None and structured_fact_retention < 0.99:
+            warnings.append("structured fact retention is below the 99% MVP target")
         quality = QualityMetrics(
             raw_visible_chars=parsed.raw_visible_chars,
             ast_chars=ast_chars,
@@ -1087,6 +1644,9 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
             raw_numeric_cell_count=parsed.raw_numeric_cell_count,
             numeric_cell_count=numeric_count,
             numeric_retention=numeric_retention,
+            raw_structured_fact_count=parsed.raw_structured_fact_count,
+            structured_fact_count=len(facts),
+            structured_fact_retention=structured_fact_retention,
             paragraph_count=sum(isinstance(node, ParagraphNode) for node in nodes),
             heading_count=sum(isinstance(node, SectionNode) for node in nodes),
             unknown_block_count=sum(isinstance(node, UnknownBlockNode) for node in nodes),
