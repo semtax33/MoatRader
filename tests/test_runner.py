@@ -7,8 +7,12 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
+    AtomicEvidenceJudgment,
+    CanonicalClaimSignature,
     CitedSummaryClaim,
     CoverageMetrics,
     Durability,
@@ -30,32 +34,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
     if request.task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
-        chunk_id = str(request.metadata["chunk_id"])
-        match = re.search(
-            r"--- BEGIN CANONICAL CHUNK ---\s*(.*?)\s*--- END CANONICAL CHUNK ---",
-            request.user,
-            re.DOTALL,
-        )
-        assert match is not None
-        raw_quote = match.group(1).strip()
-        return EvidenceExtractionResult(
-            chunk_id=chunk_id,
-            cards=[
-                EvidenceCard(
-                    evidence_id="pending",
-                    source_chunk_id=chunk_id,
-                    node_ids=[str(request.metadata["node_ids"][0])],
-                    evidence_type=EvidenceType.SWITCHING_COST,
-                    statement_type=StatementType.DISCLOSED_FACT,
-                    fact="The disclosure supports a repeatable customer relationship.",
-                    raw_quote=raw_quote,
-                    mechanism=["workflow integration", "switching friction"],
-                    direction=EvidenceDirection.MOAT_POSITIVE,
-                    strength=0.7,
-                    source_type=SourceType(str(request.metadata["source_type"])),
-                    reliability=0.8,
-                )
-            ],
+        return AtomicEvidenceJudgment(
+            is_investment_relevant=True,
+            evidence_type=EvidenceType.SWITCHING_COST,
+            statement_type=StatementType.DISCLOSED_FACT,
+            fact="The disclosure supports a repeatable customer relationship.",
+            mechanism=["workflow integration", "switching friction"],
+            direction=EvidenceDirection.MOAT_POSITIVE,
+            strength=0.7,
+            claim_signature=CanonicalClaimSignature(
+                moat_source=EvidenceType.SWITCHING_COST,
+                subject="customer workflow",
+                predicate="switching friction",
+                direction=EvidenceDirection.MOAT_POSITIVE,
+                horizon="LONG",
+            ),
         )
     if request.task == LLMTask.SECTION_SUMMARY:
         evidence_ids = list(request.metadata["evidence_ids"])
@@ -99,8 +92,16 @@ def _config(run_id: str, *, resume: bool = False, dry_run: bool = False, workers
         resume=resume,
         dry_run=dry_run,
         workers=workers,
-        evidence_batch_max_tokens=None,
     )
+
+
+def test_moat_model_latest_alias_is_rejected() -> None:
+    with pytest.raises(ValueError, match="exact pinned model ID"):
+        UniverseRunConfig(
+            run_id="unpinned",
+            as_of=datetime.fromisoformat("2025-05-16T00:00:00+09:00"),
+            moat_model="gpt-5-chat-latest",
+        )
 
 
 def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> None:
@@ -117,13 +118,15 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
     assert company.moat_score.economic_moat_score == 5.0
-    assert company.moat_score.llm_proposed_score == 7.0
+    assert company.moat_score.llm_proposed_score is None
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
     assert result.ranking == []  # fixture DCF has intentionally insufficient provenance
     company_dir = tmp_path / "integration" / "companies" / "SAMPLE"
     assert (company_dir / "evidence-pack.md").is_file()
     assert (company_dir / "evidence-clusters.json").is_file()
+    assert (company_dir / "claim-clusters.json").is_file()
+    assert (company_dir / "metamorphic-audit.json").is_file()
     assert (company_dir / "run-manifest.json").is_file()
     assert (company_dir / "dcf-assumptions.json").is_file()
     assert (company_dir / "dcf-manifest.json").is_file()
@@ -147,9 +150,10 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert dcf_payload["assumptions"]["base_revenue"] == "1000"
     assert "terminal_value_share" in dcf_payload
     run_manifest = json.loads((company_dir / "run-manifest.json").read_text(encoding="utf-8"))
-    assert run_manifest["input_sha256"] == json.loads(
-        (company_dir / "moat-request.json").read_text(encoding="utf-8")
-    )["input_sha256"]
+    assert run_manifest["model"] == "deterministic-python"
+    assert (company_dir / "moat-reducer-input.json").is_file()
+    assert not (company_dir / "moat-request.json").exists()
+    assert all(item["task"] != "FINAL_MOAT_SCORING" for item in call_audit)
 
 
 def test_runner_preserves_official_primary_document_url_in_provenance(tmp_path: Path) -> None:
@@ -386,41 +390,11 @@ def test_partial_evidence_checkpoints_resume_per_chunk(tmp_path: Path) -> None:
 
     assert resumed.companies[0].status == CompanyRunStatus.COMPLETE
     assert successful_chunk[0] not in resumed_local_chunks
-    assert len(resumed_local_chunks) == 1
+    assert resumed_local_chunks
 
 
-def test_large_evidence_layer_is_pruned_to_context_budget(tmp_path: Path) -> None:
+def test_canonical_claim_set_is_not_pruned_by_llm_context_budget(tmp_path: Path) -> None:
     universe = load_universe_manifest(ROOT / "examples" / "universe.csv")
-
-    def verbose_handler(request: LLMRequest, response_model: type[Any]) -> Any:
-        if request.task != LLMTask.LOCAL_EVIDENCE_EXTRACTION:
-            return _fixture_handler(request, response_model)
-        chunk_id = str(request.metadata["chunk_id"])
-        cards = []
-        for index in range(24):
-            cards.append(
-                EvidenceCard(
-                    evidence_id=f"pending-{index}",
-                    source_chunk_id=chunk_id,
-                    node_ids=[str(request.metadata["node_ids"][0])],
-                    evidence_type=EvidenceType.SWITCHING_COST,
-                    statement_type=StatementType.DISCLOSED_FACT,
-                    fact=("Detailed grounded competitive evidence and operating context. " * 25) + chr(65 + index),
-                    raw_quote=re.search(
-                        r"--- BEGIN CANONICAL CHUNK ---\s*(.*?)\s*--- END CANONICAL CHUNK ---",
-                        request.user,
-                        re.DOTALL,
-                    ).group(1).strip(),
-                    mechanism=["workflow integration", "qualification period", "switching friction"],
-                    direction=(
-                        EvidenceDirection.MOAT_NEGATIVE if index % 7 == 0 else EvidenceDirection.MOAT_POSITIVE
-                    ),
-                    strength=0.6,
-                    source_type=SourceType(str(request.metadata["source_type"])),
-                    reliability=0.7,
-                )
-            )
-        return EvidenceExtractionResult(chunk_id=chunk_id, cards=cards)
 
     config = _config("pruning")
     config.context_tokens = 9_000
@@ -428,19 +402,19 @@ def test_large_evidence_layer_is_pruned_to_context_budget(tmp_path: Path) -> Non
     result = MoatUniverseRunner(
         config=config,
         output_directory=tmp_path,
-        transport=FunctionTransport(verbose_handler),
+        transport=FunctionTransport(_fixture_handler),
     ).run(universe, universe.companies)
 
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
     assert company.moat_score.document_coverage.evidence_retention is not None
-    assert company.moat_score.document_coverage.evidence_retention < 1
+    assert company.moat_score.document_coverage.evidence_retention == 1
     pruning = json.loads(
         (tmp_path / "pruning" / "companies" / "SAMPLE" / "evidence-pruning.json").read_text(encoding="utf-8")
     )
-    assert pruning["pruned"] is True
-    assert pruning["selected_tokens"] <= pruning["target_tokens"]
+    assert pruning["pruned"] is False
+    assert pruning["dropped_evidence_ids"] == []
 
 
 def test_company_failure_does_not_abort_other_tickers(tmp_path: Path) -> None:

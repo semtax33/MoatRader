@@ -194,8 +194,15 @@ def main() -> int:
             errors = validate_moat_score(company.moat_score, cards)
             if errors:
                 score_contract_errors.extend(f"{as_of}/{ticker}: {error}" for error in errors)
-            if company.moat_score.llm_proposed_score is None:
-                score_contract_errors.append(f"{as_of}/{ticker}: missing llm_proposed_score audit field")
+            if company.moat_score.llm_proposed_score is not None:
+                score_contract_errors.append(f"{as_of}/{ticker}: final LLM score proposal must be absent")
+            if company.moat_score.economic_moat_score > 0 and not company.moat_score.canonical_claim_ids:
+                score_contract_errors.append(f"{as_of}/{ticker}: positive score without canonical claim IDs")
+            metamorphic_path = artifact / "metamorphic-audit.json"
+            if not metamorphic_path.is_file() or json.loads(
+                metamorphic_path.read_text(encoding="utf-8-sig")
+            ).get("passed") is not True:
+                score_contract_errors.append(f"{as_of}/{ticker}: missing or failed metamorphic gate")
             for mechanism in company.moat_score.mechanisms:
                 if mechanism.evidence_type not in STRUCTURAL_MOAT_TYPES:
                     score_contract_errors.append(f"{as_of}/{ticker}: non-structural mechanism")
@@ -213,9 +220,11 @@ def main() -> int:
                 call = json.loads(line)
                 models[call["model"]] += 1
                 tasks[call["task"]] += 1
-                if call["task"] in {"LOCAL_EVIDENCE_EXTRACTION", "FINAL_MOAT_SCORING"} and not str(
+                if call["task"] == "FINAL_MOAT_SCORING":
+                    routing_errors.append(f"{as_of}/{ticker}: forbidden FINAL_MOAT_SCORING LLM call")
+                if call["task"] == "LOCAL_EVIDENCE_EXTRACTION" and not str(
                     call["model"]
-                ).startswith(("gpt-5-luna", "gpt-5.6-luna", "fixture")):
+                ).startswith(("gpt-5.6-luna", "fixture")):
                     routing_errors.append(f"{as_of}/{ticker}: {call['task']} -> {call['model']}")
                 if call["task"] == "SECTION_SUMMARY" and not str(call["model"]).startswith(
                     ("gpt-5-nano", "fixture")

@@ -85,6 +85,44 @@ def _candidate_replay_audit(result: UniverseRunResult) -> tuple[int, int, list[s
     return total, replayed, failures
 
 
+def _metamorphic_audit(result: UniverseRunResult) -> tuple[dict[str, Any], list[str]]:
+    reports: dict[str, Any] = {}
+    failures: list[str] = []
+    required = {
+        "sentence_shuffle",
+        "paragraph_shuffle",
+        "duplicate_evidence",
+        "summary_injection",
+        "whitespace_heading_change",
+        "irrelevant_boilerplate_injection",
+        "node_order_change",
+    }
+    for company in result.companies:
+        path = Path(company.artifact_directory) / "metamorphic-audit.json"
+        if not path.is_file():
+            failures.append(f"{company.ticker}: missing metamorphic audit")
+            continue
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        reports[company.ticker] = payload
+        transformations = payload.get("transformations") or {}
+        missing = required - set(transformations)
+        if payload.get("passed") is not True or missing:
+            failures.append(
+                f"{company.ticker}: metamorphic gate failed or incomplete; missing={sorted(missing)}"
+            )
+            continue
+        for name in required:
+            item = transformations[name]
+            if (
+                item.get("atomic_key_jaccard") != 1.0
+                or item.get("evidence_jaccard") != 1.0
+                or item.get("claim_jaccard") != 1.0
+                or item.get("score_delta") != 0.0
+            ):
+                failures.append(f"{company.ticker}: {name} is not zero-tolerance invariant")
+    return reports, failures
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Approve a 3..5-company repeated-run and adjacent-date MOAT preflight before a large run."
@@ -95,6 +133,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--minimum-repeat-spearman", type=float, default=1.0)
     parser.add_argument("--minimum-evidence-jaccard", type=float, default=1.0)
+    parser.add_argument("--minimum-claim-jaccard", type=float, default=1.0)
     parser.add_argument("--minimum-adjacent-spearman", type=float, default=0.50)
     parser.add_argument("--minimum-positive-sample-companies", type=int, default=1)
     parser.add_argument("--minimum-distinct-scores-per-date", type=int, default=2)
@@ -132,12 +171,14 @@ def main() -> int:
     repeat_reports: dict[str, Any] = {}
     replay_total = 0
     replay_hits = 0
+    metamorphic_reports: dict[str, Any] = {}
     for date in dates:
         report = compare_runs(
             baselines[date],
             candidates[date],
             minimum_score_spearman=args.minimum_repeat_spearman,
             minimum_mean_evidence_jaccard=args.minimum_evidence_jaccard,
+            minimum_mean_claim_jaccard=args.minimum_claim_jaccard,
             maximum_median_score_delta=0.0,
             maximum_company_score_delta=0.0,
         )
@@ -156,6 +197,9 @@ def main() -> int:
         replay_total += total
         replay_hits += hits
         failures.extend(f"{date}: {failure}" for failure in replay_failures)
+        date_metamorphic, metamorphic_failures = _metamorphic_audit(baselines[date])
+        metamorphic_reports[date] = date_metamorphic
+        failures.extend(f"{date}: {failure}" for failure in metamorphic_failures)
         baseline_scores = [
             float(company.moat_score.economic_moat_score)
             for company in baselines[date].companies
@@ -216,6 +260,7 @@ def main() -> int:
         "execution_contract_sha256": contract_sha256(contracts[0]),
         "minimum_repeat_spearman": args.minimum_repeat_spearman,
         "minimum_evidence_jaccard": args.minimum_evidence_jaccard,
+        "minimum_claim_jaccard": args.minimum_claim_jaccard,
         "minimum_adjacent_spearman": args.minimum_adjacent_spearman,
         "minimum_positive_sample_companies": args.minimum_positive_sample_companies,
         "minimum_distinct_scores_per_date": args.minimum_distinct_scores_per_date,
@@ -223,6 +268,7 @@ def main() -> int:
         "candidate_replay_calls": replay_total,
         "candidate_replay_hits": replay_hits,
         "repeatability": repeat_reports,
+        "metamorphic": metamorphic_reports,
         "adjacent_stability": adjacent_reports,
         "inputs": {
             "universe_sha256": hashlib.sha256((workspace / "inputs" / "universe.csv").read_bytes()).hexdigest(),

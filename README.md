@@ -8,7 +8,7 @@ DART, SEC EDGAR, IR처럼 포맷이 다른 금융 문서를 하나의 source-neu
 - AST는 사람이 읽는 문서 구조, `StructuredFact`는 DCF 등 계산용 숫자입니다.
 - 모든 AST node, fact, asset, evidence는 원문 위치까지 역추적할 수 있어야 합니다.
 - `available_at`은 timezone-aware 필수값이며 PIT(point-in-time) 필터에 사용합니다.
-- LLM은 구조 복원이나 DCF 산술을 하지 않습니다. LLM의 첫 역할은 semantic chunk에서 evidence를 추출하는 것입니다.
+- LLM은 구조 복원, DCF 산술, 최종 MOAT 채점을 하지 않습니다. 결정론적으로 분리된 atomic evidence 한 건을 고정 rubric으로 분류하고 표시용 요약만 만듭니다.
 
 ## 현재 구현 범위
 
@@ -28,9 +28,9 @@ DART, SEC EDGAR, IR처럼 포맷이 다른 금융 문서를 하나의 source-neu
 - inline XBRL context/fact 추출
 - semantic chunking, 큰 표의 row-group chunking, cross-filing exact/near dedup과 숫자 변경 보존
 - 구조화 Markdown renderer
-- OpenAI Responses API Structured Outputs 기반 evidence/summary/MOAT 실행, retry와 deterministic schema repair
-- 근거 ID·node ID·숫자·인용문 validator와 chunk/section 단위 재개 체크포인트
-- 경제적 질문별 BM25 검색과 L2/L3 context budget pruning
+- OpenAI Responses API Structured Outputs 기반 atomic evidence 분류/표시용 summary 실행, retry와 deterministic schema repair
+- 근거 ID·node ID·숫자·인용문 validator와 atomic-key/section 단위 재개 체크포인트
+- evidence-level replay, canonical claim set과 경제적 질문별 BM25 검색
 - L1 summary / L2 evidence / L3 raw source의 Company Evidence Pack
 - PIT financial snapshot, Python 파생지표, deterministic unlevered DCF
 - MOAT·DCF 할인·신뢰도·coverage 기반 종목 필터/랭커
@@ -51,14 +51,14 @@ IR HTML/PDF/PPT ─────────────────── IR HTM
                                                 ↓
                                       Semantic Chunker
                                                 ↓
-                                  Local Evidence Extraction (LLM)
+                              Deterministic Atomic Segmentation
                                                 ↓
-                                Evidence validation / dedup / summary
+                               Atomic Classification (LLM, Luna)
                                                 ↓
-                             L1 + L2 + L3 Company Evidence Pack
+                     Validation → Canonical Claim Set → Python Reducer
                                       ┌─────────┴─────────┐
                                       ↓                   ↓
-                                MOAT scoring        Python DCF
+                           deterministic MOAT       Python DCF
                                       └─────────┬─────────┘
                                                 ↓
                                 PIT value + quality ranking
@@ -197,7 +197,7 @@ moatrader moat run `
 입력 manifest가 5종목을 초과하면 전체 실행은 기본적으로 차단됩니다. 먼저 같은 3~5종목을 두 번 실행하고, 반복 실행 및 인접 시점 상관관계가 모두 통과한 preflight report를 만들어야 합니다. `setup_kr_signal_backtest.py`가 고정 표본과 fresh experiment ID를 생성합니다. 아래 5종목은 이전 실패에서 동일 문서인데 점수가 크게 변했던 stress sample이며, 종목 선택에만 사용하고 기존 evidence·점수·LLM 응답은 새 experiment로 가져오지 않습니다.
 
 ```powershell
-$ws = "data-lake\backtests\kr-signal-fresh-20260815-v060"
+$ws = "data-lake\backtests\kr-signal-fresh-20260815-v070"
 python scripts\setup_kr_signal_backtest.py `
   --universe D:\Programming\python_example\MoatPoC\universe.csv `
   --dates D:\Programming\python_example\MoatPoC\dates.csv `
@@ -238,7 +238,7 @@ foreach ($row in $dates) {
 python scripts\approve_moat_preflight.py @gateArgs
 ```
 
-두 번째 표본 실행은 experiment-scoped content-addressed cache를 사용하므로 동일 요청에 API 비용을 다시 쓰지 않습니다. 기본 승인 기준은 반복 점수 Spearman `1.0`, evidence Jaccard `1.0`, 종목별 점수 차이 `0`, 인접 시점 Spearman `0.50`입니다. 모든 표본 점수가 같아 상관계수가 무의미해지는 것을 막기 위해 날짜별로 최소 2개 점수 수준과 전체 기간 중 최소 1개 positive-MOAT 종목도 요구합니다. 실패하면 `setup_kr_signal_backtest.py --sample-ticker ...`로 3~5종목을 명시해 다시 시작합니다.
+두 번째 표본 실행은 experiment-scoped evidence-level cache를 사용하므로 동일 atomic evidence에 API 비용을 다시 쓰지 않습니다. 기본 승인 기준은 반복 점수 Spearman `1.0`, evidence Jaccard `1.0`, claim Jaccard `1.0`, 종목별 점수 차이 `0`, 인접 시점 Spearman `0.50`입니다. 각 baseline 회사는 sentence/paragraph shuffle, evidence duplicate, generated-summary 삽입, whitespace/heading 변경, 무관 boilerplate 삽입, node 순서 변경에 대해 atomic/claim Jaccard `1.0`과 점수 차이 `0`인 metamorphic gate도 통과해야 합니다. 모든 표본 점수가 같아 상관계수가 무의미해지는 것을 막기 위해 날짜별로 최소 2개 점수 수준과 전체 기간 중 최소 1개 positive-MOAT 종목도 요구합니다.
 
 승인 후에만 전체 또는 shard 실행이 가능합니다. `--preflight-report`가 없거나 universe/date/model/reasoning/prompt 계약이 표본 실행과 다르면 실행 전에 실패합니다.
 
@@ -252,7 +252,7 @@ moatrader moat run `
   --workers 3
 ```
 
-동일 experiment 안에서 같은 LLM 요청은 최초의 검증 완료 응답만 사용합니다. 캐시 키에는 task, 모델, reasoning effort, prompt hash, response schema hash, runner/normalizer version이 포함됩니다. 증거 ID는 공시 문서·node·원문 인용으로 만들며 LLM 요약문, 분류, 방향, 출력 순서는 포함하지 않습니다. 공개 MOAT 메커니즘 점수·durability·counterevidence penalty도 Python이 결정론적으로 계산합니다. 구조적 증거는 PIT evidence ledger에 `valid_from`, `valid_to`, `last_confirmed_at`, `superseded_by`, `retracted_by`와 함께 보관되어 새 분기보고서에서 단순히 생략됐다는 이유로 사라지지 않습니다.
+동일 experiment 안에서 같은 atomic evidence는 최초의 검증 완료 분류만 사용합니다. 키에는 atomic text/context, rubric/prompt version, 정확한 모델 ID, reasoning effort, response schema와 runner version이 포함되므로 문장·문단·node 배열이 달라도 재사용됩니다. `evidence_id`는 원문 감사 추적용이고 Python이 만든 `claim_id`는 의미 중복 제거와 scoring identity입니다. claim reducer는 교환·결합·멱등성을 갖고 메커니즘 점수·durability·counterevidence penalty를 전부 계산합니다. 생성 요약은 atomic 후보에서 제거되고 scoring dossier도 `business_summary=null`, `section_summaries=[]`로 고정됩니다.
 
 중단되었거나 일부 종목이 실패한 run은 동일한 입력과 run ID로 재개합니다. 완료된 회사와 chunk/section 체크포인트는 다시 호출하지 않습니다.
 
@@ -280,7 +280,7 @@ moatrader screen rank `
   --minimum-document-coverage 0.60
 ```
 
-LLM은 작업별로 라우팅됩니다. 문장·섹션 요약은 기본 `gpt-5-nano`, MOAT evidence 의미 분류와 최종 MOAT scoring은 기본 `gpt-5-luna`를 사용합니다. 각각 `--summary-model`/`MOATRADER_SUMMARY_MODEL`, `--moat-model`/`MOATRADER_MOAT_MODEL`로 바꿀 수 있습니다. DCF는 LLM을 호출하지 않고 Python의 deterministic unlevered DCF 엔진으로 계산합니다.
+LLM은 작업별로 라우팅됩니다. 표시용 섹션 요약은 `gpt-5-nano`, atomic MOAT evidence 분류는 실제 API ID인 `gpt-5.6-luna`를 사용합니다. `-latest` MOAT alias는 거부하며 모델 ID 변경 시 execution-contract hash가 바뀌어 preflight 전체를 다시 통과해야 합니다. 최종 MOAT와 DCF는 LLM을 호출하지 않고 Python reducer와 deterministic unlevered DCF 엔진으로 계산합니다.
 
 ```powershell
 moatrader moat run `
@@ -290,7 +290,7 @@ moatrader moat run `
   --run-id kr-full-2025-08-31 `
   --preflight-report "$ws\diagnostics\moat-preflight.json" `
   --summary-model gpt-5-nano `
-  --moat-model gpt-5-luna
+  --moat-model gpt-5.6-luna
 ```
 
 최종 결과는 run 디렉터리의 `results.csv`, `ranking.csv`, `run-result.json`에, 회사별 근거·요청·RunManifest·체크포인트는 `companies\TICKER\` 아래에 저장됩니다. `llm-calls.jsonl`에는 호출마다 실제 사용 모델이 기록되고 `dcf-manifest.json`에는 `calculation_mode=deterministic_python`, `llm_model=null`이 기록됩니다. 한 회사의 실패는 다른 회사 실행을 중단시키지 않으며 전체 명령은 실패 회사가 있으면 종료 코드 2를 반환합니다.
@@ -376,8 +376,7 @@ moatrader schema > canonical-document-bundle.schema.json
 테스트:
 
 ```powershell
-$env:PYTHONPATH = "$PWD\src"
-pytest
+python -m pytest -q
 ```
 
 ## 서비스에서의 권장 실행 순서
@@ -385,10 +384,10 @@ pytest
 1. 원문과 SHA-256을 Bronze에 변경 없이 저장합니다.
 2. adapter 출력 bundle을 Silver에 저장합니다.
 3. parser retention/table/numeric 지표가 기준을 통과한 문서만 다음 단계로 보냅니다.
-4. 모든 chunk에 대해 local evidence 요청을 실행하고 Python validator를 통과시킵니다.
-5. evidence ID만 인용하는 section summary와 company dossier를 만듭니다.
-6. token allocator가 고른 raw chunk와 dossier로 3-layer evidence pack을 만듭니다.
-7. LLM은 MOAT를 채점하고, Python은 StructuredFact로 DCF를 계산합니다.
+4. 모든 원문 chunk를 결정론적 atomic evidence set으로 바꾸고 각 항목을 독립적으로 분류합니다.
+5. 원문 `evidence_id`와 canonical `claim_id`를 만들고 claim set으로 중복 제거합니다.
+6. 생성 요약을 judge context에서 격리하고 metamorphic gate를 통과시킵니다.
+7. Python claim reducer가 MOAT를, StructuredFact 기반 DCF 엔진이 공정가치를 계산합니다.
 8. 동일한 signal timestamp의 시장가격을 결합해 screening합니다.
 9. parser/model/prompt/input hash를 `RunManifest`로 남기고 PIT 백테스트합니다.
 

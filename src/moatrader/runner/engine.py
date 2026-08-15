@@ -21,7 +21,6 @@ from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
     CompanyDossier,
     CoverageMetrics,
-    EvidenceBatchExtractionResult,
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
@@ -34,19 +33,16 @@ from moatrader.evidence.models import (
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
     derive_moat_score,
-    validate_evidence_batch_result,
     validate_evidence_result,
     validate_moat_score,
 )
 from moatrader.evidence.processing import (
     assign_canonical_claim_identity,
+    atomic_judgment_to_card,
     build_canonical_claim_set,
     build_evidence_relations,
     build_forward_driver_cards,
-    calibrate_card_reliability,
     cluster_duplicate_evidence,
-    grounded_evidence_id,
-    normalize_card_semantics,
 )
 from moatrader.evidence.atomic import (
     ATOMIC_RUBRIC_VERSION,
@@ -55,6 +51,7 @@ from moatrader.evidence.atomic import (
     build_atomic_evidence_units,
     select_atomic_evidence_units,
 )
+from moatrader.evidence.metamorphic import audit_company_metamorphs
 from moatrader.financial import (
     DcfAssumptions,
     DcfAssumptionType,
@@ -67,9 +64,6 @@ from moatrader.llm import (
     LLMRequest,
     LLMTransport,
     build_atomic_evidence_request,
-    build_evidence_batch_request,
-    build_evidence_request,
-    build_moat_pack_request,
     build_section_summary_request,
 )
 from moatrader.llm.transport import TransportResult, TransportUsage
@@ -85,7 +79,6 @@ from moatrader.runner.models import (
     UniverseRunResult,
 )
 from moatrader.runner.report import rank_run_result, ranking_csv, results_csv
-from moatrader.runner.selection import batch_evidence_chunks, select_evidence_chunks
 from moatrader.semantic import SemanticChunk, deduplicate_chunks
 from moatrader.universe import CompanyInput, UniverseManifest
 
@@ -269,7 +262,7 @@ class MoatUniverseRunner:
             all_atomic_units = build_atomic_evidence_units(chunks, issuer_id=issuer_id)
             evidence_chunks = select_atomic_evidence_units(
                 all_atomic_units,
-                self.config.maximum_evidence_chunks,
+                self.config.maximum_atomic_evidence_units,
             )
             self.store.write_jsonl(company_dir / "atomic-evidence-units.jsonl", evidence_chunks)
             self.store.write_json(
@@ -480,6 +473,18 @@ class MoatUniverseRunner:
                 )
                 self.store.write_json(score_path, score)
 
+            metamorphic_audit = audit_company_metamorphs(
+                company_dir,
+                issuer_id=dossier.issuer_id,
+                maximum_atomic_units=self.config.maximum_atomic_evidence_units,
+            )
+            self.store.write_json(company_dir / "metamorphic-audit.json", metamorphic_audit)
+            if metamorphic_audit["passed"] is not True:
+                raise ValueError(
+                    "MOAT metamorphic gate failed: "
+                    + "; ".join(str(item) for item in metamorphic_audit["failures"])
+                )
+
             self.store.write_json(
                 company_dir / "run-manifest.json",
                 RunManifest(
@@ -648,36 +653,7 @@ class MoatUniverseRunner:
         *,
         issuer_id: str | None,
     ) -> EvidenceCard:
-        source_type = chunk.source_refs[0].source_type if chunk.source_refs else None
-        provisional = EvidenceCard(
-            evidence_id="PENDING",
-            source_chunk_id=chunk.chunk_id,
-            node_ids=sorted(set(chunk.node_ids)),
-            evidence_type=judgment.evidence_type,
-            statement_type=judgment.statement_type,
-            fact=judgment.fact,
-            mechanism=judgment.mechanism,
-            direction=judgment.direction,
-            strength=judgment.strength,
-            source_type=source_type,
-            economic_scope=judgment.economic_scope,
-            segment=judgment.segment,
-            metrics=judgment.metrics,
-            unit=judgment.unit,
-            period=judgment.period,
-            raw_quote=chunk.markdown,
-            forward_driver_type=judgment.forward_driver_type,
-            dcf_links=judgment.dcf_links,
-            forecast_horizon=judgment.forecast_horizon,
-            atomic_evidence_key=str(chunk.metadata["atomic_evidence_key"]),
-            claim_signature=judgment.claim_signature,
-        )
-        normalized = normalize_card_semantics(provisional)
-        evidence_id = grounded_evidence_id(normalized, chunk)
-        calibrated = calibrate_card_reliability(
-            normalized.model_copy(update={"evidence_id": evidence_id})
-        )
-        return assign_canonical_claim_identity(calibrated, issuer_id=issuer_id)
+        return atomic_judgment_to_card(judgment, chunk, issuer_id=issuer_id)
 
     def _validate_atomic_judgment(
         self,
@@ -1249,14 +1225,16 @@ class MoatUniverseRunner:
         prompt_contract = "\n\n".join(
             inspect.getsource(builder)
             for builder in (
-                build_evidence_request,
-                build_evidence_batch_request,
+                build_atomic_evidence_request,
                 build_section_summary_request,
-                build_moat_pack_request,
             )
         )
         schema_contract = json.dumps(
-            MoatScore.model_json_schema(),
+            {
+                "atomic_judgment": AtomicEvidenceJudgment.model_json_schema(),
+                "section_summary": SectionSummary.model_json_schema(),
+                "moat_score": MoatScore.model_json_schema(),
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -1284,10 +1262,8 @@ class MoatUniverseRunner:
                     "require_financial_table_semantics": self.config.require_financial_table_semantics,
                     "allow_low_quality": self.config.allow_low_quality,
                     "maximum_price_age_days": self.config.maximum_price_age_days,
-                    "maximum_evidence_chunks": self.config.maximum_evidence_chunks,
-                    "evidence_batch_max_tokens": self.config.evidence_batch_max_tokens,
+                    "maximum_atomic_evidence_units": self.config.maximum_atomic_evidence_units,
                     "consolidate_section_summaries": self.config.consolidate_section_summaries,
-                    "include_raw_moat_appendix": self.config.include_raw_moat_appendix,
                     "validation_attempts": self.config.validation_attempts,
                     "experiment_id": self.config.experiment_id,
                     "llm_replay_enabled": bool(self.config.llm_replay_cache_directory),

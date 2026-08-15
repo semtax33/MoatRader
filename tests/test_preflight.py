@@ -73,6 +73,35 @@ def _write_run(
                 + "\n",
                 encoding="utf-8",
             )
+        metamorphic_names = [
+            "sentence_shuffle",
+            "paragraph_shuffle",
+            "duplicate_evidence",
+            "summary_injection",
+            "whitespace_heading_change",
+            "irrelevant_boilerplate_injection",
+            "node_order_change",
+        ]
+        (artifact / "metamorphic-audit.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "moatrader-moat-metamorphic/1",
+                    "passed": True,
+                    "failures": [],
+                    "transformations": {
+                        name: {
+                            "passed": True,
+                            "atomic_key_jaccard": 1.0,
+                            "evidence_jaccard": 1.0,
+                            "claim_jaccard": 1.0,
+                            "score_delta": 0.0,
+                        }
+                        for name in metamorphic_names
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
         companies.append(
             CompanyRunResult(
                 ticker=ticker,

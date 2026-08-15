@@ -281,10 +281,8 @@ def _moat_run(args: argparse.Namespace) -> int:
         require_financial_table_semantics=not args.allow_incomplete_financial_table_semantics,
         allow_low_quality=args.allow_low_quality,
         maximum_price_age_days=args.maximum_price_age_days,
-        maximum_evidence_chunks=args.maximum_evidence_chunks,
-        evidence_batch_max_tokens=args.evidence_batch_max_tokens,
+        maximum_atomic_evidence_units=args.maximum_atomic_evidence_units,
         consolidate_section_summaries=args.consolidate_section_summaries,
-        include_raw_moat_appendix=args.include_raw_moat_appendix,
         workers=args.workers,
         resume=args.resume,
         dry_run=args.dry_run,
@@ -636,27 +634,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     moat_run.add_argument("--maximum-price-age-days", type=int, default=7)
     moat_run.add_argument(
+        "--maximum-atomic-evidence-units",
         "--maximum-evidence-chunks",
+        dest="maximum_atomic_evidence_units",
         type=int,
         default=24,
-        help="preselect at most this many MOAT-relevant chunks before evidence extraction",
-    )
-    moat_run.add_argument(
-        "--evidence-batch-max-tokens",
-        type=int,
-        default=4_000,
-        help="combine selected chunks into bounded MOAT-classification calls up to this token estimate",
+        help="classify at most this many content-ranked atomic evidence units; the old chunk flag is an alias",
     )
     moat_run.add_argument(
         "--consolidate-section-summaries",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="summarize all selected evidence cards in one company-level section-summary call",
-    )
-    moat_run.add_argument(
-        "--include-raw-moat-appendix",
-        action="store_true",
-        help="include only cited source chunks in the final MOAT prompt (off by default)",
     )
     moat_run.add_argument("--workers", type=int, default=1)
     moat_run.add_argument("--validation-attempts", type=int, default=2)

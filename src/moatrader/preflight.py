@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from moatrader.runner.models import UniverseRunConfig
+from moatrader.evidence.atomic import ATOMIC_RUBRIC_VERSION, ATOMIC_SEGMENTATION_VERSION
 
 
-PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/1"
+PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/2"
 EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
@@ -24,10 +25,8 @@ EXECUTION_CONTRACT_FIELDS = (
     "require_financial_table_semantics",
     "allow_low_quality",
     "maximum_price_age_days",
-    "maximum_evidence_chunks",
-    "evidence_batch_max_tokens",
+    "maximum_atomic_evidence_units",
     "consolidate_section_summaries",
-    "include_raw_moat_appendix",
     "validation_attempts",
     "experiment_id",
 )
@@ -43,6 +42,12 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract = {field: payload.get(field) for field in EXECUTION_CONTRACT_FIELDS}
     contract["llm_replay_enabled"] = bool(config.llm_replay_cache_directory)
     contract["evidence_ledger_enabled"] = bool(config.evidence_ledger_directory)
+    contract["atomic_segmentation_version"] = ATOMIC_SEGMENTATION_VERSION
+    contract["atomic_rubric_version"] = ATOMIC_RUBRIC_VERSION
+    contract["scoring_reducer_version"] = "canonical-claim-reducer/1"
+    contract["generated_summary_in_judge_context"] = False
+    contract["metamorphic_gate_required"] = True
+    contract["moat_model_snapshot_policy"] = "EXACT_ID_NO_LATEST_ALIAS"
     return contract
 
 

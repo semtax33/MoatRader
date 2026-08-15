@@ -33,6 +33,7 @@ def _run(run_id: str, scores: dict[str, float]) -> UniverseRunResult:
                     durability=Durability.HIGH,
                     model_confidence=0.8,
                     document_coverage=CoverageMetrics(moat_evidence_coverage=1),
+                    canonical_claim_ids=[f"CL-{ticker}"],
                 ),
             )
         )
@@ -54,6 +55,7 @@ def test_reproducibility_gate_passes_reordered_equal_results() -> None:
     assert report["passed"] is True
     assert report["score_spearman"] == 1
     assert report["mean_evidence_jaccard"] == 1
+    assert report["mean_claim_jaccard"] == 1
 
 
 def test_reproducibility_gate_fails_rank_reversal() -> None:

@@ -29,6 +29,10 @@ def _evidence_ids(company: object) -> set[str]:
     } | set(score.counterevidence_ids)
 
 
+def _claim_ids(company: object) -> set[str]:
+    return set(company.moat_score.canonical_claim_ids)
+
+
 def _jaccard(left: set[str], right: set[str]) -> float:
     union = left | right
     return len(left & right) / len(union) if union else 1.0
@@ -40,6 +44,7 @@ def compare_runs(
     *,
     minimum_score_spearman: float = 0.90,
     minimum_mean_evidence_jaccard: float = 0.50,
+    minimum_mean_claim_jaccard: float = 0.50,
     maximum_median_score_delta: float = 0.50,
     maximum_company_score_delta: float = 2.0,
     require_same_universe: bool = True,
@@ -61,6 +66,9 @@ def compare_runs(
     jaccards = [
         _jaccard(_evidence_ids(before[ticker]), _evidence_ids(after[ticker])) for ticker in common
     ]
+    claim_jaccards = [
+        _jaccard(_claim_ids(before[ticker]), _claim_ids(after[ticker])) for ticker in common
+    ]
     failures: list[str] = []
     if require_same_universe and (missing or added):
         failures.append("completed scored universe differs")
@@ -71,6 +79,7 @@ def compare_runs(
     median_delta = statistics.median(deltas)
     largest_delta = max(deltas)
     mean_jaccard = statistics.mean(jaccards)
+    mean_claim_jaccard = statistics.mean(claim_jaccards)
     if median_delta > maximum_median_score_delta:
         failures.append(
             f"median score delta {median_delta:.3f} exceeds {maximum_median_score_delta:.3f}"
@@ -83,6 +92,10 @@ def compare_runs(
         failures.append(
             f"mean evidence Jaccard {mean_jaccard:.3f} is below {minimum_mean_evidence_jaccard:.3f}"
         )
+    if mean_claim_jaccard < minimum_mean_claim_jaccard:
+        failures.append(
+            f"mean claim Jaccard {mean_claim_jaccard:.3f} is below {minimum_mean_claim_jaccard:.3f}"
+        )
     details = [
         {
             "ticker": ticker,
@@ -90,11 +103,12 @@ def compare_runs(
             "candidate_score": after_scores[index],
             "absolute_score_delta": deltas[index],
             "evidence_jaccard": jaccards[index],
+            "claim_jaccard": claim_jaccards[index],
         }
         for index, ticker in enumerate(common)
     ]
     return {
-        "schema_version": "moatrader-moat-reproducibility/1",
+        "schema_version": "moatrader-moat-reproducibility/2",
         "baseline_run_id": baseline.run_id,
         "candidate_run_id": candidate.run_id,
         "common_company_count": len(common),
@@ -104,6 +118,7 @@ def compare_runs(
         "median_absolute_score_delta": median_delta,
         "maximum_absolute_score_delta": largest_delta,
         "mean_evidence_jaccard": mean_jaccard,
+        "mean_claim_jaccard": mean_claim_jaccard,
         "passed": not failures,
         "failures": failures,
         "companies": details,
@@ -119,6 +134,7 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--minimum-score-spearman", type=float, default=0.90)
     parser.add_argument("--minimum-mean-evidence-jaccard", type=float, default=0.50)
+    parser.add_argument("--minimum-mean-claim-jaccard", type=float, default=0.50)
     parser.add_argument("--maximum-median-score-delta", type=float, default=0.50)
     parser.add_argument("--maximum-company-score-delta", type=float, default=2.0)
     parser.add_argument("--allow-universe-mismatch", action="store_true")
@@ -131,6 +147,7 @@ def main() -> int:
         candidate,
         minimum_score_spearman=args.minimum_score_spearman,
         minimum_mean_evidence_jaccard=args.minimum_mean_evidence_jaccard,
+        minimum_mean_claim_jaccard=args.minimum_mean_claim_jaccard,
         maximum_median_score_delta=args.maximum_median_score_delta,
         maximum_company_score_delta=args.maximum_company_score_delta,
         require_same_universe=not args.allow_universe_mismatch,

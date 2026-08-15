@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
+    AtomicEvidenceJudgment,
     DcfLink,
     CanonicalClaimSignature,
     ClaimCluster,
@@ -94,6 +95,46 @@ def grounded_evidence_id(card: EvidenceCard, chunk: SemanticChunk) -> str:
         # atomic source text and quote are sufficient for a stable audit ID.
         return stable_id("E", chunk.document_id, atomic_key, quote)
     return stable_id("E", chunk.document_id, *sorted(set(card.node_ids)), quote)
+
+
+def atomic_judgment_to_card(
+    judgment: AtomicEvidenceJudgment,
+    chunk: SemanticChunk,
+    *,
+    issuer_id: str | None,
+) -> EvidenceCard:
+    if not judgment.is_investment_relevant:
+        raise ValueError("irrelevant atomic judgment cannot become an evidence card")
+    source_type = chunk.source_refs[0].source_type if chunk.source_refs else SourceType.OTHER
+    provisional = EvidenceCard(
+        evidence_id="PENDING",
+        source_chunk_id=chunk.chunk_id,
+        node_ids=sorted(set(chunk.node_ids)),
+        evidence_type=judgment.evidence_type,
+        statement_type=judgment.statement_type,
+        fact=judgment.fact,
+        mechanism=judgment.mechanism,
+        direction=judgment.direction,
+        strength=judgment.strength,
+        source_type=source_type,
+        economic_scope=judgment.economic_scope,
+        segment=judgment.segment,
+        metrics=judgment.metrics,
+        unit=judgment.unit,
+        period=judgment.period,
+        raw_quote=chunk.markdown,
+        forward_driver_type=judgment.forward_driver_type,
+        dcf_links=judgment.dcf_links,
+        forecast_horizon=judgment.forecast_horizon,
+        atomic_evidence_key=str(chunk.metadata["atomic_evidence_key"]),
+        claim_signature=judgment.claim_signature,
+    )
+    normalized = normalize_card_semantics(provisional)
+    evidence_id = grounded_evidence_id(normalized, chunk)
+    calibrated = calibrate_card_reliability(
+        normalized.model_copy(update={"evidence_id": evidence_id})
+    )
+    return assign_canonical_claim_identity(calibrated, issuer_id=issuer_id)
 
 
 def _canonical_slot(value: str | None, fallback: str) -> str:

@@ -11,23 +11,24 @@
 - section/paragraph/list/note/figure/table AST, rowspan/colspan, multi-header, 단위/기간/주석, provenance
 - inline XBRL `StructuredFact`와 PIT financial snapshot
 - cross-filing chunk exact/near dedup 및 숫자 변경 보존
-- local evidence extraction → deterministic validation/repair → reliability calibration
-- canonical/supporting evidence cluster와 duplicate-free scoring dossier
+- deterministic atomic segmentation → 항목별 LLM classification → validation/repair → reliability calibration
+- 원문용 evidence ID와 의미 dedupe용 canonical claim ID/set
 - SUPPORTS/WEAKENS/CONTRADICTS/UPDATES/DUPLICATES evidence relation
 - claim별 evidence citation을 강제하는 section summary → company dossier → 경제적 질문 BM25 retrieval
-- L1/L2/L3 evidence pack, context budget pruning, coverage 기록
+- generated summary가 완전히 제외된 scoring dossier와 표시용 evidence pack, coverage 기록
 - OpenAI Responses API/Pydantic Structured Outputs transport, retry, usage audit, `store=false`
-- task별 모델 routing: 문장/section summary는 `gpt-5-nano`, evidence 의미 분류와 최종 MOAT는 `gpt-5-luna`
-- 최종 MOAT evidence citation 검증
+- task별 모델 routing: 표시용 section summary는 `gpt-5-nano`, atomic evidence 분류는 pinned `gpt-5.6-luna`
+- final-score LLM 호출이 없는 canonical claim Python reducer
 - LLM 비의존 Python unlevered DCF, assumptions hash/as-of manifest
 - 한 종목/복수 종목/전체 universe 실행, 병렬 처리, 회사별 실패 격리, chunk/section resume
 - MOAT/DCF/신뢰도/coverage screening과 재랭킹
 - PIT backtest, 종목별 거래 가능 여부·보유 잠금, mark-to-market, turnover/거래비용/슬리피지/용량, 보수적 상장폐지 청산, benchmark 초과수익
 - raw/sector/factor-neutral IC, 비중첩 Q5-Q1 평가와 반복·입력순서 변경 MOAT 재현성 gate
-- fresh experiment 범위 content-addressed LLM replay와 원문 기반 stable evidence identity
+- fresh experiment 범위 atomic-evidence replay와 원문 기반 stable evidence identity
 - LLM 제안값과 독립적인 deterministic mechanism score/durability/counterevidence penalty
 - 구조적 증거 생략을 삭제로 취급하지 않는 PIT evidence ledger와 supersede/retract 이력
-- 5종목 초과 manifest 실행 전 3~5종목 반복·인접시점 상관 preflight 강제
+- shuffle/duplicate/summary/format/boilerplate/node-order metamorphic zero-tolerance gate
+- evidence·claim Jaccard를 포함한 3~5종목 반복·인접시점 preflight 강제
 
 ## 외부 데이터가 반드시 보장해야 하는 것
 

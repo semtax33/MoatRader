@@ -37,10 +37,8 @@ class UniverseRunConfig(ContractModel):
     require_financial_table_semantics: bool = True
     allow_low_quality: bool = False
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)
-    maximum_evidence_chunks: int | None = Field(default=24, ge=1, le=1000)
-    evidence_batch_max_tokens: int | None = Field(default=4_000, ge=500, le=100_000)
+    maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
     consolidate_section_summaries: bool = True
-    include_raw_moat_appendix: bool = False
     workers: int = Field(default=1, ge=1, le=32)
     resume: bool = False
     dry_run: bool = False
@@ -64,6 +62,8 @@ class UniverseRunConfig(ContractModel):
             )
         if self.evidence_ledger_directory and not self.experiment_id:
             raise ValueError("evidence_ledger_directory requires experiment_id")
+        if self.moat_model.lower().endswith("latest"):
+            raise ValueError("moat_model must be an exact pinned model ID, not a -latest alias")
         return self
 
 

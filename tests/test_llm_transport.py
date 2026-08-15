@@ -54,22 +54,22 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
 
     result = transport.execute(request, EvidenceExtractionResult)
 
-    assert captured[0]["model"] == "gpt-5-luna"
+    assert captured[0]["model"] == "gpt-5.6-luna"
     assert captured[0]["text"]["format"]["type"] == "json_schema"  # type: ignore[index]
     assert captured[0]["reasoning"] == {"effort": "medium"}
     assert captured[0]["max_output_tokens"] == 8_000
     assert captured[0]["store"] is False
     assert result.response_id == "resp_fixture"
-    assert result.model == "gpt-5-luna-fixture"
+    assert result.model == "gpt-5.6-luna-fixture"
     assert result.usage.input_tokens == 10
     assert result.usage.cached_input_tokens == 4
 
     moat_request = request.model_copy(update={"task": LLMTask.FINAL_MOAT_SCORING})
     moat_result = transport.execute(moat_request, EvidenceExtractionResult)
 
-    assert captured[1]["model"] == "gpt-5-luna"
+    assert captured[1]["model"] == "gpt-5.6-luna"
     assert captured[1]["reasoning"] == {"effort": "medium"}
-    assert moat_result.model == "gpt-5-luna-fixture"
+    assert moat_result.model == "gpt-5.6-luna-fixture"
 
 
 def test_openai_transport_legacy_model_alias_routes_every_task_to_one_model() -> None:

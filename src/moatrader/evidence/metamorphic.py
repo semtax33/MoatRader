@@ -14,11 +14,13 @@ from moatrader.evidence.atomic import (
     split_atomic_evidence_text,
 )
 from moatrader.evidence.models import (
+    AtomicEvidenceJudgment,
     EconomicScope,
     EvidenceCard,
     EvidenceDirection,
     STRUCTURAL_MOAT_TYPES,
 )
+from moatrader.evidence.processing import atomic_judgment_to_card, build_canonical_claim_set
 from moatrader.evidence.validation import derive_moat_score
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
@@ -130,6 +132,16 @@ def audit_company_metamorphs(
     chunks = list(_read_jsonl(directory / "chunks.jsonl", SemanticChunk))
     selected = list(_read_jsonl(directory / "atomic-evidence-units.jsonl", SemanticChunk))
     claim_cards = list(_read_jsonl(directory / "canonical-claim-set.jsonl", EvidenceCard))
+    all_cards = list(_read_jsonl(directory / "evidence.jsonl", EvidenceCard))
+    current_cards = list(_read_jsonl(directory / "current-evidence.jsonl", EvidenceCard))
+    current_ids = {card.evidence_id for card in current_cards}
+    carried_cards = [card for card in all_cards if card.evidence_id not in current_ids]
+    judgments = {
+        path.stem: AtomicEvidenceJudgment.model_validate_json(
+            path.read_text(encoding="utf-8-sig")
+        )
+        for path in (directory / "atomic-judgment-by-key").glob("*.json")
+    }
     baseline_score = json.loads((directory / "moat-score.json").read_text(encoding="utf-8-sig"))
     scoring_cards = [
         card
@@ -145,6 +157,11 @@ def audit_company_metamorphs(
     ]
     as_of = baseline_score["as_of"]
     baseline_claim_ids = set(baseline_score.get("canonical_claim_ids") or [])
+    baseline_evidence_ids = {
+        evidence_id
+        for mechanism in baseline_score.get("mechanisms") or []
+        for evidence_id in mechanism.get("evidence_ids") or []
+    } | set(baseline_score.get("counterevidence_ids") or [])
     selected_keys = {str(unit.metadata["atomic_evidence_key"]) for unit in selected}
     failures: list[str] = []
     results: dict[str, object] = {}
@@ -182,11 +199,53 @@ def audit_company_metamorphs(
             str(unit.metadata["atomic_evidence_key"]) for unit in transformed_units
         }
         key_jaccard = _jaccard(selected_keys, transformed_keys)
-        # Equal atomic keys imply exact evidence-level replay; the canonical
-        # judgment/claim set and Python score are consequently unchanged.
-        claim_jaccard = 1.0 if transformed_keys == selected_keys else 0.0
-        score_delta = 0.0 if transformed_keys == selected_keys else None
-        passed = key_jaccard == 1.0 and claim_jaccard == 1.0 and score_delta == 0.0
+        missing_judgments = sorted(transformed_keys - set(judgments))
+        transformed_current = [
+            atomic_judgment_to_card(judgments[str(unit.metadata["atomic_evidence_key"])], unit, issuer_id=issuer_id)
+            for unit in transformed_units
+            if str(unit.metadata["atomic_evidence_key"]) in judgments
+            and judgments[str(unit.metadata["atomic_evidence_key"])].is_investment_relevant
+        ]
+        transformed_claims, _ = build_canonical_claim_set(
+            [*carried_cards, *transformed_current],
+            issuer_id=issuer_id,
+        )
+        transformed_scoring = [
+            card
+            for card in transformed_claims
+            if (
+                card.direction == EvidenceDirection.MOAT_NEGATIVE
+                or (
+                    card.direction == EvidenceDirection.MOAT_POSITIVE
+                    and card.evidence_type in STRUCTURAL_MOAT_TYPES
+                )
+            )
+            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+        ]
+        transformed_score = derive_moat_score(
+            None,
+            transformed_scoring,
+            issuer_id=issuer_id,
+            as_of=date.fromisoformat(as_of),
+        )
+        transformed_evidence_ids = {
+            evidence_id
+            for mechanism in transformed_score.mechanisms
+            for evidence_id in mechanism.evidence_ids
+        } | set(transformed_score.counterevidence_ids)
+        evidence_jaccard = _jaccard(baseline_evidence_ids, transformed_evidence_ids)
+        claim_jaccard = _jaccard(
+            baseline_claim_ids,
+            set(transformed_score.canonical_claim_ids),
+        )
+        score_delta = abs(transformed_score.economic_moat_score - expected_score)
+        passed = (
+            not missing_judgments
+            and key_jaccard == 1.0
+            and evidence_jaccard == 1.0
+            and claim_jaccard == 1.0
+            and score_delta == 0.0
+        )
         if not passed:
             failures.append(
                 f"{name}: atomic/evidence set changed (Jaccard={key_jaccard:.3f})"
@@ -194,8 +253,10 @@ def audit_company_metamorphs(
         results[name] = {
             "passed": passed,
             "atomic_key_jaccard": key_jaccard,
+            "evidence_jaccard": evidence_jaccard,
             "claim_jaccard": claim_jaccard,
             "score_delta": score_delta,
+            "missing_judgment_keys": missing_judgments,
             "atomic_unit_set_sha256": atomic_unit_set_sha256(transformed_units),
         }
 
