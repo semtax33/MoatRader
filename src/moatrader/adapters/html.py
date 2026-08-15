@@ -49,7 +49,7 @@ from moatrader.canonical.models import (
 )
 
 
-PARSER_VERSION = "html-ast/0.4.2"
+PARSER_VERSION = "html-ast/0.5.1"
 _DROP_TAGS = {"script", "style", "meta", "link", "noscript", "template", "head"}
 _XBRL_INFRA_TAGS = {"context", "unit", "schemaref", "resources", "references", "hidden"}
 _TABLE_CELL_TAGS = {"th", "td", "te"}
@@ -139,6 +139,55 @@ _ROLE_PATTERNS: list[tuple[SectionRole, re.Pattern[str]]] = [
     (SectionRole.GOVERNANCE, re.compile(r"지배구조|governance", re.I)),
 ]
 
+# Canonical UTF-8 Korean patterns.  Older source revisions contained mojibake
+# literals, which silently classified almost every DART section as FINANCIALS
+# or None.  Keep this override close to the parser contract so role-aware MOAT
+# retrieval works on actual DART headings.
+_NOTE_RE = re.compile(r"^\s*(?P<marker>주\s*\d+\)|주석\s*[:：]?|\*|※)")
+_UNIT_RE = re.compile(
+    r"(?:\(\s*)?단위\s*[:：]\s*(?P<unit>[^)\n\r,;]{1,40})\)?",
+    re.IGNORECASE,
+)
+_YEAR_RE = re.compile(
+    r"(?<!\d)(?P<year>20\d{2})(?P<year_marker>\s*년)?"
+    r"(?:\s*(?P<period>Q[1-4]|[1-4]Q|[1-4]분기|반기|FY|H[12]))?",
+    re.IGNORECASE,
+)
+_HEADING_PATTERNS = [
+    ("roman", re.compile(r"^\s*(?:[IVXLCDM]+|[ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+)\.\s*", re.I), 1),
+    ("decimal_nested", re.compile(r"^\s*\d+(?:\.\d+)+\s+"), 3),
+    ("decimal", re.compile(r"^\s*\d+\.\s+"), 2),
+    ("korean", re.compile(r"^\s*[가-힣]\.\s+"), 3),
+    ("paren_num", re.compile(r"^\s*\(\d+\)\s*"), 4),
+    ("circled", re.compile(r"^\s*[①②③④⑤⑥⑦⑧⑨⑩]\s*"), 5),
+]
+_ROLE_PATTERNS = [
+    (
+        SectionRole.FINANCIALS,
+        re.compile(r"재무제표|연결재무제표|재무에\s*관한\s*사항|요약재무정보|financial\s+statements?", re.I),
+    ),
+    (
+        SectionRole.MDA,
+        re.compile(r"이사의\s*경영진단|경영진단\s*및\s*분석|경영진.{0,12}(?:논의|분석)|management.{0,20}discussion|md&a", re.I),
+    ),
+    (SectionRole.RISK, re.compile(r"위험\s*요인|주요\s*위험|리스크|우발|risk\s*factors?", re.I)),
+    (
+        SectionRole.COMPETITION,
+        re.compile(r"경쟁\s*(?:상황|환경|현황|우위|력|사)|시장\s*점유율|competition|competitive\s+landscape", re.I),
+    ),
+    (SectionRole.CUSTOMERS, re.compile(r"주요\s*고객|매출처|고객|수요처|거래처|customer", re.I)),
+    (SectionRole.SUPPLIERS, re.compile(r"공급업체|구매처|원재료|공급망|supplier", re.I)),
+    (
+        SectionRole.PRODUCTS,
+        re.compile(r"제품\s*및\s*서비스|주요\s*제품|매출\s*및\s*수주|생산\s*및\s*설비|products?|services?", re.I),
+    ),
+    (SectionRole.GUIDANCE, re.compile(r"향후\s*(?:계획|전망)|사업\s*계획|가이던스|전망|guidance|outlook", re.I)),
+    (SectionRole.BUSINESS, re.compile(r"사업의\s*내용|사업\s*개요|영업의\s*개황|business(?:\s+overview)?", re.I)),
+    (SectionRole.COMPANY_OVERVIEW, re.compile(r"회사의?\s*개요|company\s+overview", re.I)),
+    (SectionRole.NOTES, re.compile(r"주석|notes?\s+to", re.I)),
+    (SectionRole.GOVERNANCE, re.compile(r"지배구조|이사회|주주총회|governance", re.I)),
+]
+
 
 @dataclass(slots=True)
 class ParsedHtml:
@@ -167,6 +216,7 @@ class ParseState:
     source_type: SourceType
     source_hash: str
     uri: str | None
+    reporting_period: ReportingPeriod | None = None
     events: list[BlockEvent] = field(default_factory=list)
     order: int = 0
 
@@ -836,6 +886,26 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
         else:
             break
 
+    # DART XML frequently represents visual table headers with ordinary TD/TE
+    # cells instead of TH.  When the leading rows are entirely non-numeric and
+    # later rows contain numeric data, treat up to three leading rows as a
+    # conservative header band.  This preserves multi-row headers without
+    # promoting ordinary row labels once numeric data has started.
+    if header_row_count == 0 and max_col >= 2:
+        later_has_numeric = any(
+            cell.numeric_value is not None
+            for row in canonical_rows[1:]
+            for cell in row.cells
+        )
+        if later_has_numeric:
+            for row in canonical_rows[:3]:
+                nonempty = [cell for cell in row.cells if cell.normalized_text]
+                if not nonempty or any(cell.numeric_value is not None for cell in nonempty):
+                    break
+                header_row_count += 1
+                for cell in nonempty:
+                    cell.is_header = True
+
     column_headers: list[TableHeader] = []
     for col_index in range(max_col):
         path: list[str] = []
@@ -844,6 +914,13 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
             if text and (not path or text != path[-1]):
                 path.append(text)
         column_headers.append(TableHeader(col=col_index, path=path))
+
+    header_text = "\n".join(
+        cell.normalized_text
+        for row in canonical_rows[: max(1, min(3, header_row_count or 1))]
+        for cell in row.cells
+        if cell.normalized_text
+    )
 
     previous_texts: list[str] = []
     for event in reversed(state.events[-4:]):
@@ -858,7 +935,13 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
             break
     previous_texts.reverse()
     context_text = "\n".join(previous_texts)
-    unit = _unit_from_text(context_text)
+    # OpenDART commonly places a colspan unit marker such as
+    # ``(단위 : 천원)`` in the first table row.  Prefer that local header
+    # evidence and only fall back to the bounded preceding context.
+    prior_table_unit = None
+    if state.events and state.events[-1].event_type == "TABLE":
+        prior_table_unit = getattr(state.events[-1].payload, "unit", None)
+    unit = _unit_from_text(header_text) or _unit_from_text(context_text) or prior_table_unit
     caption_elements = [child for child in element if _tag(child) == "caption"]
     caption = _inline_text(caption_elements[0]) if caption_elements else None
     if not caption:
@@ -866,15 +949,11 @@ def _parse_table(element: etree._Element, state: ParseState) -> TableNode:
             if not _UNIT_RE.search(candidate) and not _NOTE_RE.search(candidate) and len(candidate) <= 160:
                 caption = candidate
                 break
-    header_text = "\n".join(
-        cell.normalized_text
-        for row in canonical_rows[: max(1, min(3, header_row_count or 1))]
-        for cell in row.cells
-        if cell.normalized_text
-    )
     period = _period_from_text(header_text, allow_bare_year=True) or _period_from_text(
         "\n".join(filter(None, [caption or "", context_text]))
     )
+    if period is None and re.search(r"제\s*\d+\s*(?:\([^)]*\))?\s*기|(?:당|전)\s*기", header_text):
+        period = state.reporting_period
     normalized_table_text = "\n".join(
         " | ".join(cell.normalized_text for cell in row.cells) for row in canonical_rows
     )
@@ -1352,6 +1431,7 @@ class BaseHtmlFinancialAdapter(SourceAdapter[ParsedHtml]):
             source_type=self.source_type,
             source_hash=parsed.raw_sha256,
             uri=uri,
+            reporting_period=metadata.reporting_period,
         )
         body = next((element for element in parsed.root.iter() if _tag(element) == "body"), parsed.root)
         _walk_dom(body, state)

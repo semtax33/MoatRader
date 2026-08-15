@@ -58,6 +58,7 @@ def test_backtest_rotates_at_next_tradable_timestamp_without_lookahead() -> None
             top_n=1,
             execution_lag_days=1,
             transaction_cost_bps=0,
+            slippage_bps=0,
             initial_capital=Decimal("1000"),
         )
     ).run(
@@ -93,14 +94,17 @@ def test_backtest_rejects_stale_signal_price() -> None:
         ).run([run], _panel())
 
 
-def test_backtest_fails_when_held_security_has_no_exit_price() -> None:
+def test_backtest_uses_conservative_settlement_when_exit_price_is_missing() -> None:
     points = [
         PricePoint(timestamp=_dt("2025-01-02T16:00:00+00:00"), ticker="AAA", adjusted_close=100)
     ]
-    with pytest.raises(ValueError, match="no common tradable"):
-        PointInTimeBacktester(
-            BacktestConfig(end_at=_dt("2025-03-01T00:00:00+00:00"), transaction_cost_bps=0)
+    result = PointInTimeBacktester(
+            BacktestConfig(end_at=_dt("2025-03-01T00:00:00+00:00"), transaction_cost_bps=0, slippage_bps=0)
         ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], PricePanel(points))
+
+    assert result.performance.ending_capital == 0
+    assert result.forced_settlements[0].ticker == "AAA"
+    assert result.forced_settlements[0].assumed_return == -1
 
 
 def test_transaction_costs_reduce_ending_value() -> None:
@@ -108,6 +112,7 @@ def test_transaction_costs_reduce_ending_value() -> None:
         BacktestConfig(
             end_at=_dt("2025-03-01T00:00:00+00:00"),
             transaction_cost_bps=0,
+            slippage_bps=0,
             initial_capital=1000,
         )
     ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], _panel())
@@ -115,12 +120,64 @@ def test_transaction_costs_reduce_ending_value() -> None:
         BacktestConfig(
             end_at=_dt("2025-03-01T00:00:00+00:00"),
             transaction_cost_bps=100,
+            slippage_bps=0,
             initial_capital=1000,
         )
     ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], _panel())
 
     assert with_cost.performance.ending_capital < zero_cost.performance.ending_capital
     assert with_cost.performance.total_transaction_cost > 0
+
+
+def test_slippage_is_reported_separately_from_transaction_cost() -> None:
+    result = PointInTimeBacktester(
+        BacktestConfig(
+            end_at=_dt("2025-03-01T00:00:00+00:00"),
+            transaction_cost_bps=0,
+            slippage_bps=100,
+            initial_capital=1000,
+        )
+    ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], _panel())
+
+    assert result.performance.total_transaction_cost == 0
+    assert result.performance.total_slippage_cost > 0
+
+
+def test_suspended_selection_does_not_delay_the_whole_rebalance() -> None:
+    run = _run("r1", "2025-01-01T00:00:00+00:00", "AAA")
+    run.ranking.append(
+        RankedCandidate(
+            issuer_id="BBB",
+            ticker="BBB",
+            price_to_dcf=Decimal("0.5"),
+            margin_of_safety=Decimal("0.5"),
+            moat_score=Decimal("7"),
+            quality_value_score=Decimal("0.1"),
+            valuation_as_of=run.as_of,
+            price_as_of=run.as_of,
+        )
+    )
+    panel = PricePanel(
+        [
+            PricePoint(timestamp=_dt("2025-01-02T16:00:00+00:00"), ticker="AAA", adjusted_close=100),
+            PricePoint(timestamp=_dt("2025-01-03T16:00:00+00:00"), ticker="BBB", adjusted_close=50),
+            PricePoint(timestamp=_dt("2025-03-02T16:00:00+00:00"), ticker="AAA", adjusted_close=110),
+            PricePoint(timestamp=_dt("2025-03-02T16:00:00+00:00"), ticker="BBB", adjusted_close=55),
+        ]
+    )
+
+    result = PointInTimeBacktester(
+        BacktestConfig(
+            end_at=_dt("2025-03-01T00:00:00+00:00"),
+            top_n=2,
+            transaction_cost_bps=0,
+            slippage_bps=0,
+        )
+    ).run([run], panel)
+
+    assert result.rebalances[0].execution_at == _dt("2025-01-02T16:00:00+00:00")
+    assert result.rebalances[0].selected_tickers == ["AAA"]
+    assert result.rebalances[0].unexecuted_tickers == ["BBB"]
 
 
 def test_equity_curve_marks_intermediate_drawdown() -> None:
@@ -135,6 +192,7 @@ def test_equity_curve_marks_intermediate_drawdown() -> None:
         BacktestConfig(
             end_at=_dt("2025-03-01T00:00:00+00:00"),
             transaction_cost_bps=0,
+            slippage_bps=0,
             initial_capital=1000,
         )
     ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], panel)
@@ -155,3 +213,57 @@ def test_price_panel_loader_requires_timezone_and_adjusted_prices(tmp_path: Path
     points = load_price_panel(path)
 
     assert [(point.ticker, point.adjusted_close) for point in points] == [("AAA", Decimal("100"))]
+
+
+def test_backtest_reports_benchmark_and_excess_return() -> None:
+    panel = PricePanel(
+        [
+            PricePoint(timestamp=_dt("2025-01-02T16:00:00+00:00"), ticker="AAA", adjusted_close=100),
+            PricePoint(timestamp=_dt("2025-03-02T16:00:00+00:00"), ticker="AAA", adjusted_close=120),
+            PricePoint(timestamp=_dt("2025-01-02T16:00:00+00:00"), ticker="INDEX", adjusted_close=200),
+            PricePoint(timestamp=_dt("2025-03-02T16:00:00+00:00"), ticker="INDEX", adjusted_close=220),
+        ]
+    )
+    result = PointInTimeBacktester(
+        BacktestConfig(
+            end_at=_dt("2025-03-01T00:00:00+00:00"),
+            transaction_cost_bps=0,
+            slippage_bps=0,
+            benchmark_ticker="INDEX",
+        )
+    ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], panel)
+
+    assert result.performance.total_return == Decimal("0.2")
+    assert result.performance.benchmark_total_return == Decimal("0.1")
+    assert result.performance.excess_total_return == Decimal("0.1")
+
+
+def test_capacity_gate_uses_trade_notional_and_requires_volume() -> None:
+    points = [
+        PricePoint(
+            timestamp=_dt("2025-01-02T16:00:00+00:00"),
+            ticker="AAA",
+            adjusted_close=100,
+            dollar_volume=1000,
+        ),
+        PricePoint(timestamp=_dt("2025-03-02T16:00:00+00:00"), ticker="AAA", adjusted_close=110),
+    ]
+    with pytest.raises(ValueError, match="daily dollar volume"):
+        PointInTimeBacktester(
+            BacktestConfig(
+                end_at=_dt("2025-03-01T00:00:00+00:00"),
+                initial_capital=1000,
+                transaction_cost_bps=0,
+                slippage_bps=0,
+                enforce_capacity=True,
+                maximum_participation_rate=Decimal("0.05"),
+            )
+        ).run([_run("r1", "2025-01-01T00:00:00+00:00", "AAA")], PricePanel(points))
+
+
+def test_backtest_rejects_price_series_without_distribution_adjustment() -> None:
+    with pytest.raises(ValueError, match="including distributions"):
+        BacktestConfig(
+            end_at=_dt("2025-03-01T00:00:00+00:00"),
+            adjusted_close_includes_distributions=False,
+        )

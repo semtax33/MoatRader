@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import traceback
 from collections import defaultdict
@@ -21,13 +22,16 @@ from moatrader.evidence.models import (
     CoverageMetrics,
     EvidenceBatchExtractionResult,
     EvidenceCard,
+    EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceRelation,
-    EvidenceType,
     MoatScore,
+    OUTCOME_CORROBORATION_TYPES,
+    STRUCTURAL_MOAT_TYPES,
     SectionSummary,
 )
 from moatrader.evidence.validation import (
+    derive_moat_score,
     validate_evidence_batch_result,
     validate_evidence_result,
     validate_moat_score,
@@ -39,7 +43,13 @@ from moatrader.evidence.processing import (
     cluster_duplicate_evidence,
     normalize_card_semantics,
 )
-from moatrader.financial import DcfAssumptions, DcfEngine, FinancialSnapshot, FinancialSnapshotBuilder
+from moatrader.financial import (
+    DcfAssumptions,
+    DcfAssumptionType,
+    DcfEngine,
+    FinancialSnapshot,
+    FinancialSnapshotBuilder,
+)
 from moatrader.llm import (
     LLMRequest,
     LLMTransport,
@@ -67,7 +77,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.4.1"
+RUNNER_VERSION = "0.5.1"
 
 
 class MoatUniverseRunner:
@@ -183,6 +193,7 @@ class MoatUniverseRunner:
                     status=CompanyRunStatus.NO_PIT_DOCUMENTS,
                     run_signature=signature,
                     artifact_directory=str(company_dir),
+                    runner_version=RUNNER_VERSION,
                 )
                 self.store.write_json(result_path, result)
                 self._checkpoint(checkpoint_path, signature, "NO_PIT_DOCUMENTS")
@@ -196,6 +207,7 @@ class MoatUniverseRunner:
                         minimum_numeric_retention=self.config.minimum_numeric_retention,
                         minimum_structured_fact_retention=self.config.minimum_structured_fact_retention,
                         require_table_count_match=self.config.require_table_count_match,
+                        require_financial_table_semantics=self.config.require_financial_table_semantics,
                     ),
                 )
                 for bundle in bundles
@@ -257,6 +269,7 @@ class MoatUniverseRunner:
                     price_as_of=company.price_as_of,
                     valuation_as_of=self.config.as_of,
                     artifact_directory=str(company_dir),
+                    runner_version=RUNNER_VERSION,
                 )
                 self.store.write_json(result_path, result)
                 self._checkpoint(checkpoint_path, signature, "PREPARED")
@@ -271,6 +284,14 @@ class MoatUniverseRunner:
             relations = build_evidence_relations(cards)
             evidence_clusters = cluster_duplicate_evidence(cards, relations)
             self.store.write_json(company_dir / "evidence-clusters.json", evidence_clusters)
+            self.store.write_json(
+                company_dir / "moat-outcome-corroboration.json",
+                [
+                    card
+                    for card in cards
+                    if card.evidence_type in OUTCOME_CORROBORATION_TYPES
+                ],
+            )
 
             self._checkpoint(checkpoint_path, signature, "SUMMARIZING")
             summaries = self._load_or_summarize(company_dir, evidence_chunks, cards, audits)
@@ -278,14 +299,34 @@ class MoatUniverseRunner:
             self.store.write_json(company_dir / "dossier.json", dossier)
 
             canonical_ids = {cluster.canonical_evidence_id for cluster in evidence_clusters}
-            scoring_base_dossier = self._filter_dossier_evidence(dossier, canonical_ids)
+            structural_score_ids = {
+                card.evidence_id
+                for card in dossier.evidence
+                if card.evidence_id in canonical_ids
+                and (
+                    (
+                        card.direction == EvidenceDirection.MOAT_POSITIVE
+                        and card.evidence_type in STRUCTURAL_MOAT_TYPES
+                    )
+                    or card.direction == EvidenceDirection.MOAT_NEGATIVE
+                )
+            }
+            scoring_base_dossier = self._filter_dossier_evidence(dossier, structural_score_ids)
             retrieval = self.retriever.retrieve(scoring_base_dossier.evidence)
             self.store.write_json(company_dir / "retrieval.json", retrieval)
+            scoring_chunk_ids = {
+                card.source_chunk_id for card in scoring_base_dossier.evidence
+            }
+            raw_context_candidates = (
+                [chunk for chunk in chunks if chunk.chunk_id in scoring_chunk_ids]
+                if self.config.include_raw_moat_appendix
+                else []
+            )
             scoring_dossier, pruning = self._fit_dossier_to_context(
                 scoring_base_dossier,
                 snapshot,
                 retrieval,
-                chunks,
+                raw_context_candidates,
             )
             self.store.write_json(company_dir / "scoring-dossier.json", scoring_dossier)
             self.store.write_json(company_dir / "evidence-pruning.json", pruning)
@@ -295,10 +336,16 @@ class MoatUniverseRunner:
                 raise ValueError(
                     f"summary/evidence layers use {preliminary.token_count} tokens and exceed the available context"
                 )
+            cited_chunk_ids = {card.source_chunk_id for card in scoring_dossier.evidence}
+            raw_candidates = (
+                [chunk for chunk in chunks if chunk.chunk_id in cited_chunk_ids]
+                if self.config.include_raw_moat_appendix
+                else []
+            )
             allocation = DynamicTokenBudgetAllocator(
                 model_context_tokens=remaining_context,
                 prompt_reserve_tokens=self.config.prompt_reserve_tokens,
-            ).allocate(chunks, relevance=retrieval.chunk_relevance)
+            ).allocate(raw_candidates, relevance=retrieval.chunk_relevance)
             pack = self.pack_builder.build(scoring_dossier, snapshot, allocation.selected)
             selected_chunks = list(allocation.selected)
             dropped_ids = list(allocation.dropped_chunk_ids)
@@ -338,17 +385,13 @@ class MoatUniverseRunner:
                     MoatScore,
                     lambda value: self._validate_score(
                         value,
-                        set(pack.evidence_ids),
-                        {
-                            card.evidence_id
-                            for card in scoring_dossier.evidence
-                            if card.evidence_type
-                            in {EvidenceType.MARKET_DEMAND, EvidenceType.CATEGORY_RECURRING_DEMAND}
-                        },
+                        scoring_dossier.evidence,
                     ),
                     audits,
                     company_dir,
                 )
+                score = derive_moat_score(score, scoring_dossier.evidence)
+                total_structural_evidence = len(structural_score_ids)
                 score = score.model_copy(
                     update={
                         "issuer_id": dossier.issuer_id,
@@ -357,7 +400,7 @@ class MoatUniverseRunner:
                             bundles,
                             chunks,
                             allocation.selected,
-                            total_evidence=len(cards),
+                            total_evidence=total_structural_evidence,
                             selected_evidence=len(scoring_dossier.evidence),
                         ),
                     }
@@ -382,7 +425,7 @@ class MoatUniverseRunner:
                     model=effective_score_audit.model if effective_score_audit else self.config.moat_model,
                     parser_version=",".join(sorted({bundle.metadata.parser_version for bundle in bundles})),
                     renderer_version="canonical-markdown/1",
-                    prompt_version="moat-pack/1",
+                    prompt_version="structural-moat-pack/2",
                     token_budget=self.config.context_tokens,
                     input_tokens=actual_or_estimated_tokens,
                     input_sha256=(
@@ -414,6 +457,7 @@ class MoatUniverseRunner:
                 valuation_as_of=self.config.as_of,
                 artifact_directory=str(company_dir),
                 llm_usage=usage,
+                runner_version=RUNNER_VERSION,
             )
             self.store.write_json(result_path, result)
             self._checkpoint(checkpoint_path, signature, "COMPLETE")
@@ -513,10 +557,16 @@ class MoatUniverseRunner:
                         candidate,
                         batch[0],
                         bundle_by_document[batch[0].document_id],
+                        discard_invalid_cards=True,
                     )
                 else:
                     candidate = EvidenceBatchExtractionResult.model_validate(stored)
-                    validation_errors = validate_evidence_batch_result(candidate, batch, bundle_by_document)
+                    validation_errors = validate_evidence_batch_result(
+                        candidate,
+                        batch,
+                        bundle_by_document,
+                        discard_invalid_cards=True,
+                    )
                 if not validation_errors:
                     result = candidate
             if result is None and len(batch) == 1:
@@ -525,7 +575,12 @@ class MoatUniverseRunner:
                 result = self._execute_validated(
                     request,
                     EvidenceExtractionResult,
-                    lambda value, c=chunk: validate_evidence_result(value, c, bundle_by_document[c.document_id]),
+                    lambda value, c=chunk: validate_evidence_result(
+                        value,
+                        c,
+                        bundle_by_document[c.document_id],
+                        discard_invalid_cards=True,
+                    ),
                     audits,
                     company_dir,
                 )
@@ -534,7 +589,12 @@ class MoatUniverseRunner:
                 result = self._execute_validated(
                     request,
                     EvidenceBatchExtractionResult,
-                    lambda value, b=batch: validate_evidence_batch_result(value, b, bundle_by_document),
+                    lambda value, b=batch: validate_evidence_batch_result(
+                        value,
+                        b,
+                        bundle_by_document,
+                        discard_invalid_cards=True,
+                    ),
                     audits,
                     company_dir,
                 )
@@ -628,7 +688,40 @@ class MoatUniverseRunner:
             )
         assumptions_text = Path(company.dcf_assumptions_path).read_text(encoding="utf-8-sig")
         assumptions = DcfAssumptions.model_validate_json(assumptions_text)
+        diluted_series = snapshot.series_index().get("DILUTED_SHARES")
+        diluted_points = [
+            point
+            for point in (diluted_series.points if diluted_series else [])
+            if point.period <= self.config.as_of.date() and point.value > 0
+        ]
+        share_count_basis = "PIT_KRX_LISTED_SHARES_NOT_FULLY_DILUTED"
+        if diluted_points:
+            point = max(diluted_points, key=lambda item: (item.period, item.available_at))
+            conservative_shares = max(assumptions.diluted_shares, point.value)
+            sources = dict(assumptions.assumption_sources)
+            sources["diluted_shares"] = [
+                f"PIT_KRX_LISTED_SHARES+FINANCIAL_SNAPSHOT_DILUTED_SHARES:{point.period.isoformat()}"
+            ]
+            types = dict(assumptions.assumption_types)
+            types["diluted_shares"] = DcfAssumptionType.DISCLOSED_FACT
+            warnings = [
+                warning
+                for warning in assumptions.provenance_warnings
+                if "potential options/convertibles" not in warning
+            ]
+            assumptions = assumptions.model_copy(
+                update={
+                    "diluted_shares": conservative_shares,
+                    "assumption_sources": sources,
+                    "assumption_types": types,
+                    "provenance_warnings": warnings,
+                }
+            )
+            share_count_basis = "MAX_OF_PIT_KRX_LISTED_AND_DISCLOSED_DILUTED_SHARES"
         assumptions_hash = hashlib.sha256(assumptions_text.encode("utf-8")).hexdigest()
+        effective_assumptions_hash = hashlib.sha256(
+            assumptions.model_dump_json(exclude_none=True).encode("utf-8")
+        ).hexdigest()
         dcf = DcfEngine().value(assumptions)
         self.store.write_json(company_dir / "dcf-assumptions.json", assumptions)
         self.store.write_json(
@@ -636,6 +729,7 @@ class MoatUniverseRunner:
             {
                 "valuation_as_of": self.config.as_of.isoformat(),
                 "assumptions_input_sha256": assumptions_hash,
+                "effective_assumptions_sha256": effective_assumptions_hash,
                 "engine_version": "unlevered-dcf/2",
                 "calculation_mode": "deterministic_python",
                 "llm_model": None,
@@ -650,6 +744,7 @@ class MoatUniverseRunner:
                 "default_assumptions": dcf.default_assumptions,
                 "terminal_value_share": dcf.terminal_value_share,
                 "provenance_warnings": dcf.provenance_warnings,
+                "share_count_basis": share_count_basis,
                 "financial_snapshot_series": [series.concept for series in snapshot.series],
             },
         )
@@ -669,6 +764,32 @@ class MoatUniverseRunner:
         errors: list[str] = []
         for attempt in range(self.config.validation_attempts):
             result: TransportResult[ResponseT] = self.transport.execute(current, response_model)
+            raw_output = result.raw_output_text or result.parsed.model_dump_json(exclude_none=True)
+            normalized_output = json.dumps(
+                result.parsed.model_dump(mode="json", exclude_none=True),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            raw_response_sha256 = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
+            normalized_output_sha256 = hashlib.sha256(normalized_output.encode("utf-8")).hexdigest()
+            raw_path = company_dir / "llm-raw" / (
+                stable_id("LLM", current.task.value, current.input_sha256, attempt) + ".json"
+            )
+            self.store.write_json(
+                raw_path,
+                {
+                    "task": current.task.value,
+                    "input_sha256": current.input_sha256,
+                    "model": result.model,
+                    "provider": result.provider,
+                    "response_id": result.response_id,
+                    "raw_output_text": raw_output,
+                    "raw_response_sha256": raw_response_sha256,
+                    "normalized_output": result.parsed,
+                    "normalized_output_sha256": normalized_output_sha256,
+                },
+            )
             audits.append(
                 LLMCallAudit(
                     task=current.task.value,
@@ -678,6 +799,9 @@ class MoatUniverseRunner:
                     response_id=result.response_id,
                     usage=result.usage,
                     created_at=datetime.now(timezone.utc),
+                    raw_response_path=str(raw_path),
+                    raw_response_sha256=raw_response_sha256,
+                    normalized_output_sha256=normalized_output_sha256,
                 )
             )
             self.store.write_jsonl(company_dir / "llm-calls.jsonl", audits)
@@ -825,7 +949,7 @@ class MoatUniverseRunner:
         empty_tokens = self.pack_builder.build(empty, snapshot, []).token_count
         if empty_tokens > target:
             raise ValueError(
-                f"fixed metadata/financial summary uses {empty_tokens} tokens, above evidence-layer target {target}"
+                f"fixed structural metadata uses {empty_tokens} tokens, above evidence-layer target {target}"
             )
         low, high = 0, len(ordered)
         while low < high:
@@ -924,25 +1048,10 @@ class MoatUniverseRunner:
     def _validate_score(
         self,
         score: MoatScore,
-        evidence_ids: set[str],
-        context_only_evidence_ids: set[str] | None = None,
+        evidence: list[EvidenceCard],
     ) -> list[str]:
         score.as_of = self.config.as_of.date()
-        context_only = context_only_evidence_ids or set()
-        score.counterevidence_ids = [item for item in score.counterevidence_ids if item in evidence_ids]
-        mechanisms = []
-        for mechanism in score.mechanisms:
-            grounded = [
-                item
-                for item in mechanism.evidence_ids
-                if item in evidence_ids and item not in context_only
-            ]
-            if grounded:
-                mechanisms.append(mechanism.model_copy(update={"evidence_ids": grounded}))
-        if not mechanisms and score.economic_moat_score > 0:
-            score.economic_moat_score = 0
-        score.mechanisms = mechanisms
-        return validate_moat_score(score, evidence_ids)
+        return validate_moat_score(score, evidence)
 
     @staticmethod
     def _coverage(
@@ -1011,14 +1120,38 @@ class MoatUniverseRunner:
             section_retention=min(1.0, len(selected_sections & all_sections) / len(all_sections)) if all_sections else None,
             table_retention=min(1.0, len(selected_table_cells) / len(all_tables)) if all_tables else None,
             numeric_retention=min(1.0, selected_numeric / total_numeric) if total_numeric else None,
+            moat_evidence_coverage=(
+                min(1.0, selected_evidence / total_evidence)
+                if total_evidence
+                else 0.0
+            ),
         )
 
     def _company_signature(self, company: CompanyInput) -> str:
         digest = hashlib.sha256()
+        prompt_contract = "\n\n".join(
+            inspect.getsource(builder)
+            for builder in (
+                build_evidence_request,
+                build_evidence_batch_request,
+                build_section_summary_request,
+                build_moat_pack_request,
+            )
+        )
+        schema_contract = json.dumps(
+            MoatScore.model_json_schema(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         digest.update(
             json.dumps(
                 {
                     "ticker": company.ticker,
+                    "issuer_id": company.issuer_id,
+                    "issuer_name": company.issuer_name,
+                    "current_price": str(company.current_price) if company.current_price is not None else None,
+                    "price_as_of": company.price_as_of.isoformat() if company.price_as_of else None,
                     "as_of": self.config.as_of.isoformat(),
                     "summary_model": self.config.summary_model,
                     "moat_model": self.config.moat_model,
@@ -1031,13 +1164,17 @@ class MoatUniverseRunner:
                     "minimum_numeric_retention": self.config.minimum_numeric_retention,
                     "minimum_structured_fact_retention": self.config.minimum_structured_fact_retention,
                     "require_table_count_match": self.config.require_table_count_match,
+                    "require_financial_table_semantics": self.config.require_financial_table_semantics,
                     "allow_low_quality": self.config.allow_low_quality,
                     "maximum_price_age_days": self.config.maximum_price_age_days,
                     "maximum_evidence_chunks": self.config.maximum_evidence_chunks,
                     "evidence_batch_max_tokens": self.config.evidence_batch_max_tokens,
                     "consolidate_section_summaries": self.config.consolidate_section_summaries,
+                    "include_raw_moat_appendix": self.config.include_raw_moat_appendix,
                     "validation_attempts": self.config.validation_attempts,
                     "runner_version": RUNNER_VERSION,
+                    "prompt_contract_sha256": hashlib.sha256(prompt_contract.encode("utf-8")).hexdigest(),
+                    "response_schema_sha256": hashlib.sha256(schema_contract.encode("utf-8")).hexdigest(),
                 },
                 sort_keys=True,
             ).encode("utf-8")
@@ -1088,4 +1225,5 @@ class MoatUniverseRunner:
             error=error,
             artifact_directory=str(company_dir),
             llm_usage=usage or TransportUsage(),
+            runner_version=RUNNER_VERSION,
         )

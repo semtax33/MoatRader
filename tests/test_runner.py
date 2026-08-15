@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,13 @@ ROOT = Path(__file__).resolve().parents[1]
 def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
     if request.task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
         chunk_id = str(request.metadata["chunk_id"])
+        match = re.search(
+            r"--- BEGIN CANONICAL CHUNK ---\s*(.*?)\s*--- END CANONICAL CHUNK ---",
+            request.user,
+            re.DOTALL,
+        )
+        assert match is not None
+        raw_quote = match.group(1).strip()
         return EvidenceExtractionResult(
             chunk_id=chunk_id,
             cards=[
@@ -40,6 +48,7 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
                     evidence_type=EvidenceType.SWITCHING_COST,
                     statement_type=StatementType.DISCLOSED_FACT,
                     fact="The disclosure supports a repeatable customer relationship.",
+                    raw_quote=raw_quote,
                     mechanism=["workflow integration", "switching friction"],
                     direction=EvidenceDirection.MOAT_POSITIVE,
                     strength=0.7,
@@ -61,7 +70,8 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
             ],
         )
     if request.task == LLMTask.FINAL_MOAT_SCORING:
-        evidence_ids = list(request.metadata["evidence_ids"])
+        evidence_ids = list(request.metadata["positive_evidence_ids"])
+        negative_ids = list(request.metadata["negative_evidence_ids"])
         return MoatScore(
             issuer_id=str(request.metadata["issuer_id"]),
             as_of=date.fromisoformat(str(request.metadata["as_of"])[:10]),
@@ -77,6 +87,7 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
             durability=Durability.MEDIUM_HIGH,
             model_confidence=0.8,
             document_coverage=CoverageMetrics(),
+            counterevidence_ids=negative_ids[:1],
         )
     raise AssertionError(request.task)
 
@@ -88,6 +99,7 @@ def _config(run_id: str, *, resume: bool = False, dry_run: bool = False, workers
         resume=resume,
         dry_run=dry_run,
         workers=workers,
+        evidence_batch_max_tokens=None,
     )
 
 
@@ -104,16 +116,26 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
-    assert company.moat_score.economic_moat_score == 7.0
+    assert company.moat_score.economic_moat_score == 5.6
+    assert company.moat_score.llm_proposed_score == 7.0
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
-    assert result.ranking and result.ranking[0].ticker == "SAMPLE"
+    assert result.ranking == []  # fixture DCF has intentionally insufficient provenance
     company_dir = tmp_path / "integration" / "companies" / "SAMPLE"
     assert (company_dir / "evidence-pack.md").is_file()
     assert (company_dir / "evidence-clusters.json").is_file()
     assert (company_dir / "run-manifest.json").is_file()
     assert (company_dir / "dcf-assumptions.json").is_file()
     assert (company_dir / "dcf-manifest.json").is_file()
+    raw_calls = list((company_dir / "llm-raw").glob("*.json"))
+    assert raw_calls
+    call_audit = [
+        json.loads(line)
+        for line in (company_dir / "llm-calls.jsonl").read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert all(item.get("raw_response_sha256") for item in call_audit)
+    assert all(Path(item["raw_response_path"]).is_file() for item in call_audit)
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None
@@ -233,6 +255,25 @@ def test_runner_resume_reuses_completed_result(tmp_path: Path) -> None:
     assert resumed.companies[0].status == CompanyRunStatus.COMPLETE
 
 
+def test_resume_signature_rejects_changed_market_snapshot(tmp_path: Path) -> None:
+    universe = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    MoatUniverseRunner(
+        config=_config("resume-price"),
+        output_directory=tmp_path,
+        transport=FunctionTransport(_fixture_handler),
+    ).run(universe, universe.companies)
+    universe.companies[0].current_price = universe.companies[0].current_price + 1
+
+    resumed = MoatUniverseRunner(
+        config=_config("resume-price", resume=True),
+        output_directory=tmp_path,
+        transport=FunctionTransport(_fixture_handler),
+    ).run(universe, universe.companies)
+
+    assert resumed.companies[0].status == CompanyRunStatus.FAILED
+    assert "signature mismatch" in (resumed.companies[0].error or "")
+
+
 def test_dry_run_can_resume_into_real_execution(tmp_path: Path) -> None:
     universe = load_universe_manifest(ROOT / "examples" / "universe.csv")
     prepared = MoatUniverseRunner(
@@ -306,7 +347,12 @@ def test_large_evidence_layer_is_pruned_to_context_budget(tmp_path: Path) -> Non
                     node_ids=[str(request.metadata["node_ids"][0])],
                     evidence_type=EvidenceType.SWITCHING_COST,
                     statement_type=StatementType.DISCLOSED_FACT,
-                    fact=("Detailed grounded competitive evidence and operating context. " * 25) + str(index),
+                    fact=("Detailed grounded competitive evidence and operating context. " * 25) + chr(65 + index),
+                    raw_quote=re.search(
+                        r"--- BEGIN CANONICAL CHUNK ---\s*(.*?)\s*--- END CANONICAL CHUNK ---",
+                        request.user,
+                        re.DOTALL,
+                    ).group(1).strip(),
                     mechanism=["workflow integration", "qualification period", "switching friction"],
                     direction=(
                         EvidenceDirection.MOAT_NEGATIVE if index % 7 == 0 else EvidenceDirection.MOAT_POSITIVE

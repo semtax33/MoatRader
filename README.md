@@ -228,7 +228,7 @@ moatrader screen rank `
   --minimum-document-coverage 0.60
 ```
 
-LLM은 작업별로 라우팅됩니다. 증거 추출과 섹션·문장 요약은 기본 `gpt-5-nano`, 최종 MOAT scoring은 기본 `gpt-5.6-luna`를 사용합니다. 각각 `--summary-model`/`MOATRADER_SUMMARY_MODEL`, `--moat-model`/`MOATRADER_MOAT_MODEL`로 바꿀 수 있습니다. DCF는 LLM을 호출하지 않고 Python의 deterministic unlevered DCF 엔진으로 계산합니다.
+LLM은 작업별로 라우팅됩니다. 문장·섹션 요약은 기본 `gpt-5-nano`, MOAT evidence 의미 분류와 최종 MOAT scoring은 기본 `gpt-5-luna`를 사용합니다. 각각 `--summary-model`/`MOATRADER_SUMMARY_MODEL`, `--moat-model`/`MOATRADER_MOAT_MODEL`로 바꿀 수 있습니다. DCF는 LLM을 호출하지 않고 Python의 deterministic unlevered DCF 엔진으로 계산합니다.
 
 ```powershell
 moatrader moat run `
@@ -236,7 +236,7 @@ moatrader moat run `
   --as-of 2026-08-14T16:00:00+09:00 `
   --run-id kr-all-20260814 `
   --summary-model gpt-5-nano `
-  --moat-model gpt-5.6-luna
+  --moat-model gpt-5-luna
 ```
 
 최종 결과는 run 디렉터리의 `results.csv`, `ranking.csv`, `run-result.json`에, 회사별 근거·요청·RunManifest·체크포인트는 `companies\TICKER\` 아래에 저장됩니다. `llm-calls.jsonl`에는 호출마다 실제 사용 모델이 기록되고 `dcf-manifest.json`에는 `calculation_mode=deterministic_python`, `llm_model=null`이 기록됩니다. 한 회사의 실패는 다른 회사 실행을 중단시키지 않으며 전체 명령은 실패 회사가 있으면 종료 코드 2를 반환합니다.
@@ -257,10 +257,39 @@ moatrader backtest run `
   --top-n 10 `
   --execution-lag-days 1 `
   --transaction-cost-bps 10 `
+  --slippage-bps 5 `
+  --benchmark-ticker KOSPI `
   --output data-lake\gold\backtests\monthly-v1
 ```
 
-각 signal 이후 지정된 lag를 지난 첫 공통 거래 timestamp에 동일가중 체결하고, 보유·신규 종목 모두에 수정주가가 있어야 진행합니다. 가격이 사라진 상장폐지 종목을 조용히 제거하지 않고 실패시키므로, 데이터셋에는 상장폐지일까지의 수정주가나 명시적인 청산 가격을 포함해야 합니다. 결과는 `backtest-result.json`, `equity.csv`, `rebalances.csv`이며 turnover와 거래비용을 포함합니다. 이것은 연구 검증 도구이지 미래 수익률 보장이 아닙니다.
+가격 CSV에는 배당과 기업행동을 반영한 `adjusted_close`가 필요합니다. 거래용량 제약을
+검증할 때는 `dollar_volume` 열을 추가하고 `--enforce-capacity
+--maximum-participation-rate 0.05`를 사용합니다. 상장폐지 등으로 종료 가격이 없으면
+기본값은 전액 손실(`--missing-exit-return -1`)이며 결과의 `forced_settlements`에 기록됩니다.
+
+각 signal 이후 지정된 lag를 지난 첫 시장 timestamp에 거래 가능한 종목만 동일가중 체결합니다. 거래정지된 기존 보유분은 마지막 확인 가격으로 평가하고 잠금 상태를 기록하며, 신규 미체결 종목은 `unexecuted_tickers`에 남깁니다. 종료 가격이 끝내 없는 종목은 설정한 보수적 수익률로 강제 청산하므로 survivorship 편향을 조용히 숨기지 않습니다. 결과는 `backtest-result.json`, `equity.csv`, `rebalances.csv`이며 turnover·거래비용·슬리피지·용량 사용률·벤치마크 초과수익을 포함합니다. 이것은 연구 검증 도구이지 미래 수익률 보장이 아닙니다.
+
+실현 수익률 CSV(`date,ticker,forward_return`)가 있으면 다음 명령으로 raw IC, 섹터중립 IC,
+winsorized Q5-Q1을 계산합니다. 상·하위 분위는 서로 겹치지 않습니다.
+`--factor-column log_market_cap`처럼 숫자 노출 열을 반복 지정하면 섹터 내에서 해당
+요인까지 제거한 IC도 함께 기록합니다.
+
+```powershell
+python -m scripts.evaluate_signal_panel `
+  --signals data-lake\backtests\fresh\signals\moat-dcf-signals.csv `
+  --returns data\forward-returns.csv `
+  --output data-lake\backtests\fresh\signals\evaluation.json
+```
+
+동일 입력 반복 실행이나 입력 순서 변경 실행은 점수 순위와 인용 evidence 안정성을 별도 gate로
+검증할 수 있습니다.
+
+```powershell
+python -m scripts.audit_moat_reproducibility `
+  --baseline path\to\baseline\run-result.json `
+  --candidate path\to\reordered\run-result.json `
+  --output path\to\reproducibility.json
+```
 
 예제 DART 문서를 canonical artifact로 변환합니다.
 

@@ -589,7 +589,7 @@ def assumptions_from_history(
             "wacc": [f"UNIVERSE_SIZE_BUCKET:{size_bucket.upper() or 'MID'}"],
             "terminal_growth": ["POLICY_DEFAULT:LONG_RUN_GROWTH_2_PERCENT"],
             "net_debt": [base_source],
-            "diluted_shares": ["KRX_MARKET_SNAPSHOT"],
+            "diluted_shares": ["PIT_KRX_LISTED_SHARES_NOT_FULLY_DILUTED"],
         },
         "assumption_types": {
             "base_revenue": "DETERMINISTIC",
@@ -608,6 +608,7 @@ def assumptions_from_history(
             "Revenue growth is a historical-median heuristic with a linear fade, not company guidance.",
             "EBIT margin is a historical normalization heuristic, not a forward operating model.",
             "Tax rate and terminal growth are policy defaults.",
+            "Per-share value uses point-in-time KRX listed shares; potential options/convertibles require a separate dilution bridge.",
         ],
     }
     audit = {
@@ -642,13 +643,19 @@ def read_csv(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(stream))
 
 
-def latest_manifest_rows(
+def canonical_manifest_rows(
     path: Path,
     *,
     as_of: datetime,
-) -> dict[str, dict[str, str]]:
+) -> dict[str, list[dict[str, str]]]:
+    """Select the latest canonical annual and interim filing per ticker.
+
+    Selection is based on reporting period first and filing availability
+    second.  A late correction to an old report can therefore update that
+    period but cannot displace a newer interim/annual period.
+    """
     base = path.parent
-    selected: dict[str, tuple[datetime, dict[str, str]]] = {}
+    candidates: dict[str, list[tuple[str, datetime, datetime, dict[str, str]]]] = {}
     for row in read_csv(path):
         metadata_path = Path(row["metadata"])
         if not metadata_path.is_absolute():
@@ -658,20 +665,54 @@ def latest_manifest_rows(
         if available > as_of:
             continue
         ticker = row["ticker"].zfill(6)
-        if ticker not in selected or available > selected[ticker][0]:
-            copy = dict(row)
-            input_path = Path(copy["input"])
-            copy["input"] = str((base / input_path).resolve() if not input_path.is_absolute() else input_path)
-            copy["metadata"] = str(metadata_path)
-            selected[ticker] = (available, copy)
-    return {ticker: row for ticker, (_available, row) in selected.items()}
+        report_name = str(metadata.get("report_name") or metadata.get("title") or "")
+        form_type = str(metadata.get("form_type") or "")
+        label = f"{report_name} {form_type}".casefold()
+        if re.search(r"사업보고서|annual", label):
+            kind = "ANNUAL"
+        elif re.search(r"반기보고서|분기보고서|semiannual|quarter", label):
+            kind = "INTERIM"
+        else:
+            # Non-periodic filings must not replace periodic business reports
+            # in a structural MOAT/DCF run.
+            continue
+        period_text = str(metadata.get("period_end") or metadata.get("report_date") or "")[:10]
+        try:
+            period_at = datetime.fromisoformat(period_text).replace(tzinfo=as_of.tzinfo)
+        except ValueError:
+            continue
+        copy = dict(row)
+        input_path = Path(copy["input"])
+        copy["input"] = str((base / input_path).resolve() if not input_path.is_absolute() else input_path)
+        copy["metadata"] = str(metadata_path)
+        copy["selection_report_kind"] = kind
+        copy["selection_period_end"] = period_text
+        copy["selection_is_amendment"] = str(
+            bool(metadata.get("is_amendment")) or bool(re.search(r"기재정정|첨부정정|정정", report_name))
+        )
+        candidates.setdefault(ticker, []).append((kind, period_at, available, copy))
+
+    result: dict[str, list[dict[str, str]]] = {}
+    for ticker, values in candidates.items():
+        selected_rows = []
+        for kind in ("ANNUAL", "INTERIM"):
+            matching = [item for item in values if item[0] == kind]
+            if matching:
+                # Later period wins; latest available version wins within it.
+                selected_rows.append(max(matching, key=lambda item: (item[1], item[2]))[3])
+        if selected_rows:
+            result[ticker] = selected_rows
+    return result
+
+
+# Backward-compatible name for callers/tests; the value is now a list because
+# a company can carry both its latest annual and latest interim filing.
+latest_manifest_rows = canonical_manifest_rows
 
 
 def historical_market_snapshot(
     ticker: str,
     as_of: datetime,
-    *,
-    fallback_shares: Decimal,
 ) -> tuple[Decimal, Decimal, datetime, str]:
     from pykrx import stock as krx_stock
 
@@ -688,14 +729,20 @@ def historical_market_snapshot(
     market_day = ohlcv.index[-1].date()
     price = Decimal(str(int(ohlcv.iloc[-1]["종가"])))
 
-    shares = fallback_shares
-    source = "KRX_OHLCV+UNIVERSE_LISTED_SHARES"
+    shares: Decimal | None = None
+    source = "KRX_OHLCV+KRX_PIT_LISTED_SHARES"
     cap = krx_stock.get_market_cap(start, end, ticker)
     if cap is not None and not cap.empty:
         cap = cap[cap.index.date <= market_day].sort_index()
         if not cap.empty and Decimal(str(int(cap.iloc[-1]["상장주식수"]))) > 0:
             shares = Decimal(str(int(cap.iloc[-1]["상장주식수"])))
-            source = "KRX_OHLCV+KRX_MARKET_CAP"
+            source = "KRX_OHLCV+KRX_PIT_LISTED_SHARES"
+
+    if shares is None:
+        raise ValueError(
+            f"no point-in-time KRX listed-share count for {ticker}; "
+            "stale universe shares are not permitted for per-share DCF"
+        )
 
     price_at = datetime.combine(
         market_day,
@@ -735,7 +782,7 @@ def main() -> int:
     as_of = datetime.fromisoformat(args.as_of.replace("Z", "+00:00"))
     if as_of.tzinfo is None or as_of.utcoffset() is None:
         raise ValueError("--as-of must include a timezone offset")
-    filing_by_stock = latest_manifest_rows(
+    filing_by_stock = canonical_manifest_rows(
         args.collected_manifest.resolve(),
         as_of=as_of,
     )
@@ -752,16 +799,16 @@ def main() -> int:
     for index, source in enumerate(universe, start=1):
         ticker = source["stock_code"].zfill(6)
         print(f"[{index}/{len(universe)}] {ticker}", flush=True)
-        filing = filing_by_stock.get(ticker)
-        if filing is None:
-            exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": "NO_ANNUAL_FILING"})
+        filings = filing_by_stock.get(ticker, [])
+        if not filings:
+            exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": "NO_PERIODIC_PIT_FILING"})
             continue
+        filing = max(filings, key=lambda item: (item.get("selection_period_end", ""), item.get("selection_report_kind", "")))
         corp_code = corp_by_stock.get(ticker) or filing.get("issuer_id", "")
         try:
             price, diluted_shares, price_as_of, price_source = historical_market_snapshot(
                 ticker,
                 as_of,
-                fallback_shares=Decimal(source["listed_shares"]),
             )
         except ValueError as exc:
             exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": str(exc)})
@@ -779,8 +826,15 @@ def main() -> int:
             "price_source": price_source,
             "diluted_shares": str(diluted_shares),
         }
-        if source.get("finance_hint", "").strip().lower() == "true":
-            exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": "FINANCIAL_COMPANY_DCF_MODEL_MISMATCH"})
+        name = source.get("name", "")
+        special_valuation = (
+            source.get("finance_hint", "").strip().lower() == "true"
+            or source.get("holding_hint", "").strip().lower() == "true"
+            or source.get("security_type", "COMMON").strip().upper() != "COMMON"
+            or bool(re.search(r"리츠|REIT|리얼티|인프라", name, re.IGNORECASE))
+        )
+        if special_valuation:
+            exclusions.append({"stock_code": ticker, "name": name, "reason": "SPECIAL_COMPANY_DCF_MODEL_MISMATCH"})
         else:
             try:
                 base_metrics, pit_details, latest_report = build_pit_ttm_input(
@@ -861,23 +915,25 @@ def main() -> int:
             except ValueError as exc:
                 exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": str(exc)})
 
-        manifest_rows.append(
-            {
-                **filing,
-                "ticker": ticker,
-                "issuer_name": filing.get("issuer_name") or source.get("name", ""),
-                "current_price": format(price, "f"),
-                "price_as_of": price_as_of.isoformat(),
-                "dcf_assumptions": dcf_path,
-                "dcf_input": dcf_input_path_text,
-                "dcf_input_sha256": dcf_input_hash,
-            }
-        )
+        for selected_filing in filings:
+            manifest_rows.append(
+                {
+                    **selected_filing,
+                    "ticker": ticker,
+                    "issuer_name": selected_filing.get("issuer_name") or source.get("name", ""),
+                    "current_price": format(price, "f"),
+                    "price_as_of": price_as_of.isoformat(),
+                    "dcf_assumptions": dcf_path,
+                    "dcf_input": dcf_input_path_text,
+                    "dcf_input_sha256": dcf_input_hash,
+                }
+            )
         audits.append(audit)
 
     manifest_headers = [
         "ticker", "source", "input", "metadata", "issuer_id", "issuer_name",
         "current_price", "price_as_of", "dcf_assumptions", "dcf_input", "dcf_input_sha256",
+        "selection_report_kind", "selection_period_end", "selection_is_amendment",
     ]
     write_csv(output_root / "universe-manifest.csv", manifest_rows, manifest_headers)
     audit_headers = sorted({key for row in audits for key in row})

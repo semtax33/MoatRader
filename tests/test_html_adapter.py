@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
 from moatrader.adapters import EdgarHtmlAdapter, IrHtmlAdapter, RawDocument
 from moatrader.adapters import DartHtmlAdapter
+from moatrader.adapters.html import _section_role
 from moatrader.canonical.models import SectionNode
 from moatrader.canonical.models import SectionNode, SectionRole, SourceType, TableNode
 
 from conftest import build_dart_bundle
+
+
+def test_korean_dart_section_roles_are_classified_from_real_headings() -> None:
+    assert _section_role("II. 사업의 내용") == SectionRole.BUSINESS
+    assert _section_role("경쟁 상황 및 시장점유율") == SectionRole.COMPETITION
+    assert _section_role("주요 고객 및 매출처") == SectionRole.CUSTOMERS
+    assert _section_role("원재료 및 공급업체") == SectionRole.SUPPLIERS
+    assert _section_role("위험 요인") == SectionRole.RISK
+    assert _section_role("향후 사업 전망") == SectionRole.GUIDANCE
 
 
 DART_TABLE_HTML = """
@@ -167,6 +179,52 @@ def test_prior_table_unit_does_not_leak_into_next_operating_table() -> None:
         if isinstance(node, TableNode) and "생산능력" in node.normalized_text
     )
     assert production.unit is None
+
+
+def test_immediately_preceding_financial_table_unit_is_inherited() -> None:
+    bundle = build_dart_bundle(
+        """<DOCUMENT><BODY>
+        <TABLE><TR><TD>(단위: 백만원)</TD></TR></TABLE>
+        <TABLE><TR><TH>?덈ぉ</TH><TH>2025??/TH></TR>
+        <TR><TD>?먯궛珥앷퀎</TD><TD>1,000</TD></TR></TABLE>
+        <TABLE><TR><TH>?덈ぉ</TH><TH>2025??/TH></TR>
+        <TR><TD>留ㅼ텧??/TD><TD>500</TD></TR></TABLE>
+        </BODY></DOCUMENT>"""
+    )
+
+    tables = [node for node in bundle.ast.walk() if isinstance(node, TableNode)]
+    assert tables[-1].unit is not None
+    assert tables[-1].unit.canonical == "KRW_MILLION"
+
+
+def test_document_reporting_period_fills_relative_fiscal_header() -> None:
+    bundle = build_dart_bundle(
+        """<DOCUMENT><BODY><TABLE>
+        <TR><TH>구분</TH><TH>제28(당)기</TH><TH>제27(전)기</TH></TR>
+        <TR><TD>留ㅼ텧??/TD><TD>1,000</TD><TD>900</TD></TR>
+        </TABLE></BODY></DOCUMENT>""",
+        period_start="2025-01-01",
+        period_end="2025-12-31",
+    )
+
+    table = next(node for node in bundle.ast.walk() if isinstance(node, TableNode))
+    assert table.period is not None
+    assert table.period.end == date(2025, 12, 31)
+
+
+def test_unit_marker_inside_table_header_is_preserved() -> None:
+    bundle = build_dart_bundle(
+        """<DOCUMENT><BODY><TABLE>
+        <TR><TD COLSPAN="3">(단위 : 천원)</TD></TR>
+        <TR><TD>구분</TD><TD>2025년</TD><TD>2024년</TD></TR>
+        <TR><TD>매출액</TD><TD>1,000</TD><TD>900</TD></TR>
+        </TABLE></BODY></DOCUMENT>"""
+    )
+
+    table = next(node for node in bundle.ast.walk() if isinstance(node, TableNode))
+    assert table.unit is not None
+    assert table.unit.canonical == "KRW_THOUSAND"
+    assert table.unit.scale == 1000
 
 
 def test_dart_te_cells_are_tables_and_acode_is_a_structured_fact() -> None:
@@ -401,3 +459,17 @@ def test_dart_correction_wrapper_tables_are_not_silently_lost() -> None:
 
     assert len(tables) == 2
     assert bundle.quality.ast_table_count == bundle.quality.raw_table_count == 2
+
+
+def test_dart_td_only_leading_rows_are_inferred_as_table_headers() -> None:
+    bundle = build_dart_bundle(
+        """<html><body><h1>요약재무정보</h1><table>
+        <tr><td>구분</td><td>제65기</td><td>제64기</td></tr>
+        <tr><td>매출액</td><td>100</td><td>90</td></tr>
+        <tr><td>영업이익</td><td>10</td><td>8</td></tr>
+        </table></body></html>"""
+    )
+    table = next(node for node in bundle.ast.walk() if isinstance(node, TableNode))
+
+    assert table.header_row_count == 1
+    assert [header.path for header in table.column_headers] == [["구분"], ["제65기"], ["제64기"]]

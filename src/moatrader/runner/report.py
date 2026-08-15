@@ -18,25 +18,14 @@ def rank_run_result(
             not company.moat_score
             or not company.dcf
             or company.dcf.fair_value_per_share <= 0
+            or not company.dcf.screening_eligible
             or company.current_price is None
             or company.price_as_of is None
             or company.valuation_as_of is None
         ):
             continue
         coverage = company.moat_score.document_coverage
-        values = [
-            value
-            for value in (
-                coverage.token_retention,
-                coverage.evidence_retention,
-                coverage.char_retention,
-                coverage.section_retention,
-                coverage.table_retention,
-                coverage.numeric_retention,
-            )
-            if value is not None
-        ]
-        coverage_scalar = Decimal(str(min(values))) if values else Decimal(0)
+        coverage_scalar = Decimal(str(coverage.moat_evidence_coverage or 0))
         candidates.append(
             CandidateInput(
                 issuer_id=company.issuer_id or company.ticker,
@@ -77,21 +66,7 @@ def results_csv(result: UniverseRunResult) -> str:
     writer.writeheader()
     for company in result.companies:
         score = company.moat_score
-        coverage_values = []
-        if score:
-            coverage_values = [
-                value
-                for value in (
-                    score.document_coverage.token_retention,
-                    score.document_coverage.evidence_retention,
-                    score.document_coverage.char_retention,
-                    score.document_coverage.section_retention,
-                    score.document_coverage.table_retention,
-                    score.document_coverage.numeric_retention,
-                )
-                if value is not None
-            ]
-        coverage = min(coverage_values) if coverage_values else None
+        coverage = score.document_coverage.moat_evidence_coverage if score else None
         fair_value = company.dcf.fair_value_per_share if company.dcf else None
         writer.writerow(
             {
@@ -125,6 +100,8 @@ def ranking_csv(result: UniverseRunResult) -> str:
         "price_to_dcf",
         "margin_of_safety",
         "quality_value_score",
+        "moat_percentile",
+        "value_percentile",
         "valuation_as_of",
         "price_as_of",
     ]
@@ -139,6 +116,8 @@ def ranking_csv(result: UniverseRunResult) -> str:
                 "price_to_dcf": candidate.price_to_dcf,
                 "margin_of_safety": candidate.margin_of_safety,
                 "quality_value_score": candidate.quality_value_score,
+                "moat_percentile": candidate.moat_percentile,
+                "value_percentile": candidate.value_percentile,
                 "valuation_as_of": candidate.valuation_as_of.isoformat(),
                 "price_as_of": candidate.price_as_of.isoformat(),
             }

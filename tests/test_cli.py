@@ -33,7 +33,7 @@ def test_cli_can_dry_run_one_selected_ticker(tmp_path: Path, capsys: object) -> 
     assert (run_dir / "run-result.json").is_file()
     run_config = json.loads((run_dir / "run-config.json").read_text(encoding="utf-8"))
     assert run_config["summary_model"] == "gpt-5-nano"
-    assert run_config["moat_model"] == "gpt-5.6-luna"
+    assert run_config["moat_model"] == "gpt-5-luna"
     assert main(["moat", "status", "--run-dir", str(run_dir)]) == 0
     assert main(["screen", "rank", "--run-dir", str(run_dir)]) == 0
     assert (run_dir / "ranking.csv").is_file()

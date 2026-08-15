@@ -12,6 +12,8 @@ from moatrader.canonical.models import (
 )
 from moatrader.quality import ParserQualityGateConfig, assess_parser_quality
 
+from conftest import build_dart_bundle
+
 
 def _bundle(quality: QualityMetrics) -> CanonicalDocumentBundle:
     return CanonicalDocumentBundle(
@@ -75,3 +77,30 @@ def test_quality_gate_rejects_tagged_facts_that_were_not_canonicalized() -> None
     assert assessment.failures == [
         "structured fact retention 0.8000 is below 0.9900"
     ]
+
+
+def test_quality_gate_rejects_numeric_financial_table_without_semantics() -> None:
+    bundle = build_dart_bundle(
+        "<html><body><h1>재무제표</h1><table>"
+        "<tr><td>매출액</td><td>100</td></tr><tr><td>영업이익</td><td>10</td></tr>"
+        "</table></body></html>"
+    )
+
+    assessment = assess_parser_quality(bundle)
+
+    assert assessment.passed is False
+    assert any("column-header mapping" in failure for failure in assessment.failures)
+    assert any("reporting-period context" in failure for failure in assessment.failures)
+    assert any("unit context" in failure for failure in assessment.failures)
+
+
+def test_quality_gate_recognizes_statement_specific_korean_heading() -> None:
+    bundle = build_dart_bundle(
+        "<html><body><h1>연결 재무상태표</h1>"
+        "<table><tr><td>자산</td><td>100</td></tr>"
+        "<tr><td>부채</td><td>50</td></tr></table></body></html>"
+    )
+
+    assessment = assess_parser_quality(bundle)
+
+    assert any("column-header mapping" in failure for failure in assessment.failures)

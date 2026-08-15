@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -14,12 +16,63 @@ from moatrader.financial.pit import (
 from scripts.prepare_kr_dcf_manifest import (
     assumptions_from_history,
     build_pit_ttm_input,
+    canonical_manifest_rows,
     financial_metrics,
     latest_pit_financial_report,
 )
 
 
 KST = timezone(timedelta(hours=9))
+
+
+def test_manifest_selection_uses_period_first_and_keeps_annual_plus_interim(tmp_path: Path) -> None:
+    manifest = tmp_path / "collected.csv"
+    rows = []
+    fixtures = [
+        ("old-annual", "사업보고서 (2024.12)", "2024-12-31", "2025-03-15T23:59:59+09:00", False),
+        ("old-annual-fix", "[기재정정] 사업보고서 (2024.12)", "2024-12-31", "2025-08-20T23:59:59+09:00", True),
+        ("new-interim", "반기보고서 (2025.06)", "2025-06-30", "2025-08-14T23:59:59+09:00", False),
+    ]
+    for document_id, report_name, period_end, available_at, amendment in fixtures:
+        source = tmp_path / f"{document_id}.html"
+        source.write_text("<html></html>", encoding="utf-8")
+        metadata = tmp_path / f"{document_id}.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "available_at": available_at,
+                    "report_name": report_name,
+                    "period_end": period_end,
+                    "is_amendment": amendment,
+                }
+            ),
+            encoding="utf-8",
+        )
+        rows.append(
+            {
+                "ticker": "000001",
+                "source": "DART",
+                "input": str(source),
+                "metadata": str(metadata),
+            }
+        )
+    with manifest.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    selected = canonical_manifest_rows(
+        manifest,
+        as_of=datetime.fromisoformat("2025-08-31T23:59:59+09:00"),
+    )["000001"]
+
+    assert {(row["selection_report_kind"], row["selection_period_end"]) for row in selected} == {
+        ("ANNUAL", "2024-12-31"),
+        ("INTERIM", "2025-06-30"),
+    }
+    annual = next(row for row in selected if row["selection_report_kind"] == "ANNUAL")
+    assert annual["selection_is_amendment"] == "True"
+    assert Path(annual["input"]).name == "old-annual-fix.html"
 
 
 class FakeDartClient:

@@ -10,6 +10,7 @@ from moatrader.backtest.models import (
     BacktestPerformance,
     BacktestResult,
     EquityPoint,
+    ForcedSettlement,
     RebalanceRecord,
 )
 from moatrader.backtest.prices import PricePanel
@@ -36,14 +37,16 @@ class PointInTimeBacktester:
         ]
         peak = cash
         last_execution = signals[0].as_of
-        cost_rate = self.config.transaction_cost_bps / Decimal(10_000)
+        transaction_cost_rate = self.config.transaction_cost_bps / Decimal(10_000)
+        slippage_rate = self.config.slippage_bps / Decimal(10_000)
+        forced_settlements: list[ForcedSettlement] = []
 
         for signal in signals:
-            selected = [candidate.ticker for candidate in signal.ranking[: self.config.top_n]]
-            target_tickers = set(selected)
-            lookup_tickers = set(units) | target_tickers
+            requested = [candidate.ticker for candidate in signal.ranking[: self.config.top_n]]
             eligible_at = signal.as_of + timedelta(days=self.config.execution_lag_days)
-            execution_at = prices.common_timestamp(lookup_tickers, eligible_at)
+            execution_at = prices.market_timestamp(eligible_at)
+            if execution_at is None:
+                raise ValueError(f"no market timestamp at or after {eligible_at.isoformat()}")
             if execution_at <= last_execution:
                 raise ValueError("rebalance executions must be strictly increasing")
             if units:
@@ -56,31 +59,72 @@ class PointInTimeBacktester:
                     through=execution_at,
                     peak=peak,
                 )
-            execution_prices = prices.prices_at(lookup_tickers, execution_at)
-            current_values = {ticker: quantity * execution_prices[ticker] for ticker, quantity in units.items()}
+            lookup_tickers = set(units) | set(requested)
+            exact_prices = prices.tradable_prices_at(lookup_tickers, execution_at)
+            mark_prices = prices.prices_at_or_before(set(units), execution_at) if units else {}
+            locked_tickers = set(units) - set(exact_prices)
+            selected = [ticker for ticker in requested if ticker in exact_prices]
+            target_tickers = set(selected)
+            current_values = {ticker: quantity * mark_prices[ticker] for ticker, quantity in units.items()}
             pre_value = cash + sum(current_values.values(), Decimal(0))
             if pre_value <= 0:
                 raise ValueError("portfolio value became non-positive")
-            current_weights = {ticker: value / pre_value for ticker, value in current_values.items()}
+            locked_value = sum((current_values[ticker] for ticker in locked_tickers), Decimal(0))
+            current_weights = {
+                ticker: value / pre_value
+                for ticker, value in current_values.items()
+                if ticker not in locked_tickers
+            }
             current_cash_weight = cash / pre_value
-            target_weight = Decimal(1) / Decimal(len(selected)) if selected else Decimal(0)
+            investable_weight = max(Decimal(0), Decimal(1) - locked_value / pre_value)
+            target_weight = investable_weight / Decimal(len(selected)) if selected else Decimal(0)
             asset_turnover = sum(
                 abs((target_weight if ticker in target_tickers else Decimal(0)) - current_weights.get(ticker, Decimal(0)))
-                for ticker in lookup_tickers
+                for ticker in (set(current_weights) | target_tickers)
             )
-            target_cash_weight = Decimal(0) if selected else Decimal(1)
+            target_cash_weight = Decimal(0) if selected else investable_weight
             turnover = (asset_turnover + abs(target_cash_weight - current_cash_weight)) / Decimal(2)
-            transaction_cost = pre_value * cost_rate * turnover
-            post_value = pre_value - transaction_cost
+            if turnover > self.config.maximum_turnover:
+                raise ValueError(
+                    f"rebalance turnover {turnover} exceeds configured maximum {self.config.maximum_turnover}"
+                )
+            transaction_cost = pre_value * transaction_cost_rate * turnover
+            slippage_cost = pre_value * slippage_rate * turnover
+            post_value = pre_value - transaction_cost - slippage_cost
             if post_value <= 0:
                 raise ValueError("transaction costs exhausted the portfolio")
+            locked_units = {ticker: units[ticker] for ticker in locked_tickers}
+            investable_value = post_value - locked_value
+            if investable_value < 0:
+                raise ValueError("locked holdings exceed post-cost portfolio value")
             if selected:
-                allocation = post_value / Decimal(len(selected))
-                units = {ticker: allocation / execution_prices[ticker] for ticker in selected}
+                allocation = investable_value / Decimal(len(selected))
+                capacity_utilizations: list[Decimal] = []
+                if self.config.enforce_capacity:
+                    for ticker in selected:
+                        dollar_volume = prices.dollar_volume_at(ticker, execution_at)
+                        if dollar_volume is None:
+                            raise ValueError(
+                                f"capacity enforcement requires dollar_volume for {ticker} at {execution_at.isoformat()}"
+                            )
+                        current_value = current_values.get(ticker, Decimal(0))
+                        trade_notional = abs(allocation - current_value)
+                        utilization = trade_notional / dollar_volume
+                        capacity_utilizations.append(utilization)
+                        if utilization > self.config.maximum_participation_rate:
+                            raise ValueError(
+                                f"target trade for {ticker} uses {utilization:.4f} of daily dollar volume, "
+                                f"above {self.config.maximum_participation_rate:.4f}"
+                            )
+                units = {
+                    **locked_units,
+                    **{ticker: allocation / exact_prices[ticker] for ticker in selected},
+                }
                 cash = Decimal(0)
             else:
-                units = {}
-                cash = post_value
+                capacity_utilizations = []
+                units = locked_units
+                cash = investable_value
             rebalances.append(
                 RebalanceRecord(
                     run_id=signal.run_id,
@@ -91,6 +135,13 @@ class PointInTimeBacktester:
                     post_trade_value=post_value,
                     turnover=turnover,
                     transaction_cost=transaction_cost,
+                    slippage_cost=slippage_cost,
+                    requested_tickers=requested,
+                    unexecuted_tickers=[ticker for ticker in requested if ticker not in target_tickers],
+                    locked_tickers=sorted(locked_tickers),
+                    maximum_capacity_utilization=(
+                        max(capacity_utilizations) if capacity_utilizations else None
+                    ),
                 )
             )
             peak = max(peak, post_value)
@@ -104,7 +155,7 @@ class PointInTimeBacktester:
             )
             last_execution = execution_at
 
-        exit_at = prices.common_timestamp(set(units), self.config.end_at)
+        exit_at = prices.market_timestamp(self.config.end_at) or self.config.end_at
         if exit_at <= last_execution:
             raise ValueError("end_at must resolve after the final rebalance execution")
         if units:
@@ -117,18 +168,62 @@ class PointInTimeBacktester:
                 through=exit_at,
                 peak=peak,
             )
-        exit_prices = prices.prices_at(set(units), exit_at)
-        ending = cash + sum((quantity * exit_prices[ticker] for ticker, quantity in units.items()), Decimal(0))
-        terminal_cost = Decimal(0)
+        exit_prices = prices.tradable_prices_at(set(units), exit_at)
+        ending = cash
+        for ticker, quantity in units.items():
+            if ticker in exit_prices:
+                ending += quantity * exit_prices[ticker]
+                continue
+            last_at, last_price = prices.last_point_at_or_before(ticker, exit_at)
+            settlement_value = quantity * last_price * (Decimal(1) + self.config.missing_exit_return)
+            ending += settlement_value
+            forced_settlements.append(
+                ForcedSettlement(
+                    ticker=ticker,
+                    settlement_at=exit_at,
+                    last_price_at=last_at,
+                    last_price=last_price,
+                    assumed_return=self.config.missing_exit_return,
+                    settlement_value=settlement_value,
+                    reason="NO_EXIT_PRICE_CONSERVATIVE_SETTLEMENT",
+                )
+            )
+        terminal_transaction_cost = Decimal(0)
+        terminal_slippage_cost = Decimal(0)
         if self.config.liquidate_at_end and units:
-            terminal_cost = ending * cost_rate
-            ending -= terminal_cost
+            terminal_transaction_cost = ending * transaction_cost_rate
+            terminal_slippage_cost = ending * slippage_rate
+            ending -= terminal_transaction_cost + terminal_slippage_cost
         peak = max(peak, ending)
         self._replace_or_append_equity(
             equity,
             EquityPoint(timestamp=exit_at, portfolio_value=ending, drawdown=ending / peak - Decimal(1)),
         )
-        performance = self._performance(equity, rebalances, terminal_cost)
+        benchmark_return = None
+        if self.config.benchmark_ticker:
+            benchmark_prices = prices.tradable_prices_at(
+                {self.config.benchmark_ticker},
+                rebalances[0].execution_at,
+            )
+            benchmark_end_prices = prices.tradable_prices_at(
+                {self.config.benchmark_ticker},
+                exit_at,
+            )
+            if self.config.benchmark_ticker not in benchmark_prices or self.config.benchmark_ticker not in benchmark_end_prices:
+                raise ValueError(
+                    f"benchmark {self.config.benchmark_ticker} requires prices exactly at "
+                    f"{rebalances[0].execution_at.isoformat()} and {exit_at.isoformat()}"
+                )
+            benchmark_start = benchmark_prices[self.config.benchmark_ticker]
+            benchmark_end = benchmark_end_prices[self.config.benchmark_ticker]
+            benchmark_return = benchmark_end / benchmark_start - Decimal(1)
+        performance = self._performance(
+            equity,
+            rebalances,
+            terminal_transaction_cost,
+            terminal_slippage_cost,
+            benchmark_return,
+        )
         return BacktestResult(
             started_at=equity[0].timestamp,
             ended_at=equity[-1].timestamp,
@@ -137,6 +232,7 @@ class PointInTimeBacktester:
             rebalances=rebalances,
             equity_curve=equity,
             performance=performance,
+            forced_settlements=forced_settlements,
         )
 
     @staticmethod
@@ -158,8 +254,8 @@ class PointInTimeBacktester:
         peak: Decimal,
     ) -> Decimal:
         tickers = set(units)
-        for timestamp in prices.common_timestamps(tickers, after=after, through=through):
-            point_prices = prices.prices_at(tickers, timestamp)
+        for timestamp in prices.mark_timestamps(tickers, after=after, through=through):
+            point_prices = prices.prices_at_or_before(tickers, timestamp)
             value = cash + sum(
                 (quantity * point_prices[ticker] for ticker, quantity in units.items()),
                 Decimal(0),
@@ -191,7 +287,9 @@ class PointInTimeBacktester:
         self,
         equity: list[EquityPoint],
         rebalances: list[RebalanceRecord],
-        terminal_cost: Decimal,
+        terminal_transaction_cost: Decimal,
+        terminal_slippage_cost: Decimal,
+        benchmark_return: Decimal | None,
     ) -> BacktestPerformance:
         initial = self.config.initial_capital
         ending = equity[-1].portfolio_value
@@ -215,7 +313,14 @@ class PointInTimeBacktester:
             if rebalances
             else Decimal(0)
         )
-        total_cost = sum((record.transaction_cost for record in rebalances), Decimal(0)) + terminal_cost
+        total_transaction_cost = (
+            sum((record.transaction_cost for record in rebalances), Decimal(0))
+            + terminal_transaction_cost
+        )
+        total_slippage_cost = (
+            sum((record.slippage_cost for record in rebalances), Decimal(0))
+            + terminal_slippage_cost
+        )
         return BacktestPerformance(
             initial_capital=initial,
             ending_capital=ending,
@@ -224,6 +329,9 @@ class PointInTimeBacktester:
             annualized_volatility=volatility,
             max_drawdown=min(point.drawdown for point in equity),
             average_turnover=average_turnover,
-            total_transaction_cost=total_cost,
+            total_transaction_cost=total_transaction_cost,
+            total_slippage_cost=total_slippage_cost,
             rebalance_count=len(rebalances),
+            benchmark_total_return=benchmark_return,
+            excess_total_return=total_return - benchmark_return if benchmark_return is not None else None,
         )

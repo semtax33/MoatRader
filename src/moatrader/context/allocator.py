@@ -14,7 +14,7 @@ DEFAULT_WEIGHTS: dict[SectionRole | None, float] = {
     SectionRole.CUSTOMERS: 0.10,
     SectionRole.SUPPLIERS: 0.06,
     SectionRole.PRODUCTS: 0.08,
-    SectionRole.FINANCIALS: 0.16,
+    SectionRole.FINANCIALS: 0.03,
     SectionRole.MDA: 0.10,
     SectionRole.RISK: 0.10,
     SectionRole.GUIDANCE: 0.03,
@@ -25,7 +25,6 @@ DEFAULT_MINIMUMS: dict[SectionRole | None, int] = {
     SectionRole.BUSINESS: 800,
     SectionRole.COMPETITION: 600,
     SectionRole.CUSTOMERS: 400,
-    SectionRole.FINANCIALS: 1_000,
     SectionRole.RISK: 500,
 }
 
@@ -68,7 +67,9 @@ class DynamicTokenBudgetAllocator:
             grouped[chunk.section_role].append(chunk)
 
         def rank(chunk: SemanticChunk) -> float:
-            signal = max(0.01, relevance.get(chunk.chunk_id, 1.0))
+            # A chunk absent from retrieval is a miss, not a perfect relevance
+            # hit.  The small floor retains deterministic fallback behavior.
+            signal = max(0.01, relevance.get(chunk.chunk_id, 0.01))
             role_weight = self.weights.get(chunk.section_role, self.weights.get(None, 0.01))
             return role_weight * signal / max(1.0, chunk.token_count ** 0.5)
 
@@ -96,4 +97,3 @@ class DynamicTokenBudgetAllocator:
             selected=selected,
             dropped_chunk_ids=dropped,
         )
-

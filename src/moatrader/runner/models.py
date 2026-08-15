@@ -24,7 +24,7 @@ class UniverseRunConfig(ContractModel):
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     as_of: datetime
     summary_model: str = Field(default="gpt-5-nano", min_length=1)
-    moat_model: str = Field(default="gpt-5.6-luna", min_length=1)
+    moat_model: str = Field(default="gpt-5-luna", min_length=1)
     summary_reasoning_effort: str = Field(default="low", min_length=1)
     moat_reasoning_effort: str = Field(default="medium", min_length=1)
     context_tokens: int = Field(default=64_000, gt=8_000)
@@ -34,11 +34,13 @@ class UniverseRunConfig(ContractModel):
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
     minimum_structured_fact_retention: float = Field(default=0.99, ge=0.0, le=1.0)
     require_table_count_match: bool = True
+    require_financial_table_semantics: bool = True
     allow_low_quality: bool = False
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)
-    maximum_evidence_chunks: int | None = Field(default=None, ge=1, le=1000)
-    evidence_batch_max_tokens: int | None = Field(default=None, ge=500, le=100_000)
-    consolidate_section_summaries: bool = False
+    maximum_evidence_chunks: int | None = Field(default=24, ge=1, le=1000)
+    evidence_batch_max_tokens: int | None = Field(default=4_000, ge=500, le=100_000)
+    consolidate_section_summaries: bool = True
+    include_raw_moat_appendix: bool = False
     workers: int = Field(default=1, ge=1, le=32)
     resume: bool = False
     dry_run: bool = False
@@ -61,6 +63,9 @@ class LLMCallAudit(ContractModel):
     response_id: str | None = None
     usage: TransportUsage = Field(default_factory=TransportUsage)
     created_at: datetime
+    raw_response_path: str | None = None
+    raw_response_sha256: str | None = None
+    normalized_output_sha256: str | None = None
 
 
 class CompanyRunResult(ContractModel):
@@ -81,6 +86,7 @@ class CompanyRunResult(ContractModel):
     error: str | None = None
     artifact_directory: str
     llm_usage: TransportUsage = Field(default_factory=TransportUsage)
+    runner_version: str | None = None
 
 
 class UniverseRunResult(ContractModel):

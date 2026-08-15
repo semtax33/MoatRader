@@ -251,11 +251,13 @@ def _moat_run(args: argparse.Namespace) -> int:
         minimum_numeric_retention=args.minimum_numeric_retention,
         minimum_structured_fact_retention=args.minimum_structured_fact_retention,
         require_table_count_match=not args.allow_table_count_mismatch,
+        require_financial_table_semantics=not args.allow_incomplete_financial_table_semantics,
         allow_low_quality=args.allow_low_quality,
         maximum_price_age_days=args.maximum_price_age_days,
         maximum_evidence_chunks=args.maximum_evidence_chunks,
         evidence_batch_max_tokens=args.evidence_batch_max_tokens,
         consolidate_section_summaries=args.consolidate_section_summaries,
+        include_raw_moat_appendix=args.include_raw_moat_appendix,
         workers=args.workers,
         resume=args.resume,
         dry_run=args.dry_run,
@@ -376,9 +378,16 @@ def _backtest_run(args: argparse.Namespace) -> int:
         top_n=args.top_n,
         execution_lag_days=args.execution_lag_days,
         transaction_cost_bps=args.transaction_cost_bps,
+        slippage_bps=args.slippage_bps,
+        maximum_turnover=args.maximum_turnover,
+        enforce_capacity=args.enforce_capacity,
+        maximum_participation_rate=args.maximum_participation_rate,
+        benchmark_ticker=args.benchmark_ticker,
         initial_capital=args.initial_capital,
         liquidate_at_end=not args.no_terminal_liquidation,
         maximum_signal_price_age_days=args.maximum_signal_price_age_days,
+        missing_exit_return=args.missing_exit_return,
+        adjusted_close_includes_distributions=not args.unadjusted_distributions,
     )
     result = PointInTimeBacktester(config).run(runs, PricePanel(load_price_panel(args.prices)))
     output = Path(args.output).resolve()
@@ -395,6 +404,10 @@ def _backtest_run(args: argparse.Namespace) -> int:
     print(f"cagr={performance.cagr if performance.cagr is not None else '-'}")
     print(f"max_drawdown={performance.max_drawdown}")
     print(f"transaction_cost={performance.total_transaction_cost}")
+    print(f"slippage_cost={performance.total_slippage_cost}")
+    if performance.benchmark_total_return is not None:
+        print(f"benchmark_total_return={performance.benchmark_total_return}")
+        print(f"excess_total_return={performance.excess_total_return}")
     return 0
 
 
@@ -503,12 +516,12 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument(
         "--summary-model",
         default=os.getenv("MOATRADER_SUMMARY_MODEL", "gpt-5-nano"),
-        help="model for evidence extraction and section summaries (default: gpt-5-nano)",
+        help="model for sentence/section summaries only (default: gpt-5-nano)",
     )
     moat_run.add_argument(
         "--moat-model",
-        default=os.getenv("MOATRADER_MOAT_MODEL", "gpt-5.6-luna"),
-        help="model for final MOAT scoring (default: gpt-5.6-luna)",
+        default=os.getenv("MOATRADER_MOAT_MODEL", "gpt-5-luna"),
+        help="model for MOAT evidence classification and final scoring (default: gpt-5-luna)",
     )
     moat_run.add_argument("--model", help=argparse.SUPPRESS)
     moat_run.add_argument(
@@ -534,22 +547,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue despite parser quality gate failures (recorded in quality-gate.json)",
     )
+    moat_run.add_argument(
+        "--allow-incomplete-financial-table-semantics",
+        action="store_true",
+        help="do not hard-fail numeric financial tables missing headers, periods, or units",
+    )
     moat_run.add_argument("--maximum-price-age-days", type=int, default=7)
     moat_run.add_argument(
         "--maximum-evidence-chunks",
         type=int,
+        default=24,
         help="preselect at most this many MOAT-relevant chunks before evidence extraction",
     )
     moat_run.add_argument(
         "--evidence-batch-max-tokens",
         type=int,
-        default=None,
-        help="combine selected chunks into bounded nano-model calls up to this token estimate",
+        default=4_000,
+        help="combine selected chunks into bounded MOAT-classification calls up to this token estimate",
     )
     moat_run.add_argument(
         "--consolidate-section-summaries",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="summarize all selected evidence cards in one company-level section-summary call",
+    )
+    moat_run.add_argument(
+        "--include-raw-moat-appendix",
+        action="store_true",
+        help="include only cited source chunks in the final MOAT prompt (off by default)",
     )
     moat_run.add_argument("--workers", type=int, default=1)
     moat_run.add_argument("--validation-attempts", type=int, default=2)
@@ -583,9 +608,30 @@ def build_parser() -> argparse.ArgumentParser:
     backtest_run.add_argument("--top-n", type=int, default=10)
     backtest_run.add_argument("--execution-lag-days", type=int, default=1)
     backtest_run.add_argument("--transaction-cost-bps", type=Decimal, default=Decimal("10"))
+    backtest_run.add_argument("--slippage-bps", type=Decimal, default=Decimal("5"))
+    backtest_run.add_argument("--maximum-turnover", type=Decimal, default=Decimal("1"))
+    backtest_run.add_argument("--enforce-capacity", action="store_true")
+    backtest_run.add_argument(
+        "--maximum-participation-rate",
+        type=Decimal,
+        default=Decimal("0.05"),
+        help="maximum trade notional / daily dollar volume when capacity is enforced",
+    )
+    backtest_run.add_argument("--benchmark-ticker")
     backtest_run.add_argument("--initial-capital", type=Decimal, default=Decimal("100000000"))
     backtest_run.add_argument("--no-terminal-liquidation", action="store_true")
     backtest_run.add_argument("--maximum-signal-price-age-days", type=int, default=7)
+    backtest_run.add_argument(
+        "--missing-exit-return",
+        type=Decimal,
+        default=Decimal("-1"),
+        help="conservative return assigned when a held security has no exit price",
+    )
+    backtest_run.add_argument(
+        "--unadjusted-distributions",
+        action="store_true",
+        help="declare that adjusted_close does not include dividends/distributions",
+    )
     backtest_run.add_argument("--overwrite", action="store_true")
     backtest_run.set_defaults(handler=_backtest_run)
     return parser

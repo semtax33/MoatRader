@@ -4,6 +4,7 @@ from moatrader.backtest.models import (
     BacktestPerformance,
     BacktestResult,
     EquityPoint,
+    ForcedSettlement,
     PricePoint,
     RebalanceRecord,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "BacktestPerformance",
     "BacktestResult",
     "EquityPoint",
+    "ForcedSettlement",
     "PricePoint",
     "RebalanceRecord",
     "PricePanel",

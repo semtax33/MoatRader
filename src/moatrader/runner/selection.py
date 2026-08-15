@@ -18,27 +18,26 @@ _ROLE_WEIGHT = {
     SectionRole.MDA: 10,
     SectionRole.GUIDANCE: 8,
     SectionRole.COMPANY_OVERVIEW: 6,
-    SectionRole.FINANCIALS: 4,
+    SectionRole.FINANCIALS: 2,
     SectionRole.NOTES: 3,
     SectionRole.GOVERNANCE: 0,
     SectionRole.OTHER: 1,
 }
 
 _POSITIVE_TERMS = re.compile(
-    r"시장점유|점유율|경쟁|경쟁력|고객|거래처|수주|계약|재계약|브랜드|특허|지식재산|"
-    r"연구개발|R&D|인허가|허가|독점|진입장벽|원가|규모의 경제|네트워크|전환비용|"
-    r"가격|단가|마진|영업이익|반복매출|구독|유지율|해외시장|market share|competition|"
-    r"customer|contract|patent|license|switching|network effect|pricing|margin|retention",
+    r"시장\s*점유|경쟁\s*우위|고객|거래처|수주|계약|점유율|브랜드|특허|인허가|독점|진입\s*장벽|"
+    r"연구개발|R&D|규모의\s*경제|네트워크|전환\s*비용|가격\s*결정|마진|영업이익|반복\s*매출|구독|"
+    r"market\s*share|competition|customer|contract|patent|license|switching|network\s*effect|pricing|margin|retention",
     re.IGNORECASE,
 )
 _NEGATIVE_TERMS = re.compile(
-    r"위험|리스크|의존|집중|대체|경쟁심화|가격하락|원재료|규제|소송|분쟁|적자|손상|"
-    r"중단|감소|불확실|risk|dependen|concentrat|substitut|litigation|decline|uncertain",
+    r"위험|리스크|의존|집중|대체|경쟁\s*심화|가격\s*하락|원재료|규제|소송|분쟁|적자|손상|중단|감소|불확실|"
+    r"risk|dependen|concentrat|substitut|litigation|decline|uncertain",
     re.IGNORECASE,
 )
 _LOW_VALUE_TERMS = re.compile(
-    r"임원.{0,8}보수|이사회|감사제도|주주총회|자본금 변동|주식의 총수|정관|"
-    r"executive compensation|board of directors",
+    r"임원.{0,8}보수|이사의\s*보수|주주총회|자본금\s*변동|주식의\s*총수|정관|"
+    r"executive\s*compensation|board\s*of\s*directors",
     re.IGNORECASE,
 )
 
@@ -63,24 +62,32 @@ def select_evidence_chunks(chunks: list[SemanticChunk], maximum: int | None) -> 
         reverse=True,
     )
     selected: list[tuple[int, SemanticChunk]] = []
+    selected_ids: set[str] = set()
     used_sections: defaultdict[tuple[str, ...], int] = defaultdict(int)
 
     def reserve(predicate: Callable[[SemanticChunk], bool]) -> None:
         if len(selected) >= maximum:
             return
         for index, chunk in ranked:
-            if chunk.chunk_id in {item.chunk_id for _position, item in selected}:
+            if chunk.chunk_id in selected_ids:
                 continue
             if predicate(chunk):
                 selected.append((index, chunk))
+                selected_ids.add(chunk.chunk_id)
                 used_sections[tuple(chunk.section_path)] += 1
                 return
 
-    # A scorer needs the actual business model before it can interpret isolated
-    # patent, contract, risk, or financial-note disclosures.
+    # Preserve enough business context to interpret isolated patent, contract,
+    # risk, or customer disclosures while guaranteeing counterevidence.
     reserve(
         lambda chunk: chunk.section_role == SectionRole.BUSINESS
-        and re.search(r"사업의 개요|사업 개요|business overview", " ".join(chunk.section_path), re.IGNORECASE)
+        and bool(
+            re.search(
+                r"사업의\s*내용|사업\s*개요|business\s+overview",
+                " ".join(chunk.section_path),
+                re.IGNORECASE,
+            )
+        )
     )
     reserve(lambda chunk: chunk.section_role == SectionRole.PRODUCTS)
     reserve(lambda chunk: bool(_NEGATIVE_TERMS.search(f"{' '.join(chunk.section_path)}\n{chunk.markdown}")))
@@ -90,25 +97,22 @@ def select_evidence_chunks(chunks: list[SemanticChunk], maximum: int | None) -> 
     for index, chunk in ranked:
         if len(selected) >= maximum:
             break
-        if chunk.chunk_id in {item.chunk_id for _position, item in selected}:
+        if chunk.chunk_id in selected_ids:
             continue
         path = tuple(chunk.section_path)
         if used_sections[path] >= 1:
             continue
         selected.append((index, chunk))
+        selected_ids.add(chunk.chunk_id)
         used_sections[path] += 1
-        if len(selected) == maximum:
-            break
 
-    if len(selected) < maximum:
-        selected_ids = {chunk.chunk_id for _index, chunk in selected}
-        for index, chunk in ranked:
-            if chunk.chunk_id in selected_ids:
-                continue
-            selected.append((index, chunk))
-            selected_ids.add(chunk.chunk_id)
-            if len(selected) == maximum:
-                break
+    for index, chunk in ranked:
+        if len(selected) >= maximum:
+            break
+        if chunk.chunk_id in selected_ids:
+            continue
+        selected.append((index, chunk))
+        selected_ids.add(chunk.chunk_id)
 
     return [chunk for _index, chunk in sorted(selected, key=lambda item: item[0])]
 
@@ -122,7 +126,7 @@ def batch_evidence_chunks(chunks: list[SemanticChunk], maximum_tokens: int) -> l
     current_document: str | None = None
     for chunk in chunks:
         document_changed = current_document is not None and chunk.document_id != current_document
-        would_overflow = current and current_tokens + chunk.token_count > maximum_tokens
+        would_overflow = bool(current) and current_tokens + chunk.token_count > maximum_tokens
         if document_changed or would_overflow:
             batches.append(current)
             current = []

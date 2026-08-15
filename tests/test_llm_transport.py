@@ -5,6 +5,24 @@ from types import SimpleNamespace
 from moatrader.evidence.models import EvidenceExtractionResult
 from moatrader.evidence.models import MoatScore
 from moatrader.llm import LLMRequest, LLMTask, OpenAIResponsesTransport
+from moatrader.llm.transport import _openai_compatible_schema
+
+
+def test_openai_schema_removes_unsupported_lookaround_but_keeps_safe_patterns() -> None:
+    schema = {
+        "properties": {
+            "decimal": {"type": "string", "pattern": r"^(?!^[-+.]*$)[+-]?\d+$"},
+            "ticker": {"type": "string", "pattern": r"^\d{6}$"},
+        },
+        "$defs": [{"pattern": r"(?<=prefix)value"}],
+    }
+
+    compatible = _openai_compatible_schema(schema)
+
+    assert "pattern" not in compatible["properties"]["decimal"]
+    assert compatible["properties"]["ticker"]["pattern"] == r"^\d{6}$"
+    assert "pattern" not in compatible["$defs"][0]
+    assert schema["properties"]["decimal"]["pattern"]  # input is not mutated
 
 
 def test_openai_transport_uses_responses_create_and_usage() -> None:
@@ -36,22 +54,22 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
 
     result = transport.execute(request, EvidenceExtractionResult)
 
-    assert captured[0]["model"] == "gpt-5-nano"
+    assert captured[0]["model"] == "gpt-5-luna"
     assert captured[0]["text"]["format"]["type"] == "json_schema"  # type: ignore[index]
-    assert captured[0]["reasoning"] == {"effort": "low"}
+    assert captured[0]["reasoning"] == {"effort": "medium"}
     assert captured[0]["max_output_tokens"] == 8_000
     assert captured[0]["store"] is False
     assert result.response_id == "resp_fixture"
-    assert result.model == "gpt-5-nano-fixture"
+    assert result.model == "gpt-5-luna-fixture"
     assert result.usage.input_tokens == 10
     assert result.usage.cached_input_tokens == 4
 
     moat_request = request.model_copy(update={"task": LLMTask.FINAL_MOAT_SCORING})
     moat_result = transport.execute(moat_request, EvidenceExtractionResult)
 
-    assert captured[1]["model"] == "gpt-5.6-luna"
+    assert captured[1]["model"] == "gpt-5-luna"
     assert captured[1]["reasoning"] == {"effort": "medium"}
-    assert moat_result.model == "gpt-5.6-luna-fixture"
+    assert moat_result.model == "gpt-5-luna-fixture"
 
 
 def test_openai_transport_legacy_model_alias_routes_every_task_to_one_model() -> None:
@@ -146,7 +164,7 @@ def test_openai_transport_overrides_wrong_single_chunk_id() -> None:
         metadata={"chunk_id": "C1", "node_ids": ["N1"], "source_type": "DART"},
     )
     payload = {
-        "chunk_id": "C1",
+        "chunk_id": "provider-invented-id",
         "cards": [
             {
                 "evidence_id": "E1",
@@ -162,6 +180,7 @@ def test_openai_transport_overrides_wrong_single_chunk_id() -> None:
     )
     result = EvidenceExtractionResult.model_validate(normalized)
 
+    assert result.chunk_id == "C1"
     assert result.cards[0].source_chunk_id == "C1"
 
 
@@ -326,6 +345,42 @@ def test_openai_transport_supplies_conservative_missing_moat_metadata() -> None:
     assert result.durability.value == "MEDIUM"
     assert result.model_confidence == 0.5
     assert result.document_coverage.model_dump(exclude_none=True) == {}
+
+
+def test_openai_transport_merges_duplicate_moat_mechanism_types() -> None:
+    payload = {
+        "economic_moat_score": 6,
+        "mechanisms": [
+            {
+                "evidence_type": "INTANGIBLE_ASSET",
+                "score": 4,
+                "evidence_ids": ["E1"],
+                "rationale": "First claim",
+            },
+            {
+                "evidence_type": "INTANGIBLE_ASSET",
+                "score": 6,
+                "evidence_ids": ["E2", "E1"],
+                "rationale": "Stronger claim",
+            },
+        ],
+    }
+    request = LLMRequest(
+        task=LLMTask.FINAL_MOAT_SCORING,
+        system="system",
+        user="user",
+        response_schema=MoatScore.model_json_schema(),
+        input_sha256="0" * 64,
+        metadata={"issuer_id": "058730", "as_of": "2025-08-01"},
+    )
+
+    normalized = OpenAIResponsesTransport._normalize_grounding_fields(request, MoatScore, payload)
+    result = MoatScore.model_validate(normalized)
+
+    assert len(result.mechanisms) == 1
+    assert result.mechanisms[0].score == 6
+    assert result.mechanisms[0].evidence_ids == ["E1", "E2"]
+    assert result.mechanisms[0].rationale == "Stronger claim"
 
 
 def test_openai_transport_converts_an_empty_moat_score_to_zero() -> None:

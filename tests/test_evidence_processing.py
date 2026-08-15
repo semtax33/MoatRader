@@ -34,6 +34,7 @@ def _card(evidence_id: str, fact: str, direction: EvidenceDirection) -> Evidence
         evidence_type=EvidenceType.SWITCHING_COST,
         statement_type=StatementType.MANAGEMENT_CLAIM,
         fact=fact,
+        raw_quote=fact,
         direction=direction,
         strength=0.7,
         source_type=SourceType.IR,
@@ -42,9 +43,9 @@ def _card(evidence_id: str, fact: str, direction: EvidenceDirection) -> Evidence
 
 
 def test_reliability_is_capped_by_statement_and_source() -> None:
-    assert calibrate_card_reliability(
-        _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)
-    ).reliability == 0.55
+    card = _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)
+    card.mechanism = ["qualification creates switching friction"]
+    assert calibrate_card_reliability(card).reliability == 0.55
 
 
 def test_relations_preserve_duplicates_updates_and_contradictions() -> None:
@@ -128,6 +129,51 @@ def test_validation_drops_only_an_ungrounded_numeric_metric() -> None:
 
     assert errors == []
     assert result.cards[0].metrics == []
+
+
+def test_validation_rejects_a_card_without_verbatim_grounding() -> None:
+    card = _card("E1", "Paraphrased claim.", EvidenceDirection.MOAT_POSITIVE)
+    card.raw_quote = "Text that is not present"
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Canonical source text.",
+        token_count=3,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert any("raw_quote is required" in error for error in errors)
+    assert result.cards == []
+
+
+def test_validation_can_conservatively_discard_an_ungrounded_card() -> None:
+    card = _card("E1", "Paraphrased claim.", EvidenceDirection.MOAT_POSITIVE)
+    card.raw_quote = "Text that is not present"
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Canonical source text.",
+        token_count=3,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(
+        result,
+        chunk,
+        bundle,
+        discard_invalid_cards=True,
+    )
+
+    assert errors == []
+    assert result.cards == []
 
 
 def test_evidence_metric_ignores_repaired_json_fragment_keys() -> None:

@@ -15,6 +15,35 @@ from moatrader.llm.contracts import LLMRequest, LLMTask
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 
+_UNSUPPORTED_OPENAI_REGEX_TOKENS = ("(?=", "(?!", "(?<=", "(?<!")
+
+
+def _openai_compatible_schema(value: Any) -> Any:
+    """Drop provider-unsupported regex assertions from a strict JSON schema.
+
+    Pydantic's Decimal schema uses a negative lookahead. OpenAI Structured
+    Outputs accepts ``pattern`` but rejects lookaround syntax. The response is
+    still validated against the original Pydantic model after decoding, so
+    removing only that provider-incompatible presentation constraint does not
+    weaken local semantic validation.
+    """
+
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if (
+                key == "pattern"
+                and isinstance(item, str)
+                and any(token in item for token in _UNSUPPORTED_OPENAI_REGEX_TOKENS)
+            ):
+                continue
+            result[key] = _openai_compatible_schema(item)
+        return result
+    if isinstance(value, list):
+        return [_openai_compatible_schema(item) for item in value]
+    return value
+
+
 class TransportUsage(ContractModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
@@ -27,6 +56,7 @@ class TransportResult(ContractModel, Generic[ResponseT]):
     model: str
     response_id: str | None = None
     usage: TransportUsage = Field(default_factory=TransportUsage)
+    raw_output_text: str | None = None
 
 
 class LLMTransport(Protocol):
@@ -40,7 +70,7 @@ class OpenAIResponsesTransport:
         self,
         *,
         summary_model: str = "gpt-5-nano",
-        moat_model: str = "gpt-5.6-luna",
+        moat_model: str = "gpt-5-luna",
         summary_reasoning_effort: str = "low",
         moat_reasoning_effort: str = "medium",
         max_output_tokens: int = 8_000,
@@ -97,7 +127,9 @@ class OpenAIResponsesTransport:
                             "type": "json_schema",
                             "name": response_model.__name__,
                             "strict": True,
-                            "schema": to_strict_json_schema(response_model),
+                            "schema": _openai_compatible_schema(
+                                to_strict_json_schema(response_model)
+                            ),
                         }
                     },
                     reasoning={"effort": self._effort_for(request.task)},
@@ -127,6 +159,7 @@ class OpenAIResponsesTransport:
                     provider="openai",
                     model=str(getattr(response, "model", None) or request_model),
                     response_id=getattr(response, "id", None),
+                    raw_output_text=output_text,
                     usage=TransportUsage(
                         input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
                         output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
@@ -142,7 +175,7 @@ class OpenAIResponsesTransport:
         raise RuntimeError(f"OpenAI request failed after {self.max_retries + 1} attempt(s): {last_error}") from last_error
 
     def _model_for(self, task: LLMTask) -> str:
-        if task == LLMTask.FINAL_MOAT_SCORING:
+        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
             return self.moat_model
         return self.summary_model
 
@@ -177,6 +210,34 @@ class OpenAIResponsesTransport:
         if response_model.__name__ == "MoatScore":
             payload.setdefault("issuer_id", request.metadata.get("issuer_id"))
             payload.setdefault("as_of", request.metadata.get("as_of"))
+            mechanisms = payload.get("mechanisms")
+            if isinstance(mechanisms, list):
+                deduplicated: list[Any] = []
+                by_type: dict[str, dict[str, Any]] = {}
+                for mechanism in mechanisms:
+                    if not isinstance(mechanism, dict) or not mechanism.get("evidence_type"):
+                        deduplicated.append(mechanism)
+                        continue
+                    key = str(mechanism["evidence_type"]).strip().upper()
+                    current = by_type.get(key)
+                    if current is None:
+                        current = dict(mechanism)
+                        current["evidence_ids"] = list(dict.fromkeys(current.get("evidence_ids") or []))
+                        by_type[key] = current
+                        deduplicated.append(current)
+                        continue
+                    current["evidence_ids"] = list(
+                        dict.fromkeys([*(current.get("evidence_ids") or []), *(mechanism.get("evidence_ids") or [])])
+                    )
+                    try:
+                        stronger = float(mechanism.get("score", 0)) > float(current.get("score", 0))
+                    except (TypeError, ValueError):
+                        stronger = False
+                    if stronger:
+                        current["score"] = mechanism.get("score")
+                        if mechanism.get("rationale"):
+                            current["rationale"] = mechanism["rationale"]
+                payload["mechanisms"] = deduplicated
             for alias in ("moat_score", "overall_score", "score"):
                 if "economic_moat_score" not in payload and alias in payload:
                     payload["economic_moat_score"] = payload[alias]
@@ -224,7 +285,7 @@ class OpenAIResponsesTransport:
             return payload
         single_chunk_id = request.metadata.get("chunk_id")
         if response_model.__name__ == "EvidenceExtractionResult" and isinstance(single_chunk_id, str):
-            payload.setdefault("chunk_id", single_chunk_id)
+            payload["chunk_id"] = single_chunk_id
         nodes_by_chunk = request.metadata.get("node_ids_by_chunk")
         aliases = {
             "evidenceid": "evidence_id",
@@ -297,7 +358,7 @@ class OpenAIResponsesTransport:
                 return repair_json(candidate, return_objects=True)
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task == LLMTask.FINAL_MOAT_SCORING:
+        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
 
@@ -334,4 +395,10 @@ class FunctionTransport:
     def execute(self, request: LLMRequest, response_model: type[ResponseT]) -> TransportResult[ResponseT]:
         value = self.handler(request, response_model)
         parsed = response_model.model_validate(value)
-        return TransportResult[ResponseT](parsed=parsed, provider="function", model=self.model)
+        raw_output_text = parsed.model_dump_json(exclude_none=True)
+        return TransportResult[ResponseT](
+            parsed=parsed,
+            provider="function",
+            model=self.model,
+            raw_output_text=raw_output_text,
+        )

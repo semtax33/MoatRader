@@ -35,6 +35,33 @@ class EvidenceType(StrEnum):
     OTHER = "OTHER"
 
 
+# Only these categories describe a causal, company-specific barrier that can
+# be scored as an economic-moat mechanism.  The remaining EvidenceType values
+# are outcomes, context, operating drivers, or risks and may corroborate or
+# weaken a moat, but must never be promoted to a mechanism by themselves.
+STRUCTURAL_MOAT_TYPES: frozenset[EvidenceType] = frozenset(
+    {
+        EvidenceType.SWITCHING_COST,
+        EvidenceType.NETWORK_EFFECT,
+        EvidenceType.COST_ADVANTAGE,
+        EvidenceType.INTANGIBLE_ASSET,
+        EvidenceType.SCALE_ADVANTAGE,
+        EvidenceType.REGULATORY_BARRIER,
+    }
+)
+
+OUTCOME_CORROBORATION_TYPES: frozenset[EvidenceType] = frozenset(
+    {
+        EvidenceType.PRICING_POWER,
+        EvidenceType.CUSTOMER_RETENTION,
+        EvidenceType.MARKET_SHARE,
+        EvidenceType.MARGIN_STABILITY,
+        EvidenceType.ROIC_QUALITY,
+        EvidenceType.FCF_QUALITY,
+    }
+)
+
+
 class EvidenceDirection(StrEnum):
     MOAT_POSITIVE = "MOAT_POSITIVE"
     MOAT_NEGATIVE = "MOAT_NEGATIVE"
@@ -462,6 +489,10 @@ class CoverageMetrics(ContractModel):
     section_retention: float | None = Field(default=None, ge=0.0, le=1.0)
     table_retention: float | None = Field(default=None, ge=0.0, le=1.0)
     numeric_retention: float | None = Field(default=None, ge=0.0, le=1.0)
+    # This is the only coverage value used for MOAT eligibility/ranking.  The
+    # fields above remain parser/context diagnostics and are not collapsed into
+    # a single minimum that penalizes table-heavy filings.
+    moat_evidence_coverage: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class MoatScore(ContractModel):
@@ -474,6 +505,9 @@ class MoatScore(ContractModel):
     model_confidence: float = Field(ge=0.0, le=1.0)
     document_coverage: CoverageMetrics
     caveats: list[str] = Field(default_factory=list)
+    # Preserves the model's holistic proposal for audit.  The public economic
+    # moat score is recomputed deterministically from validated mechanisms.
+    llm_proposed_score: float | None = Field(default=None, ge=0.0, le=10.0)
 
     @model_validator(mode="after")
     def positive_score_has_evidence(self) -> "MoatScore":

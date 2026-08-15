@@ -13,14 +13,25 @@ class BacktestConfig(ContractModel):
     top_n: int = Field(default=10, ge=1)
     execution_lag_days: int = Field(default=1, ge=0, le=30)
     transaction_cost_bps: Decimal = Field(default=Decimal("10"), ge=0)
+    slippage_bps: Decimal = Field(default=Decimal("5"), ge=0)
+    maximum_turnover: Decimal = Field(default=Decimal("1"), gt=0, le=1)
+    enforce_capacity: bool = False
+    maximum_participation_rate: Decimal = Field(default=Decimal("0.05"), gt=0, le=1)
+    benchmark_ticker: str | None = None
     initial_capital: Decimal = Field(default=Decimal("100000000"), gt=0)
     liquidate_at_end: bool = True
     maximum_signal_price_age_days: int = Field(default=7, ge=0, le=366)
+    missing_exit_return: Decimal = Field(default=Decimal("-1"), ge=-1, le=0)
+    adjusted_close_includes_distributions: bool = True
 
     @model_validator(mode="after")
     def timestamps_are_aware(self) -> "BacktestConfig":
         if self.end_at.tzinfo is None or self.end_at.utcoffset() is None:
             raise ValueError("end_at must be timezone-aware")
+        if not self.adjusted_close_includes_distributions:
+            raise ValueError(
+                "backtest returns require total-return adjusted_close including distributions"
+            )
         return self
 
 
@@ -28,6 +39,7 @@ class PricePoint(ContractModel):
     timestamp: datetime
     ticker: str = Field(min_length=1)
     adjusted_close: Decimal = Field(gt=0)
+    dollar_volume: Decimal | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def timestamp_is_aware(self) -> "PricePoint":
@@ -45,6 +57,21 @@ class RebalanceRecord(ContractModel):
     post_trade_value: Decimal
     turnover: Decimal = Field(ge=0)
     transaction_cost: Decimal = Field(ge=0)
+    slippage_cost: Decimal = Field(default=Decimal(0), ge=0)
+    requested_tickers: list[str] = Field(default_factory=list)
+    unexecuted_tickers: list[str] = Field(default_factory=list)
+    locked_tickers: list[str] = Field(default_factory=list)
+    maximum_capacity_utilization: Decimal | None = Field(default=None, ge=0)
+
+
+class ForcedSettlement(ContractModel):
+    ticker: str
+    settlement_at: datetime
+    last_price_at: datetime
+    last_price: Decimal = Field(gt=0)
+    assumed_return: Decimal = Field(ge=-1)
+    settlement_value: Decimal = Field(ge=0)
+    reason: str
 
 
 class EquityPoint(ContractModel):
@@ -62,7 +89,10 @@ class BacktestPerformance(ContractModel):
     max_drawdown: Decimal
     average_turnover: Decimal
     total_transaction_cost: Decimal
+    total_slippage_cost: Decimal = Decimal(0)
     rebalance_count: int = Field(ge=0)
+    benchmark_total_return: Decimal | None = None
+    excess_total_return: Decimal | None = None
 
 
 class BacktestResult(ContractModel):
@@ -73,3 +103,4 @@ class BacktestResult(ContractModel):
     rebalances: list[RebalanceRecord]
     equity_curve: list[EquityPoint]
     performance: BacktestPerformance
+    forced_settlements: list[ForcedSettlement] = Field(default_factory=list)

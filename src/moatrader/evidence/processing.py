@@ -19,23 +19,30 @@ from moatrader.evidence.models import (
 )
 
 
-_NUMBER_RE = re.compile(r"[-+]?\d[\d,.]*(?:%|개월|년|월|일)?")
+_NUMBER_RE = re.compile(r"[-+]?\d[\d,.]*(?:%|개월|년|배|원)?")
 _DEMAND_RE = re.compile(
     r"시장\s*(?:규모|성장)|수요|환자.{0,12}(?:증가|성장)|환자\s*수|방문객|CAGR|TAM|market\s+(?:size|growth|demand)",
     re.IGNORECASE,
 )
-_SHARE_RE = re.compile(r"점유율|market\s*share|share\s+of\s+market", re.IGNORECASE)
+_SHARE_RE = re.compile(r"점유율|시장\s*점유|market\s*share|share\s+of\s+market", re.IGNORECASE)
 _RECURRING_CATEGORY_RE = re.compile(
-    r"재시술|반복\s*시술|시술\s*주기|\d+\s*[~\-–]\s*\d+\s*개월|repeat(?:ed)?\s+treatment",
+    r"재시술|반복\s*시술|시술\s*주기|\d+\s*[~-]\s*\d+\s*개월|repeat(?:ed)?\s+treatment",
     re.IGNORECASE,
 )
 _RETENTION_RE = re.compile(
-    r"고객\s*(?:유지율|이탈률)|재구매율|renewal|retention|churn|switching|전환\s*비용",
+    r"고객\s*(?:유지|이탈률|재구매율)|갱신률|renewal|retention|churn|switching|전환\s*비용",
     re.IGNORECASE,
 )
 
 
 def calibrate_card_reliability(card: EvidenceCard) -> EvidenceCard:
+    source_text = " ".join(filter(None, [card.raw_quote, card.fact]))
+    if card.statement_type == StatementType.DISCLOSED_FACT and re.search(
+        r"전망|계획|예상|기대|목표|추정|will|expect|plan|target|forecast",
+        source_text,
+        re.IGNORECASE,
+    ):
+        card = card.model_copy(update={"statement_type": StatementType.MANAGEMENT_CLAIM})
     caps = {
         StatementType.DISCLOSED_FACT: 0.95,
         StatementType.DERIVED_METRIC: 0.90,
@@ -50,6 +57,23 @@ def calibrate_card_reliability(card: EvidenceCard) -> EvidenceCard:
         StatementType.FORECAST,
     }:
         cap -= 0.05
+    if not card.raw_quote:
+        cap = min(cap, 0.20)
+    if card.economic_scope not in {EconomicScope.COMPANY, EconomicScope.SEGMENT}:
+        cap = min(cap, 0.50)
+    if (
+        card.direction == EvidenceDirection.MOAT_POSITIVE
+        and card.evidence_type in {
+            EvidenceType.SWITCHING_COST,
+            EvidenceType.NETWORK_EFFECT,
+            EvidenceType.COST_ADVANTAGE,
+            EvidenceType.INTANGIBLE_ASSET,
+            EvidenceType.SCALE_ADVANTAGE,
+            EvidenceType.REGULATORY_BARRIER,
+        }
+        and not card.mechanism
+    ):
+        cap = min(cap, 0.30)
     return card.model_copy(update={"reliability": min(card.reliability, round(cap, 2))})
 
 

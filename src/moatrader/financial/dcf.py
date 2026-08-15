@@ -111,6 +111,8 @@ class DcfValuation(ContractModel):
     confidence_penalty: Decimal = Field(ge=0, le=1)
     default_assumptions: list[str] = Field(default_factory=list)
     provenance_warnings: list[str] = Field(default_factory=list)
+    screening_eligible: bool = True
+    screening_exclusion_reasons: list[str] = Field(default_factory=list)
 
 
 class DcfEngine:
@@ -169,6 +171,19 @@ class DcfEngine:
         terminal_share = terminal_pv / enterprise if enterprise else Decimal(0)
         if terminal_share > Decimal("0.70"):
             warnings.append("terminal value exceeds 70% of enterprise value")
+        if terminal_share < 0 or terminal_share > 1:
+            warnings.append("terminal value share is outside [0, 1] because explicit-period or enterprise value is non-positive")
+        exclusion_reasons: list[str] = []
+        if enterprise <= 0:
+            exclusion_reasons.append("NON_POSITIVE_ENTERPRISE_VALUE")
+        if equity <= 0:
+            exclusion_reasons.append("NON_POSITIVE_EQUITY_VALUE")
+        if last_fcf <= 0:
+            exclusion_reasons.append("NON_POSITIVE_TERMINAL_FCF")
+        if terminal_share < 0 or terminal_share > Decimal("0.85"):
+            exclusion_reasons.append("UNRELIABLE_TERMINAL_VALUE_SHARE")
+        if confidence < Decimal("0.50"):
+            exclusion_reasons.append("LOW_ASSUMPTION_CONFIDENCE")
         return DcfValuation(
             method=assumptions.method,
             base_period=assumptions.base_period,
@@ -184,4 +199,6 @@ class DcfEngine:
             confidence_penalty=Decimal(1) - confidence,
             default_assumptions=defaults,
             provenance_warnings=warnings,
+            screening_eligible=not exclusion_reasons,
+            screening_exclusion_reasons=exclusion_reasons,
         )

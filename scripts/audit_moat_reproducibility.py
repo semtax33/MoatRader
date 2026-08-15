@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+from pathlib import Path
+
+from moatrader.runner.models import CompanyRunStatus, UniverseRunResult
+from scripts.merge_kr_signal_panel import spearman
+
+
+def _scored_companies(result: UniverseRunResult) -> dict[str, object]:
+    return {
+        company.ticker: company
+        for company in result.companies
+        if company.status == CompanyRunStatus.COMPLETE and company.moat_score is not None
+    }
+
+
+def _evidence_ids(company: object) -> set[str]:
+    score = company.moat_score
+    return {
+        evidence_id
+        for mechanism in score.mechanisms
+        for evidence_id in mechanism.evidence_ids
+    } | set(score.counterevidence_ids)
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    union = left | right
+    return len(left & right) / len(union) if union else 1.0
+
+
+def compare_runs(
+    baseline: UniverseRunResult,
+    candidate: UniverseRunResult,
+    *,
+    minimum_score_spearman: float = 0.90,
+    minimum_mean_evidence_jaccard: float = 0.50,
+    maximum_median_score_delta: float = 0.50,
+    maximum_company_score_delta: float = 2.0,
+    require_same_universe: bool = True,
+) -> dict[str, object]:
+    before = _scored_companies(baseline)
+    after = _scored_companies(candidate)
+    missing = sorted(set(before) - set(after))
+    added = sorted(set(after) - set(before))
+    common = sorted(set(before) & set(after))
+    if not common:
+        raise ValueError("the two runs have no common completed MOAT scores")
+
+    before_scores = [float(before[ticker].moat_score.economic_moat_score) for ticker in common]
+    after_scores = [float(after[ticker].moat_score.economic_moat_score) for ticker in common]
+    deltas = [abs(left - right) for left, right in zip(before_scores, after_scores, strict=True)]
+    rank_correlation = spearman(before_scores, after_scores)
+    if rank_correlation is None and all(delta == 0 for delta in deltas):
+        rank_correlation = 1.0
+    jaccards = [
+        _jaccard(_evidence_ids(before[ticker]), _evidence_ids(after[ticker])) for ticker in common
+    ]
+    failures: list[str] = []
+    if require_same_universe and (missing or added):
+        failures.append("completed scored universe differs")
+    if rank_correlation is None or rank_correlation < minimum_score_spearman:
+        failures.append(
+            f"score Spearman {rank_correlation!r} is below {minimum_score_spearman:.3f}"
+        )
+    median_delta = statistics.median(deltas)
+    largest_delta = max(deltas)
+    mean_jaccard = statistics.mean(jaccards)
+    if median_delta > maximum_median_score_delta:
+        failures.append(
+            f"median score delta {median_delta:.3f} exceeds {maximum_median_score_delta:.3f}"
+        )
+    if largest_delta > maximum_company_score_delta:
+        failures.append(
+            f"maximum company score delta {largest_delta:.3f} exceeds {maximum_company_score_delta:.3f}"
+        )
+    if mean_jaccard < minimum_mean_evidence_jaccard:
+        failures.append(
+            f"mean evidence Jaccard {mean_jaccard:.3f} is below {minimum_mean_evidence_jaccard:.3f}"
+        )
+    details = [
+        {
+            "ticker": ticker,
+            "baseline_score": before_scores[index],
+            "candidate_score": after_scores[index],
+            "absolute_score_delta": deltas[index],
+            "evidence_jaccard": jaccards[index],
+        }
+        for index, ticker in enumerate(common)
+    ]
+    return {
+        "schema_version": "moatrader-moat-reproducibility/1",
+        "baseline_run_id": baseline.run_id,
+        "candidate_run_id": candidate.run_id,
+        "common_company_count": len(common),
+        "missing_tickers": missing,
+        "added_tickers": added,
+        "score_spearman": rank_correlation,
+        "median_absolute_score_delta": median_delta,
+        "maximum_absolute_score_delta": largest_delta,
+        "mean_evidence_jaccard": mean_jaccard,
+        "passed": not failures,
+        "failures": failures,
+        "companies": details,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Gate repeat or input-reordering runs for MOAT score/evidence invariance."
+    )
+    parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument("--candidate", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--minimum-score-spearman", type=float, default=0.90)
+    parser.add_argument("--minimum-mean-evidence-jaccard", type=float, default=0.50)
+    parser.add_argument("--maximum-median-score-delta", type=float, default=0.50)
+    parser.add_argument("--maximum-company-score-delta", type=float, default=2.0)
+    parser.add_argument("--allow-universe-mismatch", action="store_true")
+    args = parser.parse_args()
+
+    baseline = UniverseRunResult.model_validate_json(args.baseline.read_text(encoding="utf-8-sig"))
+    candidate = UniverseRunResult.model_validate_json(args.candidate.read_text(encoding="utf-8-sig"))
+    report = compare_runs(
+        baseline,
+        candidate,
+        minimum_score_spearman=args.minimum_score_spearman,
+        minimum_mean_evidence_jaccard=args.minimum_mean_evidence_jaccard,
+        maximum_median_score_delta=args.maximum_median_score_delta,
+        maximum_company_score_delta=args.maximum_company_score_delta,
+        require_same_universe=not args.allow_universe_mismatch,
+    )
+    output = args.output.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report["passed"]:
+        raise RuntimeError("MOAT reproducibility gate failed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
