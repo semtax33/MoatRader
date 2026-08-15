@@ -116,7 +116,7 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
-    assert company.moat_score.economic_moat_score == 5.6
+    assert company.moat_score.economic_moat_score == 5.0
     assert company.moat_score.llm_proposed_score == 7.0
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
@@ -253,6 +253,64 @@ def test_runner_resume_reuses_completed_result(tmp_path: Path) -> None:
     ).run(universe, universe.companies)
 
     assert resumed.companies[0].status == CompanyRunStatus.COMPLETE
+
+
+def test_experiment_replay_reuses_validated_outputs_across_run_ids(tmp_path: Path) -> None:
+    universe = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    cache = tmp_path / "replay"
+    first_config = _config("replay-first").model_copy(
+        update={
+            "experiment_id": "experiment-a",
+            "llm_replay_cache_directory": str(cache),
+        }
+    )
+    first = MoatUniverseRunner(
+        config=first_config,
+        output_directory=tmp_path,
+        transport=FunctionTransport(_fixture_handler),
+    ).run(universe, universe.companies)
+
+    def fail_if_called(_request: LLMRequest, _model: type[Any]) -> Any:
+        raise AssertionError("validated response should be replayed")
+
+    second_config = _config("replay-second").model_copy(
+        update={
+            "experiment_id": "experiment-a",
+            "llm_replay_cache_directory": str(cache),
+        }
+    )
+    second = MoatUniverseRunner(
+        config=second_config,
+        output_directory=tmp_path,
+        transport=FunctionTransport(fail_if_called),
+    ).run(universe, universe.companies)
+
+    assert first.companies[0].moat_score == second.companies[0].moat_score
+    audit_path = tmp_path / "replay-second" / "companies" / "SAMPLE" / "llm-calls.jsonl"
+    calls = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    assert calls
+    assert all(call["replayed"] is True for call in calls)
+    assert all(call["replay_cache_key"] for call in calls)
+
+    fresh_calls = 0
+
+    def count_fresh_calls(request: LLMRequest, response_model: type[Any]) -> Any:
+        nonlocal fresh_calls
+        fresh_calls += 1
+        return _fixture_handler(request, response_model)
+
+    isolated_config = _config("replay-isolated").model_copy(
+        update={
+            "experiment_id": "experiment-b",
+            "llm_replay_cache_directory": str(cache),
+        }
+    )
+    MoatUniverseRunner(
+        config=isolated_config,
+        output_directory=tmp_path,
+        transport=FunctionTransport(count_fresh_calls),
+    ).run(universe, universe.companies)
+    assert fresh_calls > 0
 
 
 def test_resume_signature_rejects_changed_market_snapshot(tmp_path: Path) -> None:

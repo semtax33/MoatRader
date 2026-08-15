@@ -27,6 +27,10 @@ class SourceType(StrEnum):
     IR = "IR"
     ANALYST = "ANALYST"
     INDUSTRY = "INDUSTRY"
+    # Machine-generated prose is a presentation artifact, never source
+    # evidence.  Keeping it explicit lets the MOAT pipeline reject it before
+    # retrieval or an LLM judge can see it.
+    GENERATED_SUMMARY = "GENERATED_SUMMARY"
     OTHER = "OTHER"
 
 

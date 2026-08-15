@@ -24,7 +24,7 @@ class UniverseRunConfig(ContractModel):
     run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     as_of: datetime
     summary_model: str = Field(default="gpt-5-nano", min_length=1)
-    moat_model: str = Field(default="gpt-5-luna", min_length=1)
+    moat_model: str = Field(default="gpt-5.6-luna", min_length=1)
     summary_reasoning_effort: str = Field(default="low", min_length=1)
     moat_reasoning_effort: str = Field(default="medium", min_length=1)
     context_tokens: int = Field(default=64_000, gt=8_000)
@@ -45,6 +45,12 @@ class UniverseRunConfig(ContractModel):
     resume: bool = False
     dry_run: bool = False
     validation_attempts: int = Field(default=2, ge=1, le=5)
+    experiment_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
+    llm_replay_cache_directory: str | None = None
+    evidence_ledger_directory: str | None = None
 
     @model_validator(mode="after")
     def config_is_valid(self) -> "UniverseRunConfig":
@@ -52,6 +58,12 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("as_of must be timezone-aware")
         if self.context_tokens <= self.prompt_reserve_tokens:
             raise ValueError("context_tokens must exceed prompt_reserve_tokens")
+        if bool(self.experiment_id) != bool(self.llm_replay_cache_directory):
+            raise ValueError(
+                "experiment_id and llm_replay_cache_directory must be configured together"
+            )
+        if self.evidence_ledger_directory and not self.experiment_id:
+            raise ValueError("evidence_ledger_directory requires experiment_id")
         return self
 
 
@@ -66,6 +78,8 @@ class LLMCallAudit(ContractModel):
     raw_response_path: str | None = None
     raw_response_sha256: str | None = None
     normalized_output_sha256: str | None = None
+    replayed: bool = False
+    replay_cache_key: str | None = None
 
 
 class CompanyRunResult(ContractModel):

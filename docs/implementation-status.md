@@ -24,6 +24,10 @@
 - MOAT/DCF/신뢰도/coverage screening과 재랭킹
 - PIT backtest, 종목별 거래 가능 여부·보유 잠금, mark-to-market, turnover/거래비용/슬리피지/용량, 보수적 상장폐지 청산, benchmark 초과수익
 - raw/sector/factor-neutral IC, 비중첩 Q5-Q1 평가와 반복·입력순서 변경 MOAT 재현성 gate
+- fresh experiment 범위 content-addressed LLM replay와 원문 기반 stable evidence identity
+- LLM 제안값과 독립적인 deterministic mechanism score/durability/counterevidence penalty
+- 구조적 증거 생략을 삭제로 취급하지 않는 PIT evidence ledger와 supersede/retract 이력
+- 5종목 초과 manifest 실행 전 3~5종목 반복·인접시점 상관 preflight 강제
 
 ## 외부 데이터가 반드시 보장해야 하는 것
 

@@ -8,7 +8,10 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from scripts.merge_kr_signal_panel import spearman
+try:
+    from scripts.merge_kr_signal_panel import spearman
+except ModuleNotFoundError:  # Direct `python scripts\...py` execution.
+    from merge_kr_signal_panel import spearman
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 from moatrader.canonical.models import SourceType, StatementType
@@ -15,11 +17,13 @@ from moatrader.evidence.models import (
     EvidenceType,
     ForwardDriverType,
 )
+from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.processing import (
     build_forward_driver_cards,
     build_evidence_relations,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
+    grounded_evidence_id,
     normalize_card_semantics,
 )
 from moatrader.evidence.validation import validate_evidence_batch_result, validate_evidence_result
@@ -46,6 +50,71 @@ def test_reliability_is_capped_by_statement_and_source() -> None:
     card = _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)
     card.mechanism = ["qualification creates switching friction"]
     assert calibrate_card_reliability(card).reliability == 0.55
+
+
+def test_grounded_evidence_id_ignores_model_wording_and_classification() -> None:
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Customer qualification takes 18 months.",
+        token_count=5,
+    )
+    first = _card("pending", "First paraphrase.", EvidenceDirection.MOAT_POSITIVE)
+    first.raw_quote = "Customer qualification takes 18 months."
+    second = first.model_copy(
+        update={
+            "fact": "Different paraphrase.",
+            "direction": EvidenceDirection.NEUTRAL,
+            "evidence_type": EvidenceType.OPERATING_DRIVER,
+        }
+    )
+
+    assert grounded_evidence_id(first, chunk) == grounded_evidence_id(second, chunk)
+
+
+def test_evidence_ledger_carries_omitted_structural_evidence_without_future_leak(tmp_path: Path) -> None:
+    ledger = EvidenceLedgerStore(tmp_path, experiment_id="exp")
+    first_date = datetime.fromisoformat("2025-08-31T23:59:59+09:00")
+    later_date = datetime.fromisoformat("2025-11-30T23:59:59+09:00")
+    earlier_date = datetime.fromisoformat("2025-05-31T23:59:59+09:00")
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="Customer qualification takes 18 months.",
+        token_count=5,
+    )
+    card = _card("E1", "Customer qualification takes 18 months.", EvidenceDirection.MOAT_POSITIVE)
+    card.mechanism = ["qualification creates switching friction"]
+
+    ledger.merge(
+        "000001",
+        as_of=first_date,
+        current_cards=[card],
+        chunks=[chunk],
+        document_available_at={"D1": first_date},
+    )
+    carried = ledger.merge(
+        "000001",
+        as_of=later_date,
+        current_cards=[],
+        chunks=[],
+        document_available_at={},
+    )
+    historical = ledger.merge(
+        "000001",
+        as_of=earlier_date,
+        current_cards=[],
+        chunks=[],
+        document_available_at={},
+    )
+
+    assert [item.evidence_id for item in carried.cards] == ["E1"]
+    assert carried.carried_evidence_count == 1
+    assert historical.cards == []
 
 
 def test_relations_preserve_duplicates_updates_and_contradictions() -> None:

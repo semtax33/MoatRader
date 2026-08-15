@@ -6,7 +6,10 @@ import statistics
 from pathlib import Path
 
 from moatrader.runner.models import CompanyRunStatus, UniverseRunResult
-from scripts.merge_kr_signal_panel import spearman
+try:
+    from scripts.merge_kr_signal_panel import spearman
+except ModuleNotFoundError:  # Direct `python scripts\...py` execution.
+    from merge_kr_signal_panel import spearman
 
 
 def _scored_companies(result: UniverseRunResult) -> dict[str, object]:

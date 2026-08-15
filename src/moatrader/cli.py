@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -30,7 +31,13 @@ from moatrader.ingestion import (
 )
 from moatrader.llm import OpenAIResponsesTransport
 from moatrader.pipeline import CanonicalFinancialDocumentPipeline
+from moatrader.preflight import (
+    find_workspace_manifest,
+    validate_preflight_approval,
+    validate_preflight_sample_selection,
+)
 from moatrader.runner import MoatUniverseRunner, UniverseRunConfig, UniverseRunResult
+from moatrader.runner.engine import RUNNER_VERSION
 from moatrader.runner.report import rank_run_result, ranking_csv
 from moatrader.runstore import RunStore
 from moatrader.screening import SelectorConfig
@@ -237,6 +244,26 @@ def _moat_run(args: argparse.Namespace) -> int:
         raise ValueError(f"run directory already exists; choose another --run-id or use --resume: {run_dir}")
     manifest = load_universe_manifest(args.universe)
     companies = manifest.select(_selected_tickers(args))
+    workspace_manifest = find_workspace_manifest(args.universe, args.output)
+    workspace_payload = (
+        json.loads(workspace_manifest.read_text(encoding="utf-8-sig"))
+        if workspace_manifest is not None
+        else {}
+    )
+    experiment_id = args.experiment_id or workspace_payload.get("experiment_id")
+    if not experiment_id:
+        output_identity = hashlib.sha256(str(Path(args.output).resolve()).encode("utf-8")).hexdigest()[:16]
+        experiment_id = f"standalone-{output_identity}"
+    replay_cache = Path(args.llm_replay_cache).resolve() if args.llm_replay_cache else (
+        workspace_manifest.parent / "llm-replay"
+        if workspace_manifest is not None
+        else Path(args.output).resolve() / ".llm-replay"
+    )
+    evidence_ledger = (
+        workspace_manifest.parent / "evidence-ledger"
+        if workspace_manifest is not None
+        else Path(args.output).resolve() / ".evidence-ledger"
+    )
     config = UniverseRunConfig(
         run_id=run_id,
         as_of=args.as_of,
@@ -262,7 +289,45 @@ def _moat_run(args: argparse.Namespace) -> int:
         resume=args.resume,
         dry_run=args.dry_run,
         validation_attempts=args.validation_attempts,
+        experiment_id=experiment_id,
+        llm_replay_cache_directory=str(replay_cache),
+        evidence_ledger_directory=str(evidence_ledger),
     )
+    is_large_manifest = len(manifest.companies) > 5
+    if is_large_manifest and args.preflight_sample:
+        validate_preflight_sample_selection(
+            (company.ticker for company in companies),
+            workspace_manifest=workspace_manifest,
+        )
+    elif is_large_manifest:
+        if not args.preflight_report:
+            raise ValueError(
+                "a manifest with more than 5 companies requires a passed --preflight-report; "
+                "run exactly 3..5 tickers twice with --preflight-sample first"
+            )
+        approval_path = Path(args.preflight_report).resolve()
+        expected_approval_hash = workspace_payload.get("preflight_report_sha256")
+        if workspace_manifest is not None and (
+            workspace_payload.get("preflight_status") != "PASSED"
+            or not approval_path.is_file()
+            or not expected_approval_hash
+            or hashlib.sha256(approval_path.read_bytes()).hexdigest() != expected_approval_hash
+        ):
+            raise ValueError(
+                "preflight report is not the passed report recorded by workspace-manifest.json"
+            )
+        validate_preflight_approval(
+            approval_path,
+            universe_tickers=(company.ticker for company in manifest.companies),
+            as_of_date=config.as_of.date().isoformat(),
+            config=config,
+            runner_version=RUNNER_VERSION,
+        )
+    elif args.preflight_sample:
+        validate_preflight_sample_selection(
+            (company.ticker for company in companies),
+            workspace_manifest=workspace_manifest,
+        )
     transport = None
     if not args.dry_run:
         transport = OpenAIResponsesTransport(
@@ -514,14 +579,31 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument("--resume", action="store_true", help="reuse valid per-company checkpoints")
     moat_run.add_argument("--dry-run", action="store_true", help="ingest and emit LLM requests without API calls")
     moat_run.add_argument(
+        "--preflight-sample",
+        action="store_true",
+        help="allow only the workspace's 3..5 ticker preflight sample",
+    )
+    moat_run.add_argument(
+        "--preflight-report",
+        help="passed preflight JSON required whenever the input manifest contains more than 5 companies",
+    )
+    moat_run.add_argument(
+        "--experiment-id",
+        help="fresh experiment namespace; auto-discovered from workspace-manifest.json",
+    )
+    moat_run.add_argument(
+        "--llm-replay-cache",
+        help="experiment-scoped content-addressed response cache directory",
+    )
+    moat_run.add_argument(
         "--summary-model",
         default=os.getenv("MOATRADER_SUMMARY_MODEL", "gpt-5-nano"),
         help="model for sentence/section summaries only (default: gpt-5-nano)",
     )
     moat_run.add_argument(
         "--moat-model",
-        default=os.getenv("MOATRADER_MOAT_MODEL", "gpt-5-luna"),
-        help="model for MOAT evidence classification and final scoring (default: gpt-5-luna)",
+        default=os.getenv("MOATRADER_MOAT_MODEL", "gpt-5.6-luna"),
+        help="pinned model for atomic MOAT evidence classification (default: gpt-5.6-luna)",
     )
     moat_run.add_argument("--model", help=argparse.SUPPRESS)
     moat_run.add_argument(

@@ -13,7 +13,10 @@ from moatrader.evidence.models import EvidenceCard, EvidenceDirection, STRUCTURA
 from moatrader.evidence.validation import validate_moat_score
 from moatrader.runner.engine import RUNNER_VERSION
 from moatrader.runner.models import CompanyRunStatus, UniverseRunResult
-from scripts.merge_kr_signal_panel import decimal_percentiles
+try:
+    from scripts.merge_kr_signal_panel import decimal_percentiles
+except ModuleNotFoundError:  # Direct `python scripts\...py` execution.
+    from merge_kr_signal_panel import decimal_percentiles
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -141,7 +144,9 @@ def main() -> int:
     models: Counter[str] = Counter()
     tasks: Counter[str] = Counter()
     usage: Counter[str] = Counter()
-    response_ids: list[str] = []
+    live_response_ids: list[str] = []
+    replay_cache_outputs: dict[str, str] = {}
+    replayed_call_count = 0
 
     for as_of, paths in signal_manifest["run_results"].items():
         by_ticker: dict[str, object] = {}
@@ -216,8 +221,18 @@ def main() -> int:
                     ("gpt-5-nano", "fixture")
                 ):
                     routing_errors.append(f"{as_of}/{ticker}: SECTION_SUMMARY -> {call['model']}")
-                if call.get("response_id"):
-                    response_ids.append(call["response_id"])
+                if call.get("replayed"):
+                    replayed_call_count += 1
+                    cache_key = str(call.get("replay_cache_key") or "")
+                    normalized_hash = str(call.get("normalized_output_sha256") or "")
+                    if not cache_key:
+                        raw_audit_errors.append(f"{as_of}/{ticker}: replayed call has no cache key")
+                    elif cache_key in replay_cache_outputs and replay_cache_outputs[cache_key] != normalized_hash:
+                        raw_audit_errors.append(f"{as_of}/{ticker}: replay cache key maps to different outputs")
+                    else:
+                        replay_cache_outputs[cache_key] = normalized_hash
+                elif call.get("response_id"):
+                    live_response_ids.append(call["response_id"])
                 for key, value in call.get("usage", {}).items():
                     usage[key] += int(value or 0)
                 raw_path = Path(call.get("raw_response_path") or "")
@@ -264,8 +279,8 @@ def main() -> int:
             f"score={len(score_contract_errors)} signal={len(signal_errors)} "
             f"raw={len(raw_audit_errors)} routing={len(routing_errors)}"
         )
-    if len(response_ids) != len(set(response_ids)):
-        raise RuntimeError("duplicate provider response IDs")
+    if len(live_response_ids) != len(set(live_response_ids)):
+        raise RuntimeError("duplicate live provider response IDs")
     status_counts = Counter(row["status"] for row in rows)
     eligible_counts = Counter(row["date"] for row in rows if row["signal_eligible"] == "1")
     audit = {
@@ -296,7 +311,10 @@ def main() -> int:
         },
         "llm_audit": {
             "call_count": sum(tasks.values()),
-            "unique_response_id_count": len(set(response_ids)),
+            "live_call_count": sum(tasks.values()) - replayed_call_count,
+            "replayed_call_count": replayed_call_count,
+            "unique_live_response_id_count": len(set(live_response_ids)),
+            "unique_replay_cache_key_count": len(replay_cache_outputs),
             "models": dict(models),
             "tasks": dict(tasks),
             "usage": dict(usage),

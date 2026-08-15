@@ -53,6 +53,8 @@ def test_evidence_pack_has_three_layers_and_traceable_ids():
     assert "[E001]" in pack.markdown
     assert chunk.chunk_id in pack.raw_chunk_ids
     assert "## Financial Economics" not in pack.markdown
+    assert "고객 승인 절차가 길다." not in pack.markdown
+    assert "Display-only LLM summaries are intentionally excluded" in pack.markdown
 
 
 def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():

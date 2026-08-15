@@ -98,3 +98,36 @@ def test_identifier_files_support_large_comma_or_newline_universes(tmp_path: Pat
     path.write_text("AAPL, MSFT\n# comment\nNVDA # leader\nAAPL\n", encoding="utf-8")
 
     assert _identifier_values(["GOOG"], [str(path)]) == ["GOOG", "AAPL", "MSFT", "NVDA"]
+
+
+def test_large_manifest_is_blocked_without_preflight_report(tmp_path: Path, capsys: object) -> None:
+    source = ROOT / "examples" / "sample-dart.html"
+    metadata = ROOT / "examples" / "sample-dart-metadata.json"
+    universe = tmp_path / "large-universe.csv"
+    universe.write_text(
+        "ticker,source,input,metadata,issuer_name\n"
+        + "".join(
+            f"T{index:03d},DART,{source},{metadata},Company {index}\n"
+            for index in range(6)
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "moat",
+            "run",
+            "--universe",
+            str(universe),
+            "--as-of",
+            "2025-05-16T00:00:00+09:00",
+            "--output",
+            str(tmp_path / "runs"),
+            "--run-id",
+            "blocked-large",
+            "--dry-run",
+        ]
+    )
+
+    assert code == 2
+    assert "requires a passed --preflight-report" in capsys.readouterr().err  # type: ignore[attr-defined]

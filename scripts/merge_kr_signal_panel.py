@@ -11,6 +11,7 @@ from pathlib import Path
 
 from moatrader.runner.models import CompanyRunStatus, UniverseRunResult
 from moatrader.runner.engine import RUNNER_VERSION
+from moatrader.preflight import PREFLIGHT_SCHEMA_VERSION, ticker_set_sha256
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -52,6 +53,8 @@ def _average_ranks(values: list[float]) -> list[float]:
 def spearman(left: list[float], right: list[float]) -> float | None:
     if len(left) != len(right) or len(left) < 2:
         return None
+    if left == right:
+        return 1.0
     left_rank = _average_ranks(left)
     right_rank = _average_ranks(right)
     left_mean = statistics.mean(left_rank)
@@ -74,6 +77,11 @@ def main() -> int:
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--run", action="append", required=True, help="DATE=RUN_RESULT_JSON")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--preflight-report",
+        type=Path,
+        help="passed 3..5-company preflight report; defaults to WORKSPACE/diagnostics/moat-preflight.json",
+    )
     parser.add_argument("--minimum-adjacent-moat-spearman", type=float, default=0.50)
     parser.add_argument("--minimum-stability-companies", type=int, default=20)
     parser.add_argument(
@@ -96,6 +104,20 @@ def main() -> int:
         raise ValueError("universe contains duplicate stock codes")
     if len(set(dates)) != len(dates) or any(not date for date in dates):
         raise ValueError("dates input contains duplicate or blank dates")
+    preflight_path = (args.preflight_report or workspace / "diagnostics" / "moat-preflight.json").resolve()
+    preflight: dict[str, object] | None = None
+    if len(tickers) > 5:
+        if not preflight_path.is_file():
+            raise RuntimeError(f"production merge requires a passed preflight report: {preflight_path}")
+        preflight = json.loads(preflight_path.read_text(encoding="utf-8-sig"))
+        if (
+            preflight.get("schema_version") != PREFLIGHT_SCHEMA_VERSION
+            or preflight.get("passed") is not True
+            or preflight.get("runner_version") != RUNNER_VERSION
+            or preflight.get("approved_universe_tickers_sha256") != ticker_set_sha256(tickers)
+            or list(preflight.get("dates") or []) != dates
+        ):
+            raise RuntimeError("preflight report does not approve this runner, universe, and date set")
     run_paths: dict[str, list[Path]] = {}
     for value in args.run:
         date, separator, path = value.partition("=")
@@ -302,6 +324,9 @@ def main() -> int:
         "minimum_adjacent_moat_spearman": args.minimum_adjacent_moat_spearman,
         "minimum_stability_companies": args.minimum_stability_companies,
         "stability_gate_skipped": args.skip_stability_gate,
+        "preflight_required": len(tickers) > 5,
+        "preflight_report": str(preflight_path) if preflight is not None else None,
+        "preflight_passed": bool(preflight and preflight.get("passed")),
         "universe_source_as_of": sorted({row.get("as_of", "") for row in universe if row.get("as_of")}),
         "universe_reconstitution": False,
         "status_counts": dict(Counter(str(row["status"]) for row in rows)),

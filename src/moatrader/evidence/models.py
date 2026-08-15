@@ -137,6 +137,48 @@ class EvidenceMetric(ContractModel):
         return candidate
 
 
+class CanonicalClaimSignature(ContractModel):
+    """Semantic slots used for deterministic claim-level de-duplication.
+
+    The LLM may label these slots, but Python overwrites the type/direction and
+    canonicalizes every string before hashing.  The resulting claim_id is the
+    scoring identity; evidence_id remains the source-span audit identity.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    moat_source: EvidenceType = EvidenceType.OTHER
+    subject: str = Field(default="company", min_length=1)
+    predicate: str = Field(default="unspecified", min_length=1)
+    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
+    horizon: str = "UNSPECIFIED"
+    metric: str | None = None
+    value_bucket: str | None = None
+
+
+class AtomicEvidenceJudgment(ContractModel):
+    """Classification of one deterministic, source-grounded atomic unit."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    is_investment_relevant: bool = False
+    evidence_type: EvidenceType = EvidenceType.OTHER
+    statement_type: StatementType = StatementType.MANAGEMENT_CLAIM
+    fact: str = "No investment-relevant evidence"
+    mechanism: list[str] = Field(default_factory=list)
+    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
+    strength: float = Field(default=0.5, ge=0.0, le=1.0)
+    economic_scope: EconomicScope = EconomicScope.COMPANY
+    segment: str | None = None
+    metrics: list[EvidenceMetric] = Field(default_factory=list)
+    unit: str | None = None
+    period: str | None = None
+    forward_driver_type: ForwardDriverType | None = None
+    dcf_links: list[DcfLink] = Field(default_factory=list)
+    forecast_horizon: str | None = None
+    claim_signature: CanonicalClaimSignature | None = None
+
+
 class EvidenceCard(ContractModel):
     # Provider models occasionally add harmless presentation-only fields such
     # as period_unit. Core grounding fields remain required and are validated
@@ -164,6 +206,9 @@ class EvidenceCard(ContractModel):
     forward_driver_type: ForwardDriverType | None = None
     dcf_links: list[DcfLink] = Field(default_factory=list)
     forecast_horizon: str | None = None
+    atomic_evidence_key: str | None = None
+    claim_signature: CanonicalClaimSignature | None = None
+    claim_id: str | None = None
 
     @field_validator("metrics", mode="before")
     @classmethod
@@ -421,6 +466,12 @@ class EvidenceCluster(ContractModel):
     supporting_evidence_ids: list[str] = Field(default_factory=list)
 
 
+class ClaimCluster(ContractModel):
+    claim_id: str
+    canonical_evidence_id: str
+    supporting_evidence_ids: list[str] = Field(default_factory=list)
+
+
 class CitedSummaryClaim(ContractModel):
     text: str = Field(min_length=1)
     evidence_ids: list[str] = Field(min_length=1)
@@ -501,6 +552,7 @@ class MoatScore(ContractModel):
     economic_moat_score: float = Field(ge=0.0, le=10.0)
     mechanisms: list[MoatMechanismScore] = Field(default_factory=list)
     counterevidence_ids: list[str] = Field(default_factory=list)
+    canonical_claim_ids: list[str] = Field(default_factory=list)
     durability: Durability
     model_confidence: float = Field(ge=0.0, le=1.0)
     document_coverage: CoverageMetrics

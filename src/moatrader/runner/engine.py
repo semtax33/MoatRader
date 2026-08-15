@@ -18,6 +18,7 @@ from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import CanonicalDocumentBundle, SectionNode, TableNode
 from moatrader.context import DynamicTokenBudgetAllocator, EvidencePackBuilder
 from moatrader.evidence.models import (
+    AtomicEvidenceJudgment,
     CompanyDossier,
     CoverageMetrics,
     EvidenceBatchExtractionResult,
@@ -30,6 +31,7 @@ from moatrader.evidence.models import (
     STRUCTURAL_MOAT_TYPES,
     SectionSummary,
 )
+from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
     derive_moat_score,
     validate_evidence_batch_result,
@@ -37,11 +39,21 @@ from moatrader.evidence.validation import (
     validate_moat_score,
 )
 from moatrader.evidence.processing import (
+    assign_canonical_claim_identity,
+    build_canonical_claim_set,
     build_evidence_relations,
     build_forward_driver_cards,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
+    grounded_evidence_id,
     normalize_card_semantics,
+)
+from moatrader.evidence.atomic import (
+    ATOMIC_RUBRIC_VERSION,
+    ATOMIC_SEGMENTATION_VERSION,
+    atomic_unit_set_sha256,
+    build_atomic_evidence_units,
+    select_atomic_evidence_units,
 )
 from moatrader.financial import (
     DcfAssumptions,
@@ -51,8 +63,10 @@ from moatrader.financial import (
     FinancialSnapshotBuilder,
 )
 from moatrader.llm import (
+    LLMReplayCache,
     LLMRequest,
     LLMTransport,
+    build_atomic_evidence_request,
     build_evidence_batch_request,
     build_evidence_request,
     build_moat_pack_request,
@@ -77,7 +91,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.5.1"
+RUNNER_VERSION = "0.7.0"
 
 
 class MoatUniverseRunner:
@@ -98,6 +112,27 @@ class MoatUniverseRunner:
         self.snapshots = FinancialSnapshotBuilder()
         self.retriever = EvidenceRetriever()
         self.pack_builder = EvidencePackBuilder()
+        self.replay_cache = (
+            LLMReplayCache(
+                config.llm_replay_cache_directory,
+                experiment_id=config.experiment_id,
+                summary_model=config.summary_model,
+                moat_model=config.moat_model,
+                summary_reasoning_effort=config.summary_reasoning_effort,
+                moat_reasoning_effort=config.moat_reasoning_effort,
+                engine_version=RUNNER_VERSION,
+            )
+            if config.llm_replay_cache_directory and config.experiment_id and not config.dry_run
+            else None
+        )
+        self.evidence_ledger = (
+            EvidenceLedgerStore(
+                config.evidence_ledger_directory,
+                experiment_id=config.experiment_id,
+            )
+            if config.evidence_ledger_directory and config.experiment_id and not config.dry_run
+            else None
+        )
 
     def run(self, manifest: UniverseManifest, companies: list[CompanyInput]) -> UniverseRunResult:
         started = datetime.now(timezone.utc)
@@ -230,29 +265,30 @@ class MoatUniverseRunner:
             self.store.write_json(company_dir / "chunk-dedup.json", dedup)
             self.store.write_jsonl(company_dir / "chunks.jsonl", chunks)
 
-            evidence_chunks = select_evidence_chunks(chunks, self.config.maximum_evidence_chunks)
-            evidence_batches = (
-                batch_evidence_chunks(evidence_chunks, self.config.evidence_batch_max_tokens)
-                if self.config.evidence_batch_max_tokens is not None
-                else [[chunk] for chunk in evidence_chunks]
+            issuer_id = company.issuer_id or bundles[0].metadata.issuer_id
+            all_atomic_units = build_atomic_evidence_units(chunks, issuer_id=issuer_id)
+            evidence_chunks = select_atomic_evidence_units(
+                all_atomic_units,
+                self.config.maximum_evidence_chunks,
             )
+            self.store.write_jsonl(company_dir / "atomic-evidence-units.jsonl", evidence_chunks)
             self.store.write_json(
                 company_dir / "evidence-chunk-selection.json",
                 {
-                    "method": "role_keyword_diversity/1",
+                    "method": "atomic_content_set/1",
+                    "segmentation_version": ATOMIC_SEGMENTATION_VERSION,
+                    "rubric_version": ATOMIC_RUBRIC_VERSION,
                     "available_chunk_count": len(chunks),
-                    "selected_chunk_count": len(evidence_chunks),
+                    "available_atomic_unit_count": len(all_atomic_units),
+                    "selected_atomic_unit_count": len(evidence_chunks),
+                    "atomic_unit_set_sha256": atomic_unit_set_sha256(evidence_chunks),
                     "selected_chunk_ids": [chunk.chunk_id for chunk in evidence_chunks],
-                    "batch_count": len(evidence_batches),
-                    "batch_token_counts": [sum(chunk.token_count for chunk in batch) for batch in evidence_batches],
                 },
             )
 
             evidence_requests = [
-                build_evidence_request(batch[0])
-                if len(batch) == 1
-                else build_evidence_batch_request(batch)
-                for batch in evidence_batches
+                build_atomic_evidence_request(chunk, issuer_id=issuer_id)
+                for chunk in evidence_chunks
             ]
             self.store.write_jsonl(company_dir / "evidence-requests.jsonl", evidence_requests)
             if self.config.dry_run:
@@ -276,14 +312,70 @@ class MoatUniverseRunner:
                 return result
 
             self._checkpoint(checkpoint_path, signature, "EXTRACTING_EVIDENCE")
-            cards = self._load_or_extract_evidence(company_dir, evidence_chunks, bundles, audits)
+            current_cards = self._load_or_extract_evidence(
+                company_dir,
+                evidence_chunks,
+                bundles,
+                audits,
+                issuer_id=issuer_id,
+            )
+            self.store.write_jsonl(company_dir / "current-evidence.jsonl", current_cards)
+            ledger_merge = None
+            active_ledger_document_ids: list[str] = []
+            cards = current_cards
+            if self.evidence_ledger is not None:
+                ledger_merge = self.evidence_ledger.merge(
+                    company.ticker,
+                    as_of=self.config.as_of,
+                    current_cards=current_cards,
+                    chunks=evidence_chunks,
+                    document_available_at={
+                        bundle.ast.document_id: bundle.metadata.available_at for bundle in bundles
+                    },
+                )
+                cards = ledger_merge.cards
+            cards = [
+                assign_canonical_claim_identity(card, issuer_id=issuer_id)
+                for card in cards
+            ]
+            self.store.write_jsonl(company_dir / "evidence.jsonl", cards)
             self.store.write_json(
                 company_dir / "forward-driver-cards.json",
-                build_forward_driver_cards(cards),
+                build_forward_driver_cards(current_cards),
             )
             relations = build_evidence_relations(cards)
+            if self.evidence_ledger is not None and ledger_merge is not None:
+                invalidated = self.evidence_ledger.apply_relations(
+                    company.ticker,
+                    as_of=self.config.as_of,
+                    current_evidence_ids=ledger_merge.current_evidence_ids,
+                    relations=relations,
+                )
+                if invalidated:
+                    cards = [card for card in cards if card.evidence_id not in invalidated]
+                    relations = build_evidence_relations(cards)
+                    self.store.write_jsonl(company_dir / "evidence.jsonl", cards)
+                ledger_records = self.evidence_ledger.records(company.ticker)
+                active_ledger_document_ids = self.evidence_ledger.active_source_document_ids(
+                    company.ticker,
+                    as_of=self.config.as_of,
+                )
+                self.store.write_json(
+                    company_dir / "evidence-ledger-snapshot.json",
+                    {
+                        "experiment_id": self.config.experiment_id,
+                        "as_of": self.config.as_of.isoformat(),
+                        "current_evidence_count": len(current_cards),
+                        "carried_evidence_count": len(cards) - len(current_cards),
+                        "invalidated_evidence_ids": sorted(invalidated),
+                        "records": ledger_records,
+                    },
+                )
             evidence_clusters = cluster_duplicate_evidence(cards, relations)
             self.store.write_json(company_dir / "evidence-clusters.json", evidence_clusters)
+            claim_cards, claim_clusters = build_canonical_claim_set(cards, issuer_id=issuer_id)
+            self.store.write_jsonl(company_dir / "canonical-claim-set.jsonl", claim_cards)
+            self.store.write_json(company_dir / "claim-clusters.json", claim_clusters)
             self.store.write_json(
                 company_dir / "moat-outcome-corroboration.json",
                 [
@@ -296,14 +388,22 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "SUMMARIZING")
             summaries = self._load_or_summarize(company_dir, evidence_chunks, cards, audits)
             dossier = self._build_dossier(company, bundles, snapshot, cards, relations, summaries)
+            if ledger_merge is not None:
+                dossier = dossier.model_copy(
+                    update={
+                        "source_document_ids": list(
+                            dict.fromkeys(
+                                [*dossier.source_document_ids, *active_ledger_document_ids]
+                            )
+                        )
+                    }
+                )
             self.store.write_json(company_dir / "dossier.json", dossier)
 
-            canonical_ids = {cluster.canonical_evidence_id for cluster in evidence_clusters}
             structural_score_ids = {
                 card.evidence_id
-                for card in dossier.evidence
-                if card.evidence_id in canonical_ids
-                and (
+                for card in claim_cards
+                if (
                     (
                         card.direction == EvidenceDirection.MOAT_POSITIVE
                         and card.evidence_type in STRUCTURAL_MOAT_TYPES
@@ -311,129 +411,89 @@ class MoatUniverseRunner:
                     or card.direction == EvidenceDirection.MOAT_NEGATIVE
                 )
             }
-            scoring_base_dossier = self._filter_dossier_evidence(dossier, structural_score_ids)
+            scoring_base_dossier = self._filter_dossier_evidence(dossier, structural_score_ids).model_copy(
+                update={"business_summary": None, "section_summaries": []}
+            )
             retrieval = self.retriever.retrieve(scoring_base_dossier.evidence)
             self.store.write_json(company_dir / "retrieval.json", retrieval)
-            scoring_chunk_ids = {
-                card.source_chunk_id for card in scoring_base_dossier.evidence
+            scoring_dossier = scoring_base_dossier
+            pruning = {
+                "pruned": False,
+                "reason": "deterministic reducer consumes the complete canonical claim set",
+                "selected_evidence_ids": [card.evidence_id for card in scoring_dossier.evidence],
+                "dropped_evidence_ids": [],
             }
-            raw_context_candidates = (
-                [chunk for chunk in chunks if chunk.chunk_id in scoring_chunk_ids]
-                if self.config.include_raw_moat_appendix
-                else []
-            )
-            scoring_dossier, pruning = self._fit_dossier_to_context(
-                scoring_base_dossier,
-                snapshot,
-                retrieval,
-                raw_context_candidates,
-            )
             self.store.write_json(company_dir / "scoring-dossier.json", scoring_dossier)
             self.store.write_json(company_dir / "evidence-pruning.json", pruning)
-            preliminary = self.pack_builder.build(scoring_dossier, snapshot, [])
-            remaining_context = self.config.context_tokens - preliminary.token_count
-            if remaining_context <= self.config.prompt_reserve_tokens:
-                raise ValueError(
-                    f"summary/evidence layers use {preliminary.token_count} tokens and exceed the available context"
-                )
             cited_chunk_ids = {card.source_chunk_id for card in scoring_dossier.evidence}
-            raw_candidates = (
-                [chunk for chunk in chunks if chunk.chunk_id in cited_chunk_ids]
-                if self.config.include_raw_moat_appendix
-                else []
-            )
+            selected_scoring_units = [
+                unit for unit in evidence_chunks if unit.chunk_id in cited_chunk_ids
+            ]
             allocation = DynamicTokenBudgetAllocator(
-                model_context_tokens=remaining_context,
+                model_context_tokens=self.config.context_tokens,
                 prompt_reserve_tokens=self.config.prompt_reserve_tokens,
-            ).allocate(raw_candidates, relevance=retrieval.chunk_relevance)
-            pack = self.pack_builder.build(scoring_dossier, snapshot, allocation.selected)
-            selected_chunks = list(allocation.selected)
-            dropped_ids = list(allocation.dropped_chunk_ids)
-            while pack.token_count + self.config.prompt_reserve_tokens > self.config.context_tokens and selected_chunks:
-                weakest = min(
-                    selected_chunks,
-                    key=lambda chunk: (
-                        retrieval.chunk_relevance.get(chunk.chunk_id, 0.0),
-                        -chunk.token_count,
-                    ),
-                )
-                selected_chunks.remove(weakest)
-                dropped_ids.append(weakest.chunk_id)
-                pack = self.pack_builder.build(scoring_dossier, snapshot, selected_chunks)
-            if pack.token_count + self.config.prompt_reserve_tokens > self.config.context_tokens:
-                raise ValueError("fixed evidence pack exceeds configured model context")
-            allocation = allocation.model_copy(
-                update={
-                    "selected": selected_chunks,
-                    "dropped_chunk_ids": dropped_ids,
-                    "used_tokens": sum(chunk.token_count for chunk in selected_chunks),
-                }
-            )
+            ).allocate([], relevance={})
+            pack = self.pack_builder.build(scoring_dossier, snapshot, [])
             self.store.write_json(company_dir / "context-allocation.json", allocation)
             self.store.write_json(company_dir / "evidence-pack.json", pack)
             self.store.write_text(company_dir / "evidence-pack.md", pack.markdown)
 
             self._checkpoint(checkpoint_path, signature, "SCORING")
             score_path = company_dir / "moat-score.json"
-            score_request = build_moat_pack_request(scoring_dossier, pack)
-            self.store.write_json(company_dir / "moat-request.json", score_request)
+            reducer_payload = {
+                "schema_version": "canonical-claim-reducer/1",
+                "issuer_id": dossier.issuer_id,
+                "as_of": self.config.as_of.date().isoformat(),
+                "canonical_claims": [
+                    card.model_dump(mode="json", exclude_none=True)
+                    for card in sorted(
+                        scoring_dossier.evidence,
+                        key=lambda item: (item.claim_id or "", item.evidence_id),
+                    )
+                ],
+            }
+            reducer_json = json.dumps(
+                reducer_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+            reducer_sha256 = hashlib.sha256(reducer_json.encode("utf-8")).hexdigest()
+            self.store.write_json(company_dir / "moat-reducer-input.json", reducer_payload)
             if self.config.resume and score_path.is_file():
                 score = MoatScore.model_validate(self.store.read_json(score_path))
             else:
-                score = self._execute_validated(
-                    score_request,
-                    MoatScore,
-                    lambda value: self._validate_score(
-                        value,
-                        scoring_dossier.evidence,
-                    ),
-                    audits,
-                    company_dir,
-                )
-                score = derive_moat_score(score, scoring_dossier.evidence)
                 total_structural_evidence = len(structural_score_ids)
-                score = score.model_copy(
-                    update={
-                        "issuer_id": dossier.issuer_id,
-                        "as_of": self.config.as_of.date(),
-                        "document_coverage": self._coverage(
-                            bundles,
-                            chunks,
-                            allocation.selected,
-                            total_evidence=total_structural_evidence,
-                            selected_evidence=len(scoring_dossier.evidence),
-                        ),
-                    }
+                score = derive_moat_score(
+                    None,
+                    scoring_dossier.evidence,
+                    issuer_id=dossier.issuer_id,
+                    as_of=self.config.as_of.date(),
+                    document_coverage=self._coverage(
+                        bundles,
+                        chunks,
+                        selected_scoring_units,
+                        total_evidence=total_structural_evidence,
+                        selected_evidence=len(scoring_dossier.evidence),
+                    ),
                 )
                 self.store.write_json(score_path, score)
 
-            score_audits = [
-                audit for audit in audits if audit.task == "FINAL_MOAT_SCORING"
-            ]
-            effective_score_audit = score_audits[-1] if score_audits else None
-            actual_or_estimated_tokens = (
-                effective_score_audit.usage.input_tokens
-                if effective_score_audit and effective_score_audit.usage.input_tokens > 0
-                else pack.token_count
-            )
             self.store.write_json(
                 company_dir / "run-manifest.json",
                 RunManifest(
                     run_id=f"{self.config.run_id}:{company.ticker}",
                     signal_at=self.config.as_of,
                     evidence_cutoff=self.config.as_of,
-                    model=effective_score_audit.model if effective_score_audit else self.config.moat_model,
+                    model="deterministic-python",
                     parser_version=",".join(sorted({bundle.metadata.parser_version for bundle in bundles})),
                     renderer_version="canonical-markdown/1",
-                    prompt_version="structural-moat-pack/2",
+                    prompt_version="canonical-claim-reducer/1",
                     token_budget=self.config.context_tokens,
-                    input_tokens=actual_or_estimated_tokens,
-                    input_sha256=(
-                        effective_score_audit.input_sha256
-                        if effective_score_audit
-                        else score_request.input_sha256
-                    ),
-                    temperature=score_request.temperature,
+                    input_tokens=min(pack.token_count, self.config.context_tokens),
+                    input_sha256=reducer_sha256,
+                    temperature=0.0,
                     created_at=datetime.now(timezone.utc),
                 ),
             )
@@ -449,7 +509,7 @@ class MoatUniverseRunner:
                 source_document_ids=source_document_ids,
                 evidence_count=len(cards),
                 chunk_count=len(chunks),
-                selected_chunk_count=len(allocation.selected),
+                selected_chunk_count=len(evidence_chunks),
                 moat_score=score,
                 dcf=dcf,
                 current_price=company.current_price,
@@ -534,103 +594,134 @@ class MoatUniverseRunner:
         chunks: list[SemanticChunk],
         bundles: list[CanonicalDocumentBundle],
         audits: list[LLMCallAudit],
+        *,
+        issuer_id: str | None,
     ) -> list[EvidenceCard]:
         path = company_dir / "evidence.jsonl"
-        checkpoint_dir = company_dir / "evidence-by-chunk"
+        checkpoint_dir = company_dir / "atomic-judgment-by-key"
         bundle_by_document = {bundle.ast.document_id: bundle for bundle in bundles}
-        chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
         cards: list[EvidenceCard] = []
-        batches = (
-            batch_evidence_chunks(chunks, self.config.evidence_batch_max_tokens)
-            if self.config.evidence_batch_max_tokens is not None
-            else [[chunk] for chunk in chunks]
-        )
-        for batch in batches:
-            batch_ids = [chunk.chunk_id for chunk in batch]
-            checkpoint = checkpoint_dir / f"{stable_id('EC', *batch_ids)}.json"
-            result: EvidenceExtractionResult | EvidenceBatchExtractionResult | None = None
+        for chunk in sorted(chunks, key=lambda item: str(item.metadata["atomic_evidence_key"])):
+            atomic_key = str(chunk.metadata["atomic_evidence_key"])
+            checkpoint = checkpoint_dir / f"{atomic_key}.json"
+            judgment: AtomicEvidenceJudgment | None = None
             if self.config.resume and checkpoint.is_file():
-                stored = self.store.read_json(checkpoint)
-                if len(batch) == 1:
-                    candidate = EvidenceExtractionResult.model_validate(stored)
-                    validation_errors = validate_evidence_result(
-                        candidate,
-                        batch[0],
-                        bundle_by_document[batch[0].document_id],
-                        discard_invalid_cards=True,
-                    )
-                else:
-                    candidate = EvidenceBatchExtractionResult.model_validate(stored)
-                    validation_errors = validate_evidence_batch_result(
-                        candidate,
-                        batch,
-                        bundle_by_document,
-                        discard_invalid_cards=True,
-                    )
+                candidate = AtomicEvidenceJudgment.model_validate(self.store.read_json(checkpoint))
+                validation_errors = self._validate_atomic_judgment(
+                    candidate,
+                    chunk,
+                    bundle_by_document[chunk.document_id],
+                    issuer_id=issuer_id,
+                )
                 if not validation_errors:
-                    result = candidate
-            if result is None and len(batch) == 1:
-                chunk = batch[0]
-                request = build_evidence_request(chunk)
-                result = self._execute_validated(
+                    judgment = candidate
+            if judgment is None:
+                request = build_atomic_evidence_request(chunk, issuer_id=issuer_id)
+                judgment = self._execute_validated(
                     request,
-                    EvidenceExtractionResult,
-                    lambda value, c=chunk: validate_evidence_result(
+                    AtomicEvidenceJudgment,
+                    lambda value, c=chunk: self._validate_atomic_judgment(
                         value,
                         c,
                         bundle_by_document[c.document_id],
-                        discard_invalid_cards=True,
+                        issuer_id=issuer_id,
                     ),
                     audits,
                     company_dir,
                 )
-            elif result is None:
-                request = build_evidence_batch_request(batch)
-                result = self._execute_validated(
-                    request,
-                    EvidenceBatchExtractionResult,
-                    lambda value, b=batch: validate_evidence_batch_result(
-                        value,
-                        b,
-                        bundle_by_document,
-                        discard_invalid_cards=True,
-                    ),
-                    audits,
-                    company_dir,
-                )
-            chunk_cards: list[EvidenceCard] = []
-            for index, card in enumerate(result.cards):
-                source_chunk = chunk_by_id[card.source_chunk_id]
-                source_type = (
-                    source_chunk.source_refs[0].source_type
-                    if source_chunk.source_refs
-                    else card.source_type
-                )
-                normalized = normalize_card_semantics(
-                    card.model_copy(update={"source_type": source_type})
-                )
-                evidence_id = stable_id(
-                    "E",
-                    normalized.source_chunk_id,
-                    index,
-                    normalized.evidence_type.value,
-                    normalized.direction.value,
-                    normalized.fact,
-                )
-                chunk_cards.append(
-                    calibrate_card_reliability(
-                        normalized.model_copy(update={"evidence_id": evidence_id})
+            self.store.write_json(checkpoint, judgment)
+            if judgment.is_investment_relevant:
+                cards.append(
+                    self._card_from_atomic_judgment(
+                        judgment,
+                        chunk,
+                        issuer_id=issuer_id,
                     )
                 )
-            normalized_result: EvidenceExtractionResult | EvidenceBatchExtractionResult
-            if len(batch) == 1:
-                normalized_result = EvidenceExtractionResult(chunk_id=batch[0].chunk_id, cards=chunk_cards)
-            else:
-                normalized_result = EvidenceBatchExtractionResult(cards=chunk_cards)
-            self.store.write_json(checkpoint, normalized_result)
-            cards.extend(chunk_cards)
             self.store.write_jsonl(path, cards)
-        return cards
+        return sorted({card.evidence_id: card for card in cards}.values(), key=lambda card: card.evidence_id)
+
+    def _card_from_atomic_judgment(
+        self,
+        judgment: AtomicEvidenceJudgment,
+        chunk: SemanticChunk,
+        *,
+        issuer_id: str | None,
+    ) -> EvidenceCard:
+        source_type = chunk.source_refs[0].source_type if chunk.source_refs else None
+        provisional = EvidenceCard(
+            evidence_id="PENDING",
+            source_chunk_id=chunk.chunk_id,
+            node_ids=sorted(set(chunk.node_ids)),
+            evidence_type=judgment.evidence_type,
+            statement_type=judgment.statement_type,
+            fact=judgment.fact,
+            mechanism=judgment.mechanism,
+            direction=judgment.direction,
+            strength=judgment.strength,
+            source_type=source_type,
+            economic_scope=judgment.economic_scope,
+            segment=judgment.segment,
+            metrics=judgment.metrics,
+            unit=judgment.unit,
+            period=judgment.period,
+            raw_quote=chunk.markdown,
+            forward_driver_type=judgment.forward_driver_type,
+            dcf_links=judgment.dcf_links,
+            forecast_horizon=judgment.forecast_horizon,
+            atomic_evidence_key=str(chunk.metadata["atomic_evidence_key"]),
+            claim_signature=judgment.claim_signature,
+        )
+        normalized = normalize_card_semantics(provisional)
+        evidence_id = grounded_evidence_id(normalized, chunk)
+        calibrated = calibrate_card_reliability(
+            normalized.model_copy(update={"evidence_id": evidence_id})
+        )
+        return assign_canonical_claim_identity(calibrated, issuer_id=issuer_id)
+
+    def _validate_atomic_judgment(
+        self,
+        judgment: AtomicEvidenceJudgment,
+        chunk: SemanticChunk,
+        bundle: CanonicalDocumentBundle,
+        *,
+        issuer_id: str | None,
+    ) -> list[str]:
+        if not judgment.is_investment_relevant:
+            return []
+        errors: list[str] = []
+        if judgment.claim_signature is None:
+            errors.append("relevant atomic evidence requires a canonical claim_signature")
+        try:
+            card = self._card_from_atomic_judgment(judgment, chunk, issuer_id=issuer_id)
+            result = EvidenceExtractionResult(chunk_id=chunk.chunk_id, cards=[card])
+            errors.extend(
+                validate_evidence_result(
+                    result,
+                    chunk,
+                    bundle,
+                    discard_invalid_cards=False,
+                )
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+        return errors
+
+    @staticmethod
+    def _evidence_collision_key(card: EvidenceCard) -> tuple[int, str, str, str]:
+        # One verbatim source span is one evidence unit. Duplicate model
+        # annotations are collapsed without depending on output order.
+        direction_priority = {
+            EvidenceDirection.MOAT_NEGATIVE: 0,
+            EvidenceDirection.MOAT_POSITIVE: 1,
+            EvidenceDirection.NEUTRAL: 2,
+        }
+        return (
+            direction_priority[card.direction],
+            card.evidence_type.value,
+            card.statement_type.value,
+            card.fact,
+        )
 
     def _load_or_summarize(
         self,
@@ -763,7 +854,27 @@ class MoatUniverseRunner:
         current = request
         errors: list[str] = []
         for attempt in range(self.config.validation_attempts):
-            result: TransportResult[ResponseT] = self.transport.execute(current, response_model)
+            replayed = False
+            replay_cache_key: str | None = None
+            if self.replay_cache is None:
+                result: TransportResult[ResponseT] = self.transport.execute(current, response_model)
+                errors = list(validator(result.parsed))
+            else:
+                with self.replay_cache.locked(current, response_model) as replay_cache_key:
+                    _, cached = self.replay_cache.load(current, response_model)
+                    if cached is not None:
+                        cached_errors = list(validator(cached.parsed))
+                        if cached_errors:
+                            self.replay_cache.discard(current.task, replay_cache_key)
+                        else:
+                            result = cached
+                            errors = []
+                            replayed = True
+                    if not replayed:
+                        result = self.transport.execute(current, response_model)
+                        errors = list(validator(result.parsed))
+                        if not errors:
+                            self.replay_cache.store(current, response_model, result)
             raw_output = result.raw_output_text or result.parsed.model_dump_json(exclude_none=True)
             normalized_output = json.dumps(
                 result.parsed.model_dump(mode="json", exclude_none=True),
@@ -788,6 +899,8 @@ class MoatUniverseRunner:
                     "raw_response_sha256": raw_response_sha256,
                     "normalized_output": result.parsed,
                     "normalized_output_sha256": normalized_output_sha256,
+                    "replayed": replayed,
+                    "replay_cache_key": replay_cache_key,
                 },
             )
             audits.append(
@@ -802,10 +915,11 @@ class MoatUniverseRunner:
                     raw_response_path=str(raw_path),
                     raw_response_sha256=raw_response_sha256,
                     normalized_output_sha256=normalized_output_sha256,
+                    replayed=replayed,
+                    replay_cache_key=replay_cache_key,
                 )
             )
             self.store.write_jsonl(company_dir / "llm-calls.jsonl", audits)
-            errors = list(validator(result.parsed))
             if not errors:
                 return result.parsed
             current = self._repair_request(request, errors, attempt + 1)
@@ -978,7 +1092,10 @@ class MoatUniverseRunner:
         dossier: CompanyDossier,
         selected_ids: set[str],
     ) -> CompanyDossier:
-        selected_cards = [card for card in dossier.evidence if card.evidence_id in selected_ids]
+        selected_cards = sorted(
+            (card for card in dossier.evidence if card.evidence_id in selected_ids),
+            key=lambda card: (card.claim_id or "", card.evidence_id),
+        )
         summaries: list[SectionSummary] = []
         for summary in dossier.section_summaries:
             filtered_summary = self._filter_summary(summary, selected_ids)
@@ -1172,6 +1289,9 @@ class MoatUniverseRunner:
                     "consolidate_section_summaries": self.config.consolidate_section_summaries,
                     "include_raw_moat_appendix": self.config.include_raw_moat_appendix,
                     "validation_attempts": self.config.validation_attempts,
+                    "experiment_id": self.config.experiment_id,
+                    "llm_replay_enabled": bool(self.config.llm_replay_cache_directory),
+                    "evidence_ledger_enabled": bool(self.config.evidence_ledger_directory),
                     "runner_version": RUNNER_VERSION,
                     "prompt_contract_sha256": hashlib.sha256(prompt_contract.encode("utf-8")).hexdigest(),
                     "response_schema_sha256": hashlib.sha256(schema_contract.encode("utf-8")).hexdigest(),

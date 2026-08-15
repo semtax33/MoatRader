@@ -80,7 +80,7 @@ def test_score_requires_positive_direction_and_negative_counterevidence() -> Non
     assert any("expected MOAT_NEGATIVE" in error for error in errors)
 
 
-def test_published_score_is_deterministic_and_durability_capped() -> None:
+def test_published_score_ignores_llm_numeric_score_and_durability() -> None:
     cards = [_card("E1", EvidenceType.SWITCHING_COST, EvidenceDirection.MOAT_POSITIVE)]
     proposed = _score(
         evidence_type=EvidenceType.SWITCHING_COST,
@@ -92,6 +92,14 @@ def test_published_score_is_deterministic_and_durability_capped() -> None:
     derived = derive_moat_score(proposed, cards)
 
     assert derived.llm_proposed_score == 10
-    assert derived.mechanisms[0].score == 6.4
-    assert derived.economic_moat_score == 3
+    assert derived.mechanisms[0].score == 8.0
+    assert derived.economic_moat_score == 5.0
+    assert derived.durability == Durability.MEDIUM
     assert derived.model_confidence == 0.8
+
+    different_proposal = proposed.model_copy(update={"economic_moat_score": 1, "durability": Durability.HIGH})
+    different_proposal.mechanisms[0].score = 1
+    repeated = derive_moat_score(different_proposal, cards)
+    assert repeated.economic_moat_score == derived.economic_moat_score
+    assert repeated.mechanisms == derived.mechanisms
+    assert repeated.durability == derived.durability

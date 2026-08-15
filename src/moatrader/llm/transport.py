@@ -70,7 +70,7 @@ class OpenAIResponsesTransport:
         self,
         *,
         summary_model: str = "gpt-5-nano",
-        moat_model: str = "gpt-5-luna",
+        moat_model: str = "gpt-5.6-luna",
         summary_reasoning_effort: str = "low",
         moat_reasoning_effort: str = "medium",
         max_output_tokens: int = 8_000,

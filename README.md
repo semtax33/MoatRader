@@ -183,34 +183,86 @@ moatrader moat run `
   --run-id sample-live
 ```
 
-여러 종목은 쉼표 목록이나 반복 옵션을 사용합니다.
+여러 종목은 쉼표 목록이나 반복 옵션을 사용합니다. 아래처럼 사전검증 없이 실행하려면 입력 manifest 자체가 5종목 이하여야 합니다. 큰 manifest를 shard로 잘라 우회하는 것은 허용하지 않습니다.
 
 ```powershell
 moatrader moat run `
-  --universe data\kr-universe.csv `
+  --universe data\kr-small-universe.csv `
   --tickers 005930,000660,035420 `
   --as-of 2026-08-14T16:00:00+09:00 `
   --run-id kr-selected-20260814 `
   --workers 3
 ```
 
-`--ticker`와 `--tickers`를 생략하면 CSV의 전체 종목을 실행합니다.
+입력 manifest가 5종목을 초과하면 전체 실행은 기본적으로 차단됩니다. 먼저 같은 3~5종목을 두 번 실행하고, 반복 실행 및 인접 시점 상관관계가 모두 통과한 preflight report를 만들어야 합니다. `setup_kr_signal_backtest.py`가 고정 표본과 fresh experiment ID를 생성합니다. 아래 5종목은 이전 실패에서 동일 문서인데 점수가 크게 변했던 stress sample이며, 종목 선택에만 사용하고 기존 evidence·점수·LLM 응답은 새 experiment로 가져오지 않습니다.
+
+```powershell
+$ws = "data-lake\backtests\kr-signal-fresh-20260815-v060"
+python scripts\setup_kr_signal_backtest.py `
+  --universe D:\Programming\python_example\MoatPoC\universe.csv `
+  --dates D:\Programming\python_example\MoatPoC\dates.csv `
+  --output $ws `
+  --sample-ticker 300720 `
+  --sample-ticker 251120 `
+  --sample-ticker 348350 `
+  --sample-ticker 004140 `
+  --sample-ticker 035420
+
+# 앞 절의 prepare_kr_dcf_manifest.py 명령으로 각 날짜의
+# $ws\date-inputs\DATE\universe-manifest.csv를 먼저 생성합니다.
+
+$sample = (Get-Content "$ws\inputs\preflight-sample.txt") -join ","
+$dates = Import-Csv "$ws\inputs\dates.csv"
+foreach ($row in $dates) {
+  $date = $row.as_of
+  $manifest = "$ws\date-inputs\$date\universe-manifest.csv"
+  foreach ($repeat in @("a", "b")) {
+    moatrader moat run `
+      --universe $manifest `
+      --tickers $sample `
+      --preflight-sample `
+      --as-of "${date}T23:59:59+09:00" `
+      --output "$ws\runs" `
+      --run-id "preflight-$date-$repeat"
+  }
+}
+
+$gateArgs = @("--workspace", $ws)
+foreach ($row in $dates) {
+  $date = $row.as_of
+  $gateArgs += @(
+    "--baseline", "$date=$ws\runs\preflight-$date-a\run-result.json",
+    "--candidate", "$date=$ws\runs\preflight-$date-b\run-result.json"
+  )
+}
+python scripts\approve_moat_preflight.py @gateArgs
+```
+
+두 번째 표본 실행은 experiment-scoped content-addressed cache를 사용하므로 동일 요청에 API 비용을 다시 쓰지 않습니다. 기본 승인 기준은 반복 점수 Spearman `1.0`, evidence Jaccard `1.0`, 종목별 점수 차이 `0`, 인접 시점 Spearman `0.50`입니다. 모든 표본 점수가 같아 상관계수가 무의미해지는 것을 막기 위해 날짜별로 최소 2개 점수 수준과 전체 기간 중 최소 1개 positive-MOAT 종목도 요구합니다. 실패하면 `setup_kr_signal_backtest.py --sample-ticker ...`로 3~5종목을 명시해 다시 시작합니다.
+
+승인 후에만 전체 또는 shard 실행이 가능합니다. `--preflight-report`가 없거나 universe/date/model/reasoning/prompt 계약이 표본 실행과 다르면 실행 전에 실패합니다.
 
 ```powershell
 moatrader moat run `
-  --universe data\kr-universe.csv `
-  --as-of 2026-08-14T16:00:00+09:00 `
-  --run-id kr-all-20260814 `
+  --universe "$ws\date-inputs\2025-08-31\universe-manifest.csv" `
+  --as-of 2025-08-31T23:59:59+09:00 `
+  --output "$ws\runs" `
+  --run-id kr-full-2025-08-31 `
+  --preflight-report "$ws\diagnostics\moat-preflight.json" `
   --workers 3
 ```
+
+동일 experiment 안에서 같은 LLM 요청은 최초의 검증 완료 응답만 사용합니다. 캐시 키에는 task, 모델, reasoning effort, prompt hash, response schema hash, runner/normalizer version이 포함됩니다. 증거 ID는 공시 문서·node·원문 인용으로 만들며 LLM 요약문, 분류, 방향, 출력 순서는 포함하지 않습니다. 공개 MOAT 메커니즘 점수·durability·counterevidence penalty도 Python이 결정론적으로 계산합니다. 구조적 증거는 PIT evidence ledger에 `valid_from`, `valid_to`, `last_confirmed_at`, `superseded_by`, `retracted_by`와 함께 보관되어 새 분기보고서에서 단순히 생략됐다는 이유로 사라지지 않습니다.
 
 중단되었거나 일부 종목이 실패한 run은 동일한 입력과 run ID로 재개합니다. 완료된 회사와 chunk/section 체크포인트는 다시 호출하지 않습니다.
 
 ```powershell
 moatrader moat run `
-  --universe data\kr-universe.csv `
-  --as-of 2026-08-14T16:00:00+09:00 `
-  --run-id kr-all-20260814 `
+  --universe "$ws\date-inputs\2025-08-31\universe-manifest.csv" `
+  --as-of 2025-08-31T23:59:59+09:00 `
+  --output "$ws\runs" `
+  --run-id kr-full-2025-08-31 `
+  --preflight-report "$ws\diagnostics\moat-preflight.json" `
   --workers 3 `
   --resume
 ```
@@ -232,9 +284,11 @@ LLM은 작업별로 라우팅됩니다. 문장·섹션 요약은 기본 `gpt-5-n
 
 ```powershell
 moatrader moat run `
-  --universe data\kr-universe.csv `
-  --as-of 2026-08-14T16:00:00+09:00 `
-  --run-id kr-all-20260814 `
+  --universe "$ws\date-inputs\2025-08-31\universe-manifest.csv" `
+  --as-of 2025-08-31T23:59:59+09:00 `
+  --output "$ws\runs" `
+  --run-id kr-full-2025-08-31 `
+  --preflight-report "$ws\diagnostics\moat-preflight.json" `
   --summary-model gpt-5-nano `
   --moat-model gpt-5-luna
 ```

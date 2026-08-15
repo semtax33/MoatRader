@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from difflib import SequenceMatcher
 
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     DcfLink,
+    CanonicalClaimSignature,
+    ClaimCluster,
     EconomicScope,
     EvidenceCard,
     EvidenceCluster,
@@ -17,6 +20,7 @@ from moatrader.evidence.models import (
     ForwardDriverCard,
     ForwardDriverType,
 )
+from moatrader.semantic.chunker import SemanticChunk
 
 
 _NUMBER_RE = re.compile(r"[-+]?\d[\d,.]*(?:%|개월|년|배|원)?")
@@ -74,7 +78,125 @@ def calibrate_card_reliability(card: EvidenceCard) -> EvidenceCard:
         and not card.mechanism
     ):
         cap = min(cap, 0.30)
-    return card.model_copy(update={"reliability": min(card.reliability, round(cap, 2))})
+    # Reliability is a deterministic policy value, not model
+    # self-confidence. Using the model-proposed value made identical evidence
+    # affect the public score differently between executions.
+    return card.model_copy(update={"reliability": round(max(0.0, cap), 2)})
+
+
+def grounded_evidence_id(card: EvidenceCard, chunk: SemanticChunk) -> str:
+    """Build an ID from the cited source span, never from model labels/text."""
+
+    quote = " ".join((card.raw_quote or "").split())
+    atomic_key = chunk.metadata.get("atomic_evidence_key")
+    if atomic_key:
+        # Node/paragraph order is presentation metadata.  The source document,
+        # atomic source text and quote are sufficient for a stable audit ID.
+        return stable_id("E", chunk.document_id, atomic_key, quote)
+    return stable_id("E", chunk.document_id, *sorted(set(card.node_ids)), quote)
+
+
+def _canonical_slot(value: str | None, fallback: str) -> str:
+    text = unicodedata.normalize("NFKC", value or fallback).casefold()
+    text = re.sub(r"[^0-9a-z가-힣一-龥%><=]+", "_", text, flags=re.IGNORECASE)
+    return text.strip("_") or fallback
+
+
+def _metric_value_bucket(card: EvidenceCard) -> str | None:
+    if not card.metrics:
+        return None
+    value = str(card.metrics[0].value).replace(",", "").strip()
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", value)
+    if not match:
+        return _canonical_slot(value, "unspecified")
+    numeric = abs(float(match.group()))
+    if "%" in value:
+        if numeric < 5:
+            return "pct_lt_5"
+        if numeric < 20:
+            return "pct_5_20"
+        if numeric < 50:
+            return "pct_20_50"
+        return "pct_ge_50"
+    if numeric < 1:
+        return "lt_1"
+    if numeric < 3:
+        return "1_3"
+    if numeric < 10:
+        return "3_10"
+    return "ge_10"
+
+
+def assign_canonical_claim_identity(card: EvidenceCard, *, issuer_id: str | None) -> EvidenceCard:
+    proposed = card.claim_signature
+    signature = CanonicalClaimSignature(
+        moat_source=card.evidence_type,
+        subject=_canonical_slot(
+            proposed.subject if proposed else card.segment or card.company_scope,
+            "company",
+        ),
+        predicate=_canonical_slot(
+            proposed.predicate if proposed else card.fact,
+            "unspecified",
+        ),
+        direction=card.direction,
+        horizon=_canonical_slot(
+            proposed.horizon if proposed else card.forecast_horizon or card.period,
+            "unspecified",
+        ).upper(),
+        metric=(
+            _canonical_slot(proposed.metric, "unspecified")
+            if proposed and proposed.metric
+            else (_canonical_slot(card.metrics[0].name, "unspecified") if card.metrics else None)
+        ),
+        value_bucket=(
+            _canonical_slot(proposed.value_bucket, "unspecified")
+            if proposed and proposed.value_bucket
+            else _metric_value_bucket(card)
+        ),
+    )
+    claim_id = stable_id(
+        "CL",
+        issuer_id or "UNKNOWN_ISSUER",
+        signature.moat_source.value,
+        signature.subject,
+        signature.predicate,
+        signature.direction.value,
+        signature.horizon,
+        signature.metric or "",
+        signature.value_bucket or "",
+    )
+    return card.model_copy(update={"claim_signature": signature, "claim_id": claim_id})
+
+
+def build_canonical_claim_set(
+    cards: list[EvidenceCard],
+    *,
+    issuer_id: str | None,
+) -> tuple[list[EvidenceCard], list[ClaimCluster]]:
+    """Reduce evidence to a commutative, associative and idempotent set."""
+
+    grouped: dict[str, list[EvidenceCard]] = {}
+    for source in cards:
+        card = assign_canonical_claim_identity(source, issuer_id=issuer_id)
+        assert card.claim_id is not None
+        grouped.setdefault(card.claim_id, []).append(card)
+    canonical_cards: list[EvidenceCard] = []
+    clusters: list[ClaimCluster] = []
+    for claim_id in sorted(grouped):
+        group_by_evidence_id = {card.evidence_id: card for card in grouped[claim_id]}
+        group = list(group_by_evidence_id.values())
+        canonical = min(group, key=lambda card: (-card.reliability, card.evidence_id))
+        supporters = sorted(card.evidence_id for card in group if card.evidence_id != canonical.evidence_id)
+        canonical_cards.append(canonical)
+        clusters.append(
+            ClaimCluster(
+                claim_id=claim_id,
+                canonical_evidence_id=canonical.evidence_id,
+                supporting_evidence_ids=supporters,
+            )
+        )
+    return canonical_cards, clusters
 
 
 def normalize_card_semantics(card: EvidenceCard) -> EvidenceCard:
@@ -158,6 +280,7 @@ def build_evidence_relations(
     support_threshold: float = 0.55,
     weakens_threshold: float = 0.45,
 ) -> list[EvidenceRelation]:
+    cards = sorted(cards, key=lambda card: card.evidence_id)
     relations: list[EvidenceRelation] = []
     normalized = [re.sub(r"\s+", " ", card.fact).strip().casefold() for card in cards]
     for index, card in enumerate(cards):
@@ -205,7 +328,6 @@ def cluster_duplicate_evidence(
 ) -> list[EvidenceCluster]:
     """Return one deterministic representative plus all duplicate supporting IDs."""
     card_by_id = {card.evidence_id: card for card in cards}
-    order = {card.evidence_id: index for index, card in enumerate(cards)}
     if len(card_by_id) != len(cards):
         raise ValueError("evidence IDs must be unique before clustering")
     parent = {evidence_id: evidence_id for evidence_id in card_by_id}
@@ -233,20 +355,18 @@ def cluster_duplicate_evidence(
         groups.setdefault(find(card.evidence_id), []).append(card)
     clusters: list[EvidenceCluster] = []
     for group in groups.values():
-        canonical = max(
+        canonical = min(
             group,
             key=lambda card: (
-                card.reliability * card.strength,
-                card.reliability,
-                card.strength,
-                -order[card.evidence_id],
+                -card.reliability,
+                card.evidence_id,
             ),
         )
-        supporters = [card.evidence_id for card in group if card.evidence_id != canonical.evidence_id]
+        supporters = sorted(card.evidence_id for card in group if card.evidence_id != canonical.evidence_id)
         clusters.append(
             EvidenceCluster(
                 canonical_evidence_id=canonical.evidence_id,
                 supporting_evidence_ids=supporters,
             )
         )
-    return sorted(clusters, key=lambda cluster: order[cluster.canonical_evidence_id])
+    return sorted(clusters, key=lambda cluster: cluster.canonical_evidence_id)

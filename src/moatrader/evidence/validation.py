@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import re
+from collections import defaultdict
+from datetime import date
 from decimal import Decimal
 
 from moatrader.canonical.models import CanonicalDocumentBundle
 from moatrader.evidence.models import (
     Durability,
+    CoverageMetrics,
     EconomicScope,
     EvidenceBatchExtractionResult,
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
+    EvidenceType,
+    MoatMechanismScore,
     MoatScore,
     STRUCTURAL_MOAT_TYPES,
 )
@@ -193,33 +198,72 @@ def validate_moat_score(score: MoatScore, evidence: list[EvidenceCard]) -> list[
     return errors
 
 
-def derive_moat_score(score: MoatScore, evidence: list[EvidenceCard]) -> MoatScore:
-    """Conservatively recompute the public score from grounded evidence.
+def derive_moat_score(
+    score: MoatScore | None,
+    evidence: list[EvidenceCard],
+    *,
+    issuer_id: str | None = None,
+    as_of: date | None = None,
+    document_coverage: CoverageMetrics | None = None,
+) -> MoatScore:
+    """Compute the public score deterministically from grounded card labels.
 
-    The LLM proposes mechanism-level strengths and durability.  Code enforces
-    evidence-quality caps, counterevidence penalties, and durability ceilings.
+    Input is first reduced to a canonical claim set, so permutations,
+    partitions and duplicate evidence cannot change the public result.  A
+    legacy LLM proposal may be supplied for audit compatibility, but the
+    production runner passes ``None`` and performs no final scoring call.
     """
-    validation_errors = validate_moat_score(score, evidence)
-    if validation_errors:
-        raise ValueError("cannot derive MOAT score from invalid evidence: " + "; ".join(validation_errors))
-    card_by_id = {card.evidence_id: card for card in evidence}
-    adjusted_mechanisms = []
-    for mechanism in score.mechanisms:
-        cards = [card_by_id[item] for item in mechanism.evidence_ids]
-        qualities = sorted(
-            (
-                card.strength
-                * card.reliability
-                * (1.0 if card.economic_scope == EconomicScope.COMPANY else 0.9)
-                for card in cards
-            ),
-            reverse=True,
+    from moatrader.evidence.processing import build_canonical_claim_set
+
+    effective_issuer_id = issuer_id or (score.issuer_id if score else None)
+    evidence, _claim_clusters = build_canonical_claim_set(
+        evidence,
+        issuer_id=effective_issuer_id,
+    )
+    proposed_score = score.economic_moat_score if score is not None else None
+    if score is None:
+        if as_of is None:
+            raise ValueError("as_of is required for deterministic MOAT scoring")
+        score = MoatScore(
+            issuer_id=effective_issuer_id,
+            as_of=as_of,
+            economic_moat_score=0.0,
+            durability=Durability.LOW,
+            model_confidence=0.0,
+            document_coverage=document_coverage or CoverageMetrics(),
         )
+    else:
+        validation_errors = validate_moat_score(score, evidence)
+        if validation_errors:
+            raise ValueError("cannot derive MOAT score from invalid evidence: " + "; ".join(validation_errors))
+    grouped: dict[EvidenceType, list[EvidenceCard]] = defaultdict(list)
+    for card in evidence:
+        if (
+            card.direction == EvidenceDirection.MOAT_POSITIVE
+            and card.evidence_type in STRUCTURAL_MOAT_TYPES
+            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+        ):
+            grouped[card.evidence_type].append(card)
+
+    adjusted_mechanisms: list[MoatMechanismScore] = []
+    source_counts: dict[EvidenceType, int] = {}
+    for evidence_type in sorted(grouped, key=lambda item: item.value):
+        cards = sorted(grouped[evidence_type], key=lambda item: item.evidence_id)
+        qualities = sorted((_deterministic_card_quality(card) for card in cards), reverse=True)
         independent_sources = len({card.source_chunk_id for card in cards})
+        source_counts[evidence_type] = independent_sources
         corroboration_bonus = min(0.10, max(0, independent_sources - 1) * 0.05)
-        evidence_cap = min(10.0, 10.0 * min(1.0, qualities[0] + corroboration_bonus))
+        mechanism_score = round(10.0 * min(1.0, qualities[0] + corroboration_bonus), 2)
         adjusted_mechanisms.append(
-            mechanism.model_copy(update={"score": round(min(mechanism.score, evidence_cap), 2)})
+            MoatMechanismScore(
+                evidence_type=evidence_type,
+                score=mechanism_score,
+                evidence_ids=[card.evidence_id for card in cards],
+                rationale=(
+                    f"Deterministic aggregation of {len(cards)} grounded "
+                    f"{evidence_type.value} evidence unit(s)."
+                ),
+            )
         )
 
     strengths = sorted((item.score for item in adjusted_mechanisms), reverse=True)
@@ -230,37 +274,74 @@ def derive_moat_score(score: MoatScore, evidence: list[EvidenceCard]) -> MoatSco
     else:
         base_score = 0.8 * strengths[0] + 0.2 * strengths[1]
 
-    negative_qualities = sorted(
+    counter_types = STRUCTURAL_MOAT_TYPES | {
+        EvidenceType.COMPETITIVE_THREAT,
+        EvidenceType.CUSTOMER_CONCENTRATION,
+        EvidenceType.SUBSTITUTION_RISK,
+        EvidenceType.TECHNOLOGY_RISK,
+        EvidenceType.CAPITAL_INTENSITY,
+    }
+    counter_cards = sorted(
         (
-            card_by_id[item].strength * card_by_id[item].reliability
-            for item in score.counterevidence_ids
+            card
+            for card in evidence
+            if card.direction == EvidenceDirection.MOAT_NEGATIVE
+            and card.evidence_type in counter_types
+            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
         ),
-        reverse=True,
+        key=lambda card: (-_deterministic_card_quality(card), card.evidence_id),
     )
-    counter_penalty = min(3.0, sum(negative_qualities[:3]))
+    selected_counter_cards = counter_cards[:3]
+    counter_penalty = min(
+        3.0,
+        sum(_deterministic_card_quality(card) for card in selected_counter_cards),
+    )
+    top_mechanism = max(adjusted_mechanisms, key=lambda item: item.score, default=None)
+    top_sources = source_counts.get(top_mechanism.evidence_type, 0) if top_mechanism else 0
+    if top_mechanism is None or top_mechanism.score < 4.0:
+        durability = Durability.LOW
+    elif top_mechanism.score >= 8.5 and top_sources >= 3:
+        durability = Durability.HIGH
+    elif top_mechanism.score >= 6.0 and top_sources >= 2:
+        durability = Durability.MEDIUM_HIGH
+    else:
+        durability = Durability.MEDIUM
     durability_cap = {
         Durability.LOW: 3.0,
         Durability.MEDIUM: 5.0,
         Durability.MEDIUM_HIGH: 8.0,
         Durability.HIGH: 10.0,
-    }[score.durability]
+    }[durability]
     derived = round(max(0.0, min(durability_cap, base_score - counter_penalty)), 2)
-    mean_reliability = (
-        sum(card_by_id[item].reliability for mechanism in adjusted_mechanisms for item in mechanism.evidence_ids)
-        / sum(len(mechanism.evidence_ids) for mechanism in adjusted_mechanisms)
-        if adjusted_mechanisms
+    mechanism_cards = [card for cards in grouped.values() for card in cards]
+    confidence = (
+        round(sum(_deterministic_card_quality(card) for card in mechanism_cards) / len(mechanism_cards), 2)
+        if mechanism_cards
         else 0.0
     )
-    confidence = round(min(score.model_confidence, mean_reliability), 2)
-    caveats = list(score.caveats)
+    caveats = ["Public MOAT score, durability, and counterevidence penalty are deterministic."]
     if not adjusted_mechanisms:
         caveats.append("No validated company-specific structural moat mechanism.")
+    if selected_counter_cards:
+        caveats.append(
+            f"Applied {len(selected_counter_cards)} grounded structural counterevidence unit(s)."
+        )
     return score.model_copy(
         update={
             "economic_moat_score": derived,
             "mechanisms": adjusted_mechanisms,
+            "counterevidence_ids": [card.evidence_id for card in selected_counter_cards],
+            "canonical_claim_ids": sorted(
+                card.claim_id for card in evidence if card.claim_id is not None
+            ),
+            "durability": durability,
             "model_confidence": confidence,
-            "llm_proposed_score": score.economic_moat_score,
-            "caveats": list(dict.fromkeys(caveats)),
+            "llm_proposed_score": proposed_score,
+            "caveats": caveats,
         }
     )
+
+
+def _deterministic_card_quality(card: EvidenceCard) -> float:
+    scope_factor = 1.0 if card.economic_scope == EconomicScope.COMPANY else 0.9
+    return round(card.reliability * scope_factor, 4)

@@ -62,7 +62,7 @@ class EvidencePackBuilder:
             "",
             "# L1. Structural Summary",
             "",
-            dossier.business_summary or "_No grounded structural summary._",
+            "_Display-only LLM summaries are intentionally excluded from scoring._",
             "",
             "# L2. Grounded Structural Evidence Cards",
             "",
