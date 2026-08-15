@@ -25,7 +25,10 @@ from moatrader.semantic.chunker import SemanticChunk
 def _number_tokens(value: str) -> set[str]:
     """Return normalized numeric tokens so commas/decimal zeroes compare."""
     result: set[str] = set()
-    for token in re.findall(r"(?<![A-Za-z])[-+]?\d[\d,.]*(?:%|배|개|명|원|년|월|일)?", value):
+    for token in re.findall(
+        r"(?:\d{4}(?=년)|(?<![A-Za-z])[-+]?\d[\d,.]*)(?:%|배|개|명|원|년|월|일)?",
+        value,
+    ):
         suffix_match = re.search(r"(%|배|개|명|원|년|월|일)$", token)
         suffix = suffix_match.group(1) if suffix_match else ""
         number = token[: -len(suffix)] if suffix else token
@@ -44,7 +47,11 @@ def _number_tokens(value: str) -> set[str]:
             # A source may express a date/amount with or without its suffix.
             result.add(normalized)
         except Exception:
-            result.add(token)
+            # Multi-dot dates such as ``2020.09.03`` are not Decimal values.
+            # Keep their canonical punctuation-stripped form so a sentence
+            # comma or period cannot create a false ungrounded-number error.
+            result.add(candidate + suffix)
+            result.add(candidate)
     return result
 
 

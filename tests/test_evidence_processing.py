@@ -220,6 +220,54 @@ def test_validation_accepts_grounded_decimal_followed_by_source_punctuation() ->
     assert [item.evidence_id for item in result.cards] == ["E1"]
 
 
+def test_validation_accepts_grounded_multi_dot_dates_with_sentence_punctuation() -> None:
+    card = _card(
+        "E1",
+        "The license runs from 2020.09.03, through 2040.09.03.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = "License period: 2020.09.03 through 2040.09.03."
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="License period: 2020.09.03 through 2040.09.03.",
+        token_count=6,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
+def test_validation_recovers_a_year_joined_to_an_ascii_section_label() -> None:
+    card = _card(
+        "E1",
+        "The GOLF business launched LPGA golfwear in August 2016.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = "GOLF2016년 8월에 LPGA 골프웨어를 런칭하였습니다."
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown="(4) GOLF2016년 8월에 LPGA 골프웨어를 런칭하였습니다.",
+        token_count=6,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
 def test_validation_rejects_a_card_without_verbatim_grounding() -> None:
     card = _card("E1", "Paraphrased claim.", EvidenceDirection.MOAT_POSITIVE)
     card.raw_quote = "Text that is not present"

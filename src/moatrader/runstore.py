@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,4 +51,14 @@ class RunStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temporary.write_bytes(content)
-        temporary.replace(path)
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                # Windows virus scanners and indexers can briefly retain a
+                # handle after a prior write.  Keep the atomic replacement
+                # contract while tolerating that transient external lock.
+                if attempt == 5:
+                    raise
+                time.sleep(0.025 * (2**attempt))
