@@ -108,18 +108,28 @@ class OpenAIResponsesTransport:
         self.moat_reasoning_effort = moat_reasoning_effort
         self.max_output_tokens = max_output_tokens
         self.max_retries = max_retries
-        if client is None:
+        self.timeout_seconds = timeout_seconds
+        self.client = client
+
+    def _client(self) -> Any:
+        """Initialize the SDK only when a cache miss needs a live request.
+
+        A fully populated replay cache is intentionally usable offline and
+        without exposing an API credential to a reproducibility run.
+        """
+
+        if self.client is None:
             try:
                 from openai import OpenAI
             except ImportError as exc:
                 raise RuntimeError('OpenAI support is optional; install with: pip install -e ".[llm]"') from exc
             try:
-                client = OpenAI(timeout=timeout_seconds, max_retries=0)
+                self.client = OpenAI(timeout=self.timeout_seconds, max_retries=0)
             except Exception as exc:
                 raise RuntimeError(
                     "failed to initialize OpenAI client; verify OPENAI_API_KEY and client configuration"
                 ) from exc
-        self.client = client
+        return self.client
 
     def execute(self, request: LLMRequest, response_model: type[ResponseT]) -> TransportResult[ResponseT]:
         last_error: Exception | None = None
@@ -172,7 +182,7 @@ class OpenAIResponsesTransport:
                     if request.prompt_cache_breakpoint:
                         cache_options["ttl"] = request.prompt_cache_ttl
                     create_kwargs["prompt_cache_options"] = cache_options
-                response = self.client.responses.create(**create_kwargs)
+                response = self._client().responses.create(**create_kwargs)
                 output_text = str(getattr(response, "output_text", "") or "")
                 if not output_text:
                     refusal = self._refusal_text(response)
@@ -216,6 +226,7 @@ class OpenAIResponsesTransport:
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
             LLMTask.FINAL_MOAT_SCORING,
         }:
             return self.moat_model
@@ -402,7 +413,11 @@ class OpenAIResponsesTransport:
     def _effort_for(self, task: LLMTask) -> str:
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
             return self.atomic_reasoning_effort
-        if task in {LLMTask.CONTEXTUAL_MOAT_STRENGTH, LLMTask.FINAL_MOAT_SCORING}:
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
 
@@ -414,6 +429,8 @@ class OpenAIResponsesTransport:
             return min(self.max_output_tokens, 2_000)
         if task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
             return min(self.max_output_tokens, 8_000)
+        if task == LLMTask.CANDIDATE_ATOMIC_AUDIT:
+            return min(self.max_output_tokens, 2_000)
         if task == LLMTask.SECTION_SUMMARY:
             return min(self.max_output_tokens, 3_000)
         return min(self.max_output_tokens, 4_000)

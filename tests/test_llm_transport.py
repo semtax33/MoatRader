@@ -34,6 +34,12 @@ def test_canonical_json_object_recursively_sorts_keys() -> None:
     assert list(_canonical_json_object(value)["z"][0]) == ["a", "b"]
 
 
+def test_openai_transport_defers_client_initialization_for_offline_replay() -> None:
+    transport = OpenAIResponsesTransport()
+
+    assert transport.client is None
+
+
 def test_prompt_cache_key_is_stable_and_rate_partitioned() -> None:
     first = _prompt_cache_key(
         "atomic-v4", static_prefix="stable rubric", routing_identity="EVIDENCE-1"
@@ -149,7 +155,7 @@ def test_contextual_strength_routes_to_luna_with_full_quality_budget() -> None:
             return SimpleNamespace(
                 id="resp_strength",
                 model=kwargs["model"],
-                output_text='{"evidence_sufficiency":0,"durability_bucket":0}',
+                output_text='{"evidence_sufficiency":0,"mechanisms":[],"outcome_confirmation":[],"counterevidence":[],"llm_proposed_score":null}',
                 usage=None,
             )
 

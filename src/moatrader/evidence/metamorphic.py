@@ -21,6 +21,7 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     STRUCTURAL_MOAT_TYPES,
 )
+from moatrader.context.moat_strength import MoatStrengthContext
 from moatrader.evidence.processing import atomic_judgment_to_card, build_canonical_claim_set
 from moatrader.evidence.validation import derive_moat_score
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
@@ -149,6 +150,17 @@ def audit_company_metamorphs(
     contextual_assessment = ContextualMoatAssessment.model_validate_json(
         (directory / "contextual-moat-assessment.json").read_text(encoding="utf-8-sig")
     )
+    strength_context = MoatStrengthContext.model_validate_json(
+        (directory / "moat-strength-context.json").read_text(encoding="utf-8-sig")
+    )
+    chunk_id_by_ref = {
+        reference.ref_id: reference.chunk_id
+        for reference in strength_context.references
+    }
+    raw_quote_by_ref = {
+        reference.ref_id: reference.raw_quote
+        for reference in strength_context.references
+    }
     claim_cards = list(_read_jsonl(directory / "canonical-claim-set.jsonl", EvidenceCard))
     all_cards = list(_read_jsonl(directory / "evidence.jsonl", EvidenceCard))
     current_cards = list(_read_jsonl(directory / "current-evidence.jsonl", EvidenceCard))
@@ -210,6 +222,8 @@ def audit_company_metamorphs(
         cited_transformed_units = select_context_cited_atomic_units(
             all_transformed_units,
             contextual_assessment,
+            chunk_id_by_ref=chunk_id_by_ref,
+            raw_quote_by_ref=raw_quote_by_ref,
         )
         transformed_units = sorted(
             {

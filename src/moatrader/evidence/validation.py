@@ -5,8 +5,15 @@ from collections import defaultdict
 from datetime import date
 from decimal import Decimal
 
+from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import CanonicalDocumentBundle
+from moatrader.context.moat_strength import ContextEvidenceReference
 from moatrader.evidence.models import (
+    CandidateAtomicAuditDecision,
+    CandidateAtomicAuditResult,
+    CandidateAuditReason,
+    CandidateMechanism,
+    CandidateSupportStatus,
     ContextualMoatAssessment,
     Durability,
     CoverageMetrics,
@@ -20,6 +27,7 @@ from moatrader.evidence.models import (
     MoatOutcomeScore,
     MoatAuditStatus,
     MoatScore,
+    MoatScoreEligibilityStatus,
     OUTCOME_CORROBORATION_TYPES,
     ReconciledCounterevidence,
     ReconciledMechanismStrength,
@@ -310,6 +318,10 @@ def validate_moat_score(score: MoatScore, evidence: list[EvidenceCard]) -> list[
         errors.append("positive moat assessment must cite available counterevidence")
     if score.economic_moat_score > 0 and not score.mechanisms:
         errors.append("positive moat score requires at least one validated mechanism")
+    if score.economic_moat_score > 0 and not score.score_eligible:
+        errors.append("ineligible MOAT assessment cannot publish a positive score")
+    if score.audit_status == MoatAuditStatus.FAIL and score.score_eligible:
+        errors.append("failed audit must be excluded from ranking")
     if score.scoring_method == "DUAL_LANE_CONTEXTUAL_STRENGTH_REDUCER_V1":
         if score.evidence_confidence != score.model_confidence:
             errors.append("dual-lane evidence_confidence must match compatibility model_confidence")
@@ -482,13 +494,13 @@ def _deterministic_card_quality(card: EvidenceCard) -> float:
 
 def validate_contextual_moat_assessment(
     assessment: ContextualMoatAssessment,
-    chunks: list[SemanticChunk],
+    references: list[ContextEvidenceReference],
 ) -> list[str]:
-    """Validate broad-context attributes directly against canonical chunks."""
+    """Validate the small ID-only contextual contract."""
 
-    chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    known_reference_ids = {reference.ref_id for reference in references}
     errors: list[str] = []
-    seen: dict[str, set[EvidenceType]] = defaultdict(set)
+    seen: dict[str, set[str]] = defaultdict(set)
     groups = (
         ("mechanism", assessment.mechanisms),
         ("outcome", assessment.outcome_confirmation),
@@ -497,59 +509,270 @@ def validate_contextual_moat_assessment(
     for category, items in groups:
         for item in items:
             evidence_type = item.evidence_type
-            if evidence_type in seen[category]:
+            type_value = evidence_type.value
+            if type_value in seen[category]:
                 errors.append(f"{category}: duplicate {evidence_type.value}")
-            seen[category].add(evidence_type)
-            if category == "mechanism":
-                if evidence_type not in STRUCTURAL_MOAT_TYPES:
-                    errors.append(f"mechanism: {evidence_type.value} is not structural")
-                if item.economic_scope not in {
-                    EconomicScope.COMPANY,
-                    EconomicScope.SEGMENT,
-                }:
-                    errors.append(
-                        f"mechanism: {evidence_type.value} scope is "
-                        f"{item.economic_scope.value}"
-                    )
-            elif category == "outcome" and evidence_type not in OUTCOME_CORROBORATION_TYPES:
-                errors.append(f"outcome: {evidence_type.value} is not an outcome type")
-            elif category == "counterevidence" and evidence_type not in MOAT_COUNTEREVIDENCE_TYPES:
+            seen[category].add(type_value)
+            unknown_refs = set(item.reference_ids) - known_reference_ids
+            if unknown_refs:
                 errors.append(
-                    f"counterevidence: {evidence_type.value} is outside the risk rubric"
+                    f"{category} {type_value}: unknown references {sorted(unknown_refs)}"
                 )
-
-            cited_chunks: list[SemanticChunk] = []
-            for citation in item.citations:
-                chunk = chunk_by_id.get(citation.chunk_id)
-                if chunk is None:
-                    errors.append(
-                        f"{category} {evidence_type.value}: unknown chunk {citation.chunk_id}"
-                    )
-                    continue
-                cited_chunks.append(chunk)
-                outside_nodes = set(citation.node_ids) - set(chunk.node_ids)
-                if outside_nodes:
-                    errors.append(
-                        f"{category} {evidence_type.value}: node IDs outside "
-                        f"{citation.chunk_id}: {sorted(outside_nodes)}"
-                    )
-                if not _quote_in_text(citation.raw_quote, chunk.markdown):
-                    errors.append(
-                        f"{category} {evidence_type.value}: raw quote is not in "
-                        f"{citation.chunk_id}"
-                    )
-            source_numbers = set().union(
-                *(_number_tokens(chunk.markdown) for chunk in cited_chunks)
-            ) if cited_chunks else set()
-            unsupported = _number_tokens(item.rationale) - source_numbers
-            if unsupported:
-                errors.append(
-                    f"{category} {evidence_type.value}: rationale contains unsupported "
-                    f"numbers {sorted(unsupported)}"
-                )
-    if assessment.durability_bucket > 0 and not assessment.mechanisms:
-        errors.append("positive durability requires at least one contextual mechanism")
+            if re.search(r"\d", item.rationale):
+                errors.append(f"{category} {type_value}: rationale contains digits")
     return errors
+
+
+def _qualitative_rationale(value: str) -> str:
+    cleaned = re.sub(r"\d[\d,.:/%+\-]*", "", value)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-")
+    return cleaned or "Grounded qualitative assessment from the reference manifest."
+
+
+def _robust_strength_bucket(value: int) -> int:
+    """Collapse one-step model noise while retaining absent/exceptional states."""
+
+    if value <= 0:
+        return 0
+    if value >= 4:
+        return 4
+    return 2
+
+
+def normalize_contextual_moat_assessment(
+    assessment: ContextualMoatAssessment,
+    references: list[ContextEvidenceReference],
+) -> tuple[ContextualMoatAssessment, dict[str, object]]:
+    """Repair fields/items deterministically without repeating broad context.
+
+    Unknown references are removed, numeric rationale is stripped, and
+    duplicates are merged conservatively. An item with no valid reference is
+    dropped rather than causing a company-wide retry.
+    """
+
+    known = {reference.ref_id for reference in references}
+    actions: list[dict[str, object]] = []
+
+    def prepared(item: object, category: str) -> object | None:
+        refs = sorted(set(item.reference_ids) & known)
+        unknown = sorted(set(item.reference_ids) - known)
+        rationale = _qualitative_rationale(item.rationale)
+        if unknown:
+            actions.append(
+                {"category": category, "type": item.evidence_type.value, "action": "DROP_UNKNOWN_REFS", "values": unknown}
+            )
+        if rationale != item.rationale:
+            actions.append(
+                {"category": category, "type": item.evidence_type.value, "action": "REMOVE_NUMERIC_RATIONALE"}
+            )
+        if not refs:
+            actions.append(
+                {"category": category, "type": item.evidence_type.value, "action": "DROP_ITEM_WITHOUT_VALID_REF"}
+            )
+            return None
+        updates: dict[str, object] = {"reference_ids": refs, "rationale": rationale}
+        if category == "mechanism":
+            updates.update(
+                strength_bucket=_robust_strength_bucket(item.strength_bucket),
+                scope_materiality_bucket=_robust_strength_bucket(
+                    item.scope_materiality_bucket
+                ),
+                durability_bucket=_robust_strength_bucket(item.durability_bucket),
+            )
+        elif category == "outcome":
+            if item.strength_bucket < 2 or item.persistence_bucket < 2:
+                actions.append(
+                    {"category": category, "type": item.evidence_type.value, "action": "DROP_WEAK_OUTCOME"}
+                )
+                return None
+            updates.update(
+                strength_bucket=_robust_strength_bucket(item.strength_bucket),
+                persistence_bucket=_robust_strength_bucket(item.persistence_bucket),
+            )
+        else:
+            # Counter presence is material; free-form severity precision was
+            # not repeatable enough to justify a different penalty.
+            updates["severity_bucket"] = 0 if item.severity_bucket <= 0 else 2
+        if any(updates.get(field) != getattr(item, field) for field in updates if hasattr(item, field)):
+            actions.append(
+                {"category": category, "type": item.evidence_type.value, "action": "CALIBRATE_ORDINAL_BUCKETS"}
+            )
+        return item.model_copy(update=updates)
+
+    def merge(items: list[object], category: str) -> list[object]:
+        by_type: dict[str, object] = {}
+        for raw in items:
+            item = prepared(raw, category)
+            if item is None:
+                continue
+            key = item.evidence_type.value
+            current = by_type.get(key)
+            if current is None:
+                by_type[key] = item
+                continue
+            updates: dict[str, object] = {
+                "reference_ids": sorted(set(current.reference_ids) | set(item.reference_ids)),
+                "rationale": min(
+                    [current.rationale, item.rationale],
+                    key=lambda text: (len(text), text),
+                ),
+            }
+            if category == "mechanism":
+                updates.update(
+                    strength_bucket=min(current.strength_bucket, item.strength_bucket),
+                    scope_materiality_bucket=min(
+                        current.scope_materiality_bucket,
+                        item.scope_materiality_bucket,
+                    ),
+                    durability_bucket=min(
+                        current.durability_bucket,
+                        item.durability_bucket,
+                    ),
+                    economic_scope=(
+                        current.economic_scope
+                        if current.economic_scope == item.economic_scope
+                        else type(current.economic_scope).SEGMENT
+                    ),
+                )
+            elif category == "outcome":
+                updates.update(
+                    strength_bucket=min(current.strength_bucket, item.strength_bucket),
+                    persistence_bucket=min(
+                        current.persistence_bucket,
+                        item.persistence_bucket,
+                    ),
+                )
+            else:
+                updates["severity_bucket"] = max(
+                    current.severity_bucket,
+                    item.severity_bucket,
+                )
+            by_type[key] = current.model_copy(update=updates)
+            actions.append(
+                {"category": category, "type": key, "action": "MERGE_DUPLICATE"}
+            )
+        return [by_type[key] for key in sorted(by_type)]
+
+    mechanisms = merge(list(assessment.mechanisms), "mechanism")
+    outcomes = merge(list(assessment.outcome_confirmation), "outcome")
+    counters = merge(list(assessment.counterevidence), "counterevidence")
+    sufficiency = assessment.evidence_sufficiency
+    if not mechanisms and not outcomes and not counters and actions:
+        sufficiency = min(sufficiency, 1)
+    normalized = assessment.model_copy(
+        update={
+            "evidence_sufficiency": sufficiency,
+            "mechanisms": mechanisms,
+            "outcome_confirmation": outcomes,
+            "counterevidence": counters,
+        }
+    )
+    return normalized, {
+        "schema_version": "contextual-field-repair/1",
+        "strategy": "DETERMINISTIC_ITEM_FIELD_REPAIR_NO_BROAD_RETRY",
+        "action_count": len(actions),
+        "actions": actions,
+    }
+
+
+def build_candidate_manifest(
+    assessment: ContextualMoatAssessment,
+) -> list[CandidateMechanism]:
+    return [
+        CandidateMechanism(
+            candidate_id=stable_id(
+                "M",
+                item.evidence_type.value,
+                length=12,
+            ),
+            evidence_type=EvidenceType(item.evidence_type.value),
+            strength_bucket=item.strength_bucket,
+            scope_materiality_bucket=item.scope_materiality_bucket,
+            durability_bucket=item.durability_bucket,
+            economic_scope=EconomicScope(item.economic_scope.value),
+            reference_ids=item.reference_ids,
+            rationale=item.rationale,
+        )
+        for item in assessment.mechanisms
+    ]
+
+
+def normalize_candidate_atomic_audit(
+    audit: CandidateAtomicAuditResult,
+    candidates: list[CandidateMechanism],
+    evidence: list[EvidenceCard],
+    *,
+    allowed_evidence_ids: dict[str, list[str]],
+) -> tuple[CandidateAtomicAuditResult, dict[str, object]]:
+    """Conservatively repair an ID-only candidate audit without an LLM retry."""
+
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    card_by_id = {card.evidence_id: card for card in evidence}
+    supplied: dict[str, CandidateAtomicAuditDecision] = {}
+    actions: list[dict[str, object]] = []
+    for decision in audit.decisions:
+        if decision.candidate_id not in candidate_by_id:
+            actions.append({"action": "DROP_UNKNOWN_CANDIDATE", "candidate_id": decision.candidate_id})
+            continue
+        if decision.candidate_id in supplied:
+            actions.append({"action": "DROP_DUPLICATE_DECISION", "candidate_id": decision.candidate_id})
+            continue
+        supplied[decision.candidate_id] = decision
+
+    normalized: list[CandidateAtomicAuditDecision] = []
+    for candidate in candidates:
+        allowed = set(allowed_evidence_ids.get(candidate.candidate_id, []))
+        decision = supplied.get(candidate.candidate_id)
+        if decision is None:
+            normalized.append(
+                CandidateAtomicAuditDecision(
+                    candidate_id=candidate.candidate_id,
+                    support=CandidateSupportStatus.INSUFFICIENT,
+                    reason=CandidateAuditReason.INSUFFICIENT_ATOMIC_EVIDENCE,
+                )
+            )
+            actions.append({"action": "ADD_MISSING_DECISION", "candidate_id": candidate.candidate_id})
+            continue
+        supporting = sorted(
+            evidence_id
+            for evidence_id in set(decision.supporting_atomic_evidence_ids) & allowed
+            if (
+                (card := card_by_id.get(evidence_id)) is not None
+                and card.direction == EvidenceDirection.MOAT_POSITIVE
+                and card.evidence_type == candidate.evidence_type
+                and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+            )
+        )
+        contradicting = sorted(
+            evidence_id
+            for evidence_id in set(decision.contradicting_atomic_evidence_ids) & allowed
+            if (
+                (card := card_by_id.get(evidence_id)) is not None
+                and card.direction == EvidenceDirection.MOAT_NEGATIVE
+            )
+        )
+        support = decision.support
+        reason = decision.reason
+        if support == CandidateSupportStatus.SUPPORTED and not supporting:
+            support = CandidateSupportStatus.INSUFFICIENT
+            reason = CandidateAuditReason.INSUFFICIENT_ATOMIC_EVIDENCE
+            actions.append({"action": "DOWNGRADE_UNGROUNDED_SUPPORT", "candidate_id": candidate.candidate_id})
+        normalized.append(
+            decision.model_copy(
+                update={
+                    "support": support,
+                    "reason": reason,
+                    "supporting_atomic_evidence_ids": supporting,
+                    "contradicting_atomic_evidence_ids": contradicting,
+                }
+            )
+        )
+    return CandidateAtomicAuditResult(decisions=normalized), {
+        "schema_version": "candidate-audit-repair/1",
+        "strategy": "DETERMINISTIC_ID_ALLOWLIST_REPAIR_NO_CONTEXT_RETRY",
+        "action_count": len(actions),
+        "actions": actions,
+    }
 
 
 def _quote_in_text(quote: str, text: str) -> bool:
@@ -565,25 +788,39 @@ def reconcile_context_and_claims(
     *,
     contextual_chunks: list[SemanticChunk],
     atomic_units: list[SemanticChunk],
+    references: list[ContextEvidenceReference],
+    candidate_manifest: list[CandidateMechanism],
+    candidate_audit: CandidateAtomicAuditResult,
 ) -> ReconciledMoatAssessment:
-    """Gate contextual strength through grounded context and atomic claims."""
+    """Reconcile the two lanes by Python-owned candidate identity."""
 
     validation_errors = validate_contextual_moat_assessment(
         assessment,
-        contextual_chunks,
+        references,
     )
     if validation_errors:
         raise ValueError(
             "invalid contextual MOAT assessment: " + "; ".join(validation_errors)
         )
     context_by_id = {chunk.chunk_id: chunk for chunk in contextual_chunks}
+    reference_by_id = {reference.ref_id: reference for reference in references}
+    card_by_id = {card.evidence_id: card for card in evidence}
+    audit_by_candidate_id = {
+        decision.candidate_id: decision for decision in candidate_audit.decisions
+    }
     origins_by_atomic_id = {
         unit.chunk_id: set(unit.metadata.get("origin_chunk_ids") or [])
         for unit in atomic_units
     }
 
-    def citation_chunk_ids(item: object) -> list[str]:
-        return sorted({citation.chunk_id for citation in item.citations})
+    def reference_chunk_ids(item: object) -> list[str]:
+        return sorted(
+            {
+                reference_by_id[reference_id].chunk_id
+                for reference_id in item.reference_ids
+                if reference_id in reference_by_id
+            }
+        )
 
     def matches_context(card: EvidenceCard, chunk_ids: set[str]) -> bool:
         origins = origins_by_atomic_id.get(card.source_chunk_id, set())
@@ -603,29 +840,42 @@ def reconcile_context_and_claims(
     outcomes: list[ReconciledOutcomeStrength] = []
     counters: list[ReconciledCounterevidence] = []
 
-    for item in assessment.mechanisms:
-        chunk_ids = set(citation_chunk_ids(item))
-        matching = sorted(
-            (
-                card
-                for card in evidence
-                if card.direction == EvidenceDirection.MOAT_POSITIVE
-                and card.evidence_type == item.evidence_type
-                and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
-                and matches_context(card, chunk_ids)
-            ),
-            key=lambda card: card.evidence_id,
+    for candidate in candidate_manifest:
+        chunk_ids = set(reference_chunk_ids(candidate))
+        audit_decision = audit_by_candidate_id.get(candidate.candidate_id)
+        matching = []
+        if audit_decision is not None:
+            matching = sorted(
+                (
+                    card_by_id[evidence_id]
+                    for evidence_id in audit_decision.supporting_atomic_evidence_ids
+                    if evidence_id in card_by_id
+                    and card_by_id[evidence_id].direction == EvidenceDirection.MOAT_POSITIVE
+                    and card_by_id[evidence_id].evidence_type == candidate.evidence_type
+                    and card_by_id[evidence_id].economic_scope
+                    in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+                ),
+                key=lambda card: card.evidence_id,
+            )
+        accepted = bool(
+            audit_decision is not None
+            and audit_decision.support == CandidateSupportStatus.SUPPORTED
+            and matching
         )
-        accepted = bool(matching)
         decisions.append(
             ReconciliationDecision(
                 category="MECHANISM",
-                evidence_type=item.evidence_type,
+                candidate_id=candidate.candidate_id,
+                evidence_type=candidate.evidence_type,
                 accepted=accepted,
                 reason=(
-                    "context citation matched a positive atomic/canonical claim"
+                    "candidate-targeted atomic audit explicitly supported the mechanism"
                     if accepted
-                    else "no positive atomic/canonical claim matched the cited context"
+                    else (
+                        audit_decision.reason.value
+                        if audit_decision is not None
+                        else CandidateAuditReason.INSUFFICIENT_ATOMIC_EVIDENCE.value
+                    )
                 ),
                 context_chunk_ids=sorted(chunk_ids),
                 atomic_evidence_ids=[card.evidence_id for card in matching],
@@ -634,24 +884,28 @@ def reconcile_context_and_claims(
         if accepted:
             mechanisms.append(
                 ReconciledMechanismStrength(
-                    evidence_type=item.evidence_type,
-                    strength_bucket=item.strength_bucket,
-                    scope_materiality_bucket=item.scope_materiality_bucket,
-                    economic_scope=item.economic_scope,
+                    candidate_id=candidate.candidate_id,
+                    evidence_type=candidate.evidence_type,
+                    strength_bucket=candidate.strength_bucket,
+                    scope_materiality_bucket=candidate.scope_materiality_bucket,
+                    durability_bucket=candidate.durability_bucket,
+                    economic_scope=candidate.economic_scope,
                     context_chunk_ids=sorted(chunk_ids),
+                    reference_ids=candidate.reference_ids,
                     atomic_evidence_ids=[card.evidence_id for card in matching],
-                    rationale=item.rationale,
+                    rationale=candidate.rationale,
                 )
             )
 
     for item in assessment.outcome_confirmation:
-        chunk_ids = set(citation_chunk_ids(item))
+        chunk_ids = set(reference_chunk_ids(item))
+        evidence_type = EvidenceType(item.evidence_type.value)
         matching = sorted(
             (
                 card
                 for card in evidence
                 if card.direction == EvidenceDirection.MOAT_POSITIVE
-                and card.evidence_type == item.evidence_type
+                and card.evidence_type == evidence_type
                 and matches_context(card, chunk_ids)
             ),
             key=lambda card: card.evidence_id,
@@ -660,7 +914,7 @@ def reconcile_context_and_claims(
         decisions.append(
             ReconciliationDecision(
                 category="OUTCOME",
-                evidence_type=item.evidence_type,
+                evidence_type=evidence_type,
                 accepted=accepted,
                 reason=(
                     "context outcome matched a positive atomic/canonical claim"
@@ -674,10 +928,11 @@ def reconcile_context_and_claims(
         if accepted:
             outcomes.append(
                 ReconciledOutcomeStrength(
-                    evidence_type=item.evidence_type,
+                    evidence_type=evidence_type,
                     strength_bucket=item.strength_bucket,
                     persistence_bucket=item.persistence_bucket,
                     context_chunk_ids=sorted(chunk_ids),
+                    reference_ids=item.reference_ids,
                     atomic_evidence_ids=[card.evidence_id for card in matching],
                     rationale=item.rationale,
                 )
@@ -685,13 +940,14 @@ def reconcile_context_and_claims(
 
     represented_counter_ids: set[str] = set()
     for item in assessment.counterevidence:
-        chunk_ids = set(citation_chunk_ids(item))
+        chunk_ids = set(reference_chunk_ids(item))
+        evidence_type = EvidenceType(item.evidence_type.value)
         matching = sorted(
             (
                 card
                 for card in evidence
                 if _is_moat_counterevidence(card)
-                and card.evidence_type == item.evidence_type
+                and card.evidence_type == evidence_type
                 and matches_context(card, chunk_ids)
             ),
             key=lambda card: card.evidence_id,
@@ -702,9 +958,10 @@ def reconcile_context_and_claims(
         # erase adverse source evidence.
         counters.append(
             ReconciledCounterevidence(
-                evidence_type=item.evidence_type,
+                evidence_type=evidence_type,
                 severity_bucket=item.severity_bucket,
                 context_chunk_ids=sorted(chunk_ids),
+                reference_ids=item.reference_ids,
                 atomic_evidence_ids=[card.evidence_id for card in matching],
                 rationale=item.rationale,
             )
@@ -712,7 +969,7 @@ def reconcile_context_and_claims(
         decisions.append(
             ReconciliationDecision(
                 category="COUNTEREVIDENCE",
-                evidence_type=item.evidence_type,
+                evidence_type=evidence_type,
                 accepted=True,
                 reason=(
                     "grounded context counterevidence; atomic match present"
@@ -738,6 +995,7 @@ def reconcile_context_and_claims(
                 evidence_type=card.evidence_type,
                 severity_bucket=1,
                 context_chunk_ids=origin_ids,
+                reference_ids=[],
                 atomic_evidence_ids=[card.evidence_id],
                 rationale="Validated atomic counterevidence retained independently of context scoring.",
             )
@@ -758,8 +1016,11 @@ def reconcile_context_and_claims(
         if match_rate >= 0.75
         else MoatAuditStatus.PARTIAL
     )
-    if assessment.mechanisms and not mechanisms:
-        audit_status = MoatAuditStatus.FAIL
+    # A valid but unsupported candidate is a bridge-eligibility outcome, not a
+    # malformed audit. Score eligibility records BRIDGE_FAIL separately so it
+    # can never enter the investable zero-score bucket.
+    if candidate_manifest and not mechanisms:
+        audit_status = MoatAuditStatus.PARTIAL
     all_atomic_ids = sorted(
         {
             evidence_id
@@ -783,7 +1044,10 @@ def reconcile_context_and_claims(
     )
     return ReconciledMoatAssessment(
         evidence_sufficiency=assessment.evidence_sufficiency,
-        durability_bucket=assessment.durability_bucket,
+        durability_bucket=max(
+            (mechanism.durability_bucket for mechanism in mechanisms),
+            default=0,
+        ),
         mechanisms=mechanisms,
         outcomes=outcomes,
         counterevidence=counters,
@@ -820,6 +1084,7 @@ def derive_audited_moat_score(
         effective_buckets.append(float(effective_bucket))
         mechanisms.append(
             MoatMechanismScore(
+                candidate_id=item.candidate_id,
                 evidence_type=item.evidence_type,
                 score=round(effective_bucket / 4 * 10, 2),
                 evidence_ids=item.atomic_evidence_ids,
@@ -907,6 +1172,27 @@ def derive_audited_moat_score(
     if audit_status == MoatAuditStatus.PASS and confidence < 0.60:
         audit_status = MoatAuditStatus.PARTIAL
 
+    mechanism_decisions = [
+        decision
+        for decision in reconciled.decisions
+        if decision.category == "MECHANISM"
+    ]
+    if reconciled.audit_status == MoatAuditStatus.FAIL:
+        score_eligible = False
+        eligibility_status = MoatScoreEligibilityStatus.BRIDGE_FAIL
+    elif not mechanisms and reconciled.evidence_sufficiency <= 1:
+        score_eligible = False
+        eligibility_status = MoatScoreEligibilityStatus.INSUFFICIENT
+    elif not mechanisms and mechanism_decisions:
+        score_eligible = False
+        eligibility_status = MoatScoreEligibilityStatus.BRIDGE_FAIL
+    elif not mechanisms:
+        score_eligible = True
+        eligibility_status = MoatScoreEligibilityStatus.VALID_NO_MOAT
+    else:
+        score_eligible = True
+        eligibility_status = MoatScoreEligibilityStatus.VALID_MOAT
+
     counter_ids = sorted(
         {
             evidence_id
@@ -927,6 +1213,10 @@ def derive_audited_moat_score(
     ]
     if reconciled.audit_status == MoatAuditStatus.FAIL:
         caveats.append("Contextual mechanisms failed the atomic/canonical reconciliation gate.")
+    if not score_eligible:
+        caveats.append(
+            "Economic score is a compatibility placeholder and is excluded from ranking."
+        )
     if counter_ids or counter_chunk_ids:
         caveats.append("Grounded counterevidence was retained independently of positive retrieval.")
     return MoatScore(
@@ -941,6 +1231,20 @@ def derive_audited_moat_score(
             card.claim_id for card in canonical_evidence if card.claim_id is not None
         ),
         context_chunk_ids=reconciled.context_chunk_ids,
+        context_reference_ids=sorted(
+            {
+                reference_id
+                for item in [
+                    *reconciled.mechanisms,
+                    *reconciled.outcomes,
+                    *reconciled.counterevidence,
+                ]
+                for reference_id in item.reference_ids
+            }
+        ),
+        candidate_ids=sorted(
+            mechanism.candidate_id for mechanism in reconciled.mechanisms
+        ),
         context_document_ids=reconciled.context_document_ids,
         atomic_evidence_ids=reconciled.atomic_evidence_ids,
         durability=durability,
@@ -948,6 +1252,8 @@ def derive_audited_moat_score(
         evidence_confidence=confidence,
         document_coverage=document_coverage,
         audit_status=audit_status,
+        score_eligible=score_eligible,
+        eligibility_status=eligibility_status,
         scoring_method="DUAL_LANE_CONTEXTUAL_STRENGTH_REDUCER_V1",
         caveats=caveats,
     )

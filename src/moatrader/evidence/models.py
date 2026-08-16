@@ -35,6 +35,38 @@ class EvidenceType(StrEnum):
     OTHER = "OTHER"
 
 
+class StructuralMoatType(StrEnum):
+    """Only company-specific causal barriers allowed in the context lane."""
+
+    SWITCHING_COST = "SWITCHING_COST"
+    NETWORK_EFFECT = "NETWORK_EFFECT"
+    COST_ADVANTAGE = "COST_ADVANTAGE"
+    INTANGIBLE_ASSET = "INTANGIBLE_ASSET"
+    SCALE_ADVANTAGE = "SCALE_ADVANTAGE"
+    REGULATORY_BARRIER = "REGULATORY_BARRIER"
+
+
+class OutcomeEvidenceType(StrEnum):
+    """Realized outcomes which may corroborate, but never create, a moat."""
+
+    PRICING_POWER = "PRICING_POWER"
+    CUSTOMER_RETENTION = "CUSTOMER_RETENTION"
+    MARKET_SHARE = "MARKET_SHARE"
+    MARGIN_STABILITY = "MARGIN_STABILITY"
+    ROIC_QUALITY = "ROIC_QUALITY"
+    FCF_QUALITY = "FCF_QUALITY"
+
+
+class MoatRiskType(StrEnum):
+    """Adverse categories accepted from the contextual counterevidence lane."""
+
+    COMPETITIVE_THREAT = "COMPETITIVE_THREAT"
+    CUSTOMER_CONCENTRATION = "CUSTOMER_CONCENTRATION"
+    SUBSTITUTION_RISK = "SUBSTITUTION_RISK"
+    TECHNOLOGY_RISK = "TECHNOLOGY_RISK"
+    CAPITAL_INTENSITY = "CAPITAL_INTENSITY"
+
+
 # Only these categories describe a causal, company-specific barrier that can
 # be scored as an economic-moat mechanism.  The remaining EvidenceType values
 # are outcomes, context, operating drivers, or risks and may corroborate or
@@ -74,6 +106,13 @@ class EconomicScope(StrEnum):
     PRODUCT_CATEGORY = "PRODUCT_CATEGORY"
     INDUSTRY = "INDUSTRY"
     MACRO = "MACRO"
+
+
+class CompanyMoatScope(StrEnum):
+    """Scopes which can contribute to a company economic-moat score."""
+
+    COMPANY = "COMPANY"
+    SEGMENT = "SEGMENT"
 
 
 class ForwardDriverType(StrEnum):
@@ -558,8 +597,20 @@ class MoatAuditStatus(StrEnum):
     FAIL = "FAIL"
 
 
+class MoatScoreEligibilityStatus(StrEnum):
+    VALID_MOAT = "VALID_MOAT"
+    VALID_NO_MOAT = "VALID_NO_MOAT"
+    INSUFFICIENT = "INSUFFICIENT"
+    VALIDATION_FAIL = "VALIDATION_FAIL"
+    BRIDGE_FAIL = "BRIDGE_FAIL"
+
+
 class ContextCitation(ContractModel):
-    """A contextual-strength claim anchored directly to canonical source text."""
+    """Deprecated checkpoint compatibility type.
+
+    Contextual LLM responses no longer contain source coordinates.  New code
+    uses reference IDs which Python hydrates from the context manifest.
+    """
 
     chunk_id: str = Field(min_length=1)
     node_ids: list[str] = Field(min_length=1)
@@ -567,26 +618,27 @@ class ContextCitation(ContractModel):
 
 
 class ContextualMechanismAssessment(ContractModel):
-    evidence_type: EvidenceType
+    evidence_type: StructuralMoatType
     strength_bucket: int = Field(ge=0, le=4)
     scope_materiality_bucket: int = Field(ge=0, le=4)
-    economic_scope: EconomicScope
-    citations: list[ContextCitation] = Field(min_length=1)
+    durability_bucket: int = Field(ge=0, le=4)
+    economic_scope: CompanyMoatScope
+    reference_ids: list[str] = Field(min_length=1)
     rationale: str = Field(min_length=1)
 
 
 class ContextualOutcomeAssessment(ContractModel):
-    evidence_type: EvidenceType
+    evidence_type: OutcomeEvidenceType
     strength_bucket: int = Field(ge=0, le=4)
     persistence_bucket: int = Field(ge=0, le=4)
-    citations: list[ContextCitation] = Field(min_length=1)
+    reference_ids: list[str] = Field(min_length=1)
     rationale: str = Field(min_length=1)
 
 
 class ContextualCounterevidenceAssessment(ContractModel):
-    evidence_type: EvidenceType
+    evidence_type: MoatRiskType
     severity_bucket: int = Field(ge=0, le=4)
-    citations: list[ContextCitation] = Field(min_length=1)
+    reference_ids: list[str] = Field(min_length=1)
     rationale: str = Field(min_length=1)
 
 
@@ -600,12 +652,56 @@ class ContextualMoatAssessment(ContractModel):
     evidence_sufficiency: int = Field(ge=0, le=4)
     mechanisms: list[ContextualMechanismAssessment] = Field(default_factory=list)
     outcome_confirmation: list[ContextualOutcomeAssessment] = Field(default_factory=list)
-    durability_bucket: int = Field(ge=0, le=4)
     counterevidence: list[ContextualCounterevidenceAssessment] = Field(default_factory=list)
     llm_proposed_score: float | None = Field(default=None, ge=0.0, le=10.0)
 
 
+class CandidateMechanism(ContractModel):
+    """Python-owned identity for one contextual structural mechanism."""
+
+    candidate_id: str = Field(min_length=1)
+    evidence_type: EvidenceType
+    strength_bucket: int = Field(ge=0, le=4)
+    scope_materiality_bucket: int = Field(ge=0, le=4)
+    durability_bucket: int = Field(ge=0, le=4)
+    economic_scope: EconomicScope
+    reference_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class CandidateSupportStatus(StrEnum):
+    SUPPORTED = "SUPPORTED"
+    NOT_SUPPORTED = "NOT_SUPPORTED"
+    CONTRADICTED = "CONTRADICTED"
+    INSUFFICIENT = "INSUFFICIENT"
+
+
+class CandidateAuditReason(StrEnum):
+    EXPLICIT_CAUSAL_BARRIER = "EXPLICIT_CAUSAL_BARRIER"
+    OUTCOME_ONLY = "OUTCOME_ONLY"
+    INDUSTRY_OR_CATEGORY_ONLY = "INDUSTRY_OR_CATEGORY_ONLY"
+    SCOPE_MISMATCH = "SCOPE_MISMATCH"
+    TYPE_MISMATCH = "TYPE_MISMATCH"
+    INSUFFICIENT_ATOMIC_EVIDENCE = "INSUFFICIENT_ATOMIC_EVIDENCE"
+    CONTRADICTED_BY_ATOMIC_EVIDENCE = "CONTRADICTED_BY_ATOMIC_EVIDENCE"
+
+
+class CandidateAtomicAuditDecision(ContractModel):
+    """Candidate-targeted judgment; only Python-owned IDs cross the boundary."""
+
+    candidate_id: str = Field(min_length=1)
+    support: CandidateSupportStatus
+    reason: CandidateAuditReason
+    supporting_atomic_evidence_ids: list[str] = Field(default_factory=list)
+    contradicting_atomic_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class CandidateAtomicAuditResult(ContractModel):
+    decisions: list[CandidateAtomicAuditDecision] = Field(default_factory=list)
+
+
 class ReconciliationDecision(ContractModel):
+    candidate_id: str | None = None
     category: str
     evidence_type: EvidenceType
     accepted: bool
@@ -615,11 +711,14 @@ class ReconciliationDecision(ContractModel):
 
 
 class ReconciledMechanismStrength(ContractModel):
+    candidate_id: str
     evidence_type: EvidenceType
     strength_bucket: int = Field(ge=0, le=4)
     scope_materiality_bucket: int = Field(ge=0, le=4)
+    durability_bucket: int = Field(ge=0, le=4)
     economic_scope: EconomicScope
     context_chunk_ids: list[str] = Field(min_length=1)
+    reference_ids: list[str] = Field(min_length=1)
     atomic_evidence_ids: list[str] = Field(min_length=1)
     rationale: str
 
@@ -629,6 +728,7 @@ class ReconciledOutcomeStrength(ContractModel):
     strength_bucket: int = Field(ge=0, le=4)
     persistence_bucket: int = Field(ge=0, le=4)
     context_chunk_ids: list[str] = Field(min_length=1)
+    reference_ids: list[str] = Field(min_length=1)
     atomic_evidence_ids: list[str] = Field(min_length=1)
     rationale: str
 
@@ -637,6 +737,7 @@ class ReconciledCounterevidence(ContractModel):
     evidence_type: EvidenceType
     severity_bucket: int = Field(ge=0, le=4)
     context_chunk_ids: list[str] = Field(default_factory=list)
+    reference_ids: list[str] = Field(default_factory=list)
     atomic_evidence_ids: list[str] = Field(default_factory=list)
     rationale: str
 
@@ -655,6 +756,7 @@ class ReconciledMoatAssessment(ContractModel):
 
 
 class MoatMechanismScore(ContractModel):
+    candidate_id: str | None = None
     evidence_type: EvidenceType
     score: float = Field(ge=0.0, le=10.0)
     evidence_ids: list[str] = Field(min_length=1)
@@ -697,6 +799,8 @@ class MoatScore(ContractModel):
     counterevidence_context_chunk_ids: list[str] = Field(default_factory=list)
     canonical_claim_ids: list[str] = Field(default_factory=list)
     context_chunk_ids: list[str] = Field(default_factory=list)
+    context_reference_ids: list[str] = Field(default_factory=list)
+    candidate_ids: list[str] = Field(default_factory=list)
     context_document_ids: list[str] = Field(default_factory=list)
     atomic_evidence_ids: list[str] = Field(default_factory=list)
     durability: Durability
@@ -704,6 +808,8 @@ class MoatScore(ContractModel):
     evidence_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     document_coverage: CoverageMetrics
     audit_status: MoatAuditStatus = MoatAuditStatus.PARTIAL
+    score_eligible: bool = True
+    eligibility_status: MoatScoreEligibilityStatus = MoatScoreEligibilityStatus.VALID_MOAT
     scoring_method: str = "LEGACY_RELIABILITY_REDUCER"
     caveats: list[str] = Field(default_factory=list)
     # Preserves the model's holistic proposal for audit.  The public economic
@@ -714,6 +820,10 @@ class MoatScore(ContractModel):
     def positive_score_has_evidence(self) -> "MoatScore":
         if self.economic_moat_score > 0 and not self.mechanisms:
             raise ValueError("a positive moat score requires cited mechanisms")
+        if self.economic_moat_score > 0 and not self.score_eligible:
+            raise ValueError("an ineligible MOAT assessment cannot publish a positive score")
+        if self.audit_status == MoatAuditStatus.FAIL and self.score_eligible:
+            raise ValueError("a failed MOAT audit cannot be score eligible")
         if self.evidence_confidence is None:
             self.evidence_confidence = self.model_confidence
         return self

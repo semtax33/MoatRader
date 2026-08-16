@@ -48,6 +48,51 @@ _FORWARD_LANGUAGE_RE = re.compile(
     r"전망|계획|예상|기대|목표|가이던스|추정|will|expect|plan|target|forecast|guidance",
     re.IGNORECASE,
 )
+_LLM_NUMERIC_FRAGMENT_RE = re.compile(r"\d[\d,.:/%+\-~–—?]*")
+
+
+def normalize_atomic_extraction(
+    extraction: AtomicEvidenceExtraction,
+) -> tuple[AtomicEvidenceExtraction, list[str]]:
+    """Keep free LLM prose qualitative; Python owns source numbers/periods.
+
+    Atomic raw quotes, metrics and periods are hydrated from the canonical
+    source after this step, so removing digits from model-authored prose loses
+    no auditable numeric evidence and prevents one malformed suffix from
+    failing an entire company.
+    """
+
+    actions: list[str] = []
+
+    def qualitative(value: str | None, field: str) -> str | None:
+        if value is None:
+            return None
+        cleaned = _LLM_NUMERIC_FRAGMENT_RE.sub("", value)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-~")
+        if cleaned != value:
+            actions.append(f"REMOVE_NUMERIC_PROSE:{field}")
+        return cleaned or None
+
+    fact = qualitative(extraction.fact, "fact") or "Grounded canonical source evidence."
+    mechanisms = [
+        cleaned
+        for index, value in enumerate(extraction.mechanism)
+        if (cleaned := qualitative(value, f"mechanism[{index}]") or "")
+    ]
+    normalized = extraction.model_copy(
+        update={
+            "fact": fact,
+            "mechanism": mechanisms,
+            "claim_subject": qualitative(extraction.claim_subject, "subject") or "company",
+            "claim_predicate": qualitative(extraction.claim_predicate, "predicate")
+            or "unspecified",
+            # Source-derived period/horizon is added by
+            # atomic_extraction_to_judgment below.
+            "claim_horizon": qualitative(extraction.claim_horizon, "horizon"),
+            "claim_metric": qualitative(extraction.claim_metric, "metric"),
+        }
+    )
+    return normalized, actions
 _ATOMIC_METRIC_RE = re.compile(
     r"(?<![0-9A-Za-z])(?P<value>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
     r"(?P<unit>%p|pp|%|억원|백만원|천원|원|달러|USD|KRW|개월|년|배)?",

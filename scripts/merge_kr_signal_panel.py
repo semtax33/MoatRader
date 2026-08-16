@@ -196,6 +196,8 @@ def main() -> int:
             if score is None:
                 reasons.append("NO_MOAT_SCORE")
             else:
+                if not score.score_eligible:
+                    reasons.append(f"MOAT_SCORE_{score.eligibility_status.value}")
                 if Decimal(str(score.economic_moat_score)) < Decimal("5"):
                     reasons.append("MOAT_BELOW_5")
                 if score.audit_status.value == "FAIL":

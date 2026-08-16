@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -12,8 +11,11 @@ import pytest
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
+    CandidateAtomicAuditDecision,
+    CandidateAtomicAuditResult,
+    CandidateAuditReason,
+    CandidateSupportStatus,
     CitedSummaryClaim,
-    ContextCitation,
     ContextualMechanismAssessment,
     ContextualMoatAssessment,
     CoverageMetrics,
@@ -48,14 +50,6 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
             claim_horizon="LONG",
         )
     if request.task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
-        chunk_id = re.search(r"^## CHUNK (\S+)", request.user, re.MULTILINE).group(1)
-        node_line = re.search(r"^Node IDs: (.+)$", request.user, re.MULTILINE).group(1)
-        source = re.search(
-            r"--- BEGIN UNTRUSTED SOURCE ---\n(.+?)\n--- END UNTRUSTED SOURCE ---",
-            request.user,
-            re.DOTALL,
-        ).group(1)
-        raw_quote = next(line for line in source.splitlines() if line.strip())
         return ContextualMoatAssessment(
             evidence_sufficiency=3,
             mechanisms=[
@@ -63,18 +57,25 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
                     evidence_type=EvidenceType.SWITCHING_COST,
                     strength_bucket=3,
                     scope_materiality_bucket=4,
+                    durability_bucket=3,
                     economic_scope=EconomicScope.COMPANY,
-                    citations=[
-                        ContextCitation(
-                            chunk_id=chunk_id,
-                            node_ids=[node_line.split(",")[0]],
-                            raw_quote=raw_quote,
-                        )
-                    ],
+                    reference_ids=[str(request.metadata["reference_ids"][0])],
                     rationale="Grounded context indicates switching friction.",
                 )
             ],
-            durability_bucket=3,
+        )
+    if request.task == LLMTask.CANDIDATE_ATOMIC_AUDIT:
+        candidate_id = str(request.metadata["candidate_ids"][0])
+        evidence_ids = list(request.metadata["allowed_evidence_ids"][candidate_id])
+        return CandidateAtomicAuditResult(
+            decisions=[
+                CandidateAtomicAuditDecision(
+                    candidate_id=candidate_id,
+                    support=CandidateSupportStatus.SUPPORTED,
+                    reason=CandidateAuditReason.EXPLICIT_CAUSAL_BARRIER,
+                    supporting_atomic_evidence_ids=evidence_ids,
+                )
+            ]
         )
     if request.task == LLMTask.SECTION_SUMMARY:
         evidence_ids = list(request.metadata["evidence_ids"])
@@ -143,7 +144,7 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
-    assert company.moat_score.economic_moat_score == 5.62
+    assert company.moat_score.economic_moat_score == 3.75
     assert company.moat_score.llm_proposed_score is None
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")

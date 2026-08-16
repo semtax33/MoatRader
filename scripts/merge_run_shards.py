@@ -47,7 +47,12 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
             else (score.model_confidence if score is not None else None)
         )
         composite = None
-        if score is not None and margin is not None and coverage_min is not None:
+        if (
+            score is not None
+            and score.score_eligible
+            and margin is not None
+            and coverage_min is not None
+        ):
             composite = (
                 Decimal(str(score.economic_moat_score))
                 / Decimal(10)
@@ -63,6 +68,8 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
                 "moat_score": score.economic_moat_score if score else None,
                 "durability": score.durability.value if score else None,
                 "audit_status": score.audit_status.value if score else None,
+                "score_eligible": score.score_eligible if score else None,
+                "eligibility_status": score.eligibility_status.value if score else None,
                 "evidence_confidence": evidence_confidence,
                 "model_confidence": score.model_confidence if score else None,
                 "document_coverage_min": coverage_min,

@@ -26,6 +26,7 @@ from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
     CompanyDossier,
     ContextualMoatAssessment,
+    CandidateAtomicAuditResult,
     CoverageMetrics,
     EvidenceCard,
     EvidenceDirection,
@@ -39,8 +40,11 @@ from moatrader.evidence.models import (
 )
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
+    build_candidate_manifest,
     derive_audited_moat_score,
     reconcile_context_and_claims,
+    normalize_candidate_atomic_audit,
+    normalize_contextual_moat_assessment,
     validate_contextual_moat_assessment,
     validate_evidence_result,
     validate_moat_score,
@@ -54,12 +58,16 @@ from moatrader.evidence.processing import (
     build_evidence_preserving_summaries,
     build_forward_driver_cards,
     cluster_duplicate_evidence,
+    normalize_atomic_extraction,
 )
 from moatrader.evidence.atomic import (
     ATOMIC_RUBRIC_VERSION,
     ATOMIC_SEGMENTATION_VERSION,
     atomic_unit_set_sha256,
     build_atomic_evidence_units,
+    build_candidate_atomic_evidence_allowlist,
+    build_candidate_targeted_atomic_audit,
+    map_context_references_to_atomic_units,
     select_atomic_evidence_units,
     select_context_cited_atomic_units,
 )
@@ -76,6 +84,7 @@ from moatrader.llm import (
     LLMRequest,
     LLMTransport,
     build_atomic_evidence_request,
+    build_candidate_atomic_audit_request,
     build_contextual_moat_strength_request,
     build_section_summary_request,
 )
@@ -97,7 +106,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.9.0"
+RUNNER_VERSION = "0.9.1"
 
 
 class MoatUniverseRunner:
@@ -475,32 +484,64 @@ class MoatUniverseRunner:
                 strength_assessment = ContextualMoatAssessment.model_validate(
                     self.store.read_json(strength_assessment_path)
                 )
-                strength_errors = validate_contextual_moat_assessment(
-                    strength_assessment,
-                    strength_chunks,
-                )
-                if strength_errors:
-                    raise ValueError(
-                        "resumed contextual assessment failed validation: "
-                        + "; ".join(strength_errors)
-                    )
             else:
+                # Broad context is read exactly once. All contract repairs below
+                # are deterministic field/item operations and never resend the
+                # 100K-class context because one field was malformed.
                 strength_assessment = self._execute_validated(
                     strength_request,
                     ContextualMoatAssessment,
-                    lambda value: validate_contextual_moat_assessment(
-                        value,
-                        strength_chunks,
-                    ),
+                    lambda _value: [],
                     audits,
                     company_dir,
                 )
-                self.store.write_json(strength_assessment_path, strength_assessment)
+            self.store.write_json(
+                company_dir / "contextual-moat-assessment-raw.json",
+                strength_assessment,
+            )
+            strength_assessment, strength_repair = normalize_contextual_moat_assessment(
+                strength_assessment,
+                strength_context.references,
+            )
+            strength_errors = validate_contextual_moat_assessment(
+                strength_assessment,
+                strength_context.references,
+            )
+            if strength_errors:
+                raise ValueError(
+                    "normalized contextual assessment failed validation: "
+                    + "; ".join(strength_errors)
+                )
+            self.store.write_json(strength_assessment_path, strength_assessment)
+            self.store.write_json(
+                company_dir / "contextual-moat-field-repair.json",
+                strength_repair,
+            )
+            candidate_manifest = build_candidate_manifest(strength_assessment)
+            self.store.write_json(
+                company_dir / "moat-candidate-manifest.json",
+                candidate_manifest,
+            )
 
             baseline_atomic_units = list(evidence_chunks)
+            chunk_id_by_ref = {
+                reference.ref_id: reference.chunk_id
+                for reference in strength_context.references
+            }
+            raw_quote_by_ref = {
+                reference.ref_id: reference.raw_quote
+                for reference in strength_context.references
+            }
+            atomic_unit_ids_by_ref = map_context_references_to_atomic_units(
+                all_atomic_units,
+                chunk_id_by_ref=chunk_id_by_ref,
+                raw_quote_by_ref=raw_quote_by_ref,
+            )
             cited_atomic_units = select_context_cited_atomic_units(
                 all_atomic_units,
                 strength_assessment,
+                chunk_id_by_ref=chunk_id_by_ref,
+                raw_quote_by_ref=raw_quote_by_ref,
             )
             units_by_id = {
                 unit.chunk_id: unit
@@ -576,6 +617,44 @@ class MoatUniverseRunner:
                 for card in cards
             ]
             self.store.write_jsonl(company_dir / "evidence.jsonl", cards)
+
+            allowed_candidate_evidence = build_candidate_atomic_evidence_allowlist(
+                candidate_manifest,
+                cards,
+                evidence_chunks,
+                atomic_unit_ids_by_ref=atomic_unit_ids_by_ref,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-allowlist.json",
+                allowed_candidate_evidence,
+            )
+            candidate_audit = build_candidate_targeted_atomic_audit(
+                candidate_manifest,
+                cards,
+                allowed_evidence_ids=allowed_candidate_evidence,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-method.json",
+                {
+                    "schema_version": "candidate-targeted-atomic-audit/1",
+                    "method": "PYTHON_EXACT_CANDIDATE_REF_TYPE_SCOPE_BINDING",
+                    "additional_llm_calls": 0,
+                },
+            )
+            candidate_audit, candidate_audit_repair = normalize_candidate_atomic_audit(
+                candidate_audit,
+                candidate_manifest,
+                cards,
+                allowed_evidence_ids=allowed_candidate_evidence,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit.json",
+                candidate_audit,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-repair.json",
+                candidate_audit_repair,
+            )
             self.store.write_json(
                 company_dir / "forward-driver-cards.json",
                 build_forward_driver_cards(current_cards),
@@ -627,6 +706,9 @@ class MoatUniverseRunner:
                 cards,
                 contextual_chunks=strength_chunks,
                 atomic_units=evidence_chunks,
+                references=strength_context.references,
+                candidate_manifest=candidate_manifest,
+                candidate_audit=candidate_audit,
             )
             self.store.write_json(
                 company_dir / "moat-reconciliation.json",
@@ -689,10 +771,17 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "SCORING")
             score_path = company_dir / "moat-score.json"
             reducer_payload = {
-                "schema_version": "dual-lane-strength-reducer/1",
+                "schema_version": "dual-lane-strength-reducer/2",
                 "issuer_id": dossier.issuer_id,
                 "as_of": self.config.as_of.date().isoformat(),
                 "contextual_assessment": strength_assessment.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "candidate_manifest": [
+                    item.model_dump(mode="json", exclude_none=True)
+                    for item in candidate_manifest
+                ],
+                "candidate_atomic_audit": candidate_audit.model_dump(
                     mode="json", exclude_none=True
                 ),
                 "reconciled_attributes": reconciled.model_dump(
@@ -986,16 +1075,37 @@ class MoatUniverseRunner:
                 extraction = self._execute_validated(
                     request,
                     AtomicEvidenceExtraction,
-                    lambda value, c=chunk: self._validate_atomic_judgment(
-                        atomic_extraction_to_judgment(value, c),
-                        c,
-                        bundle_by_document[c.document_id],
-                        issuer_id=issuer_id,
-                    ),
+                    lambda _value: [],
                     audits,
                     company_dir,
                 )
+                extraction, repair_actions = normalize_atomic_extraction(extraction)
                 judgment = atomic_extraction_to_judgment(extraction, chunk)
+                validation_errors = self._validate_atomic_judgment(
+                    judgment,
+                    chunk,
+                    bundle_by_document[chunk.document_id],
+                    issuer_id=issuer_id,
+                )
+                repair_payload: dict[str, object] = {
+                    "schema_version": "atomic-field-repair/1",
+                    "atomic_evidence_key": atomic_key,
+                    "strategy": "DETERMINISTIC_FIELD_REPAIR_NO_COMPANY_RETRY",
+                    "actions": repair_actions,
+                    "validation_errors": validation_errors,
+                    "item_accepted": not validation_errors,
+                }
+                if validation_errors:
+                    judgment = AtomicEvidenceJudgment(
+                        is_investment_relevant=False,
+                        fact="Atomic item excluded after deterministic validation.",
+                    )
+                    repair_payload["fallback"] = "EXCLUDE_INVALID_ATOMIC_ITEM"
+                if repair_actions or validation_errors:
+                    self.store.write_json(
+                        company_dir / "atomic-repair-by-key" / f"{atomic_key}.json",
+                        repair_payload,
+                    )
             self.store.write_json(checkpoint, judgment)
             if judgment.is_investment_relevant:
                 cards.append(

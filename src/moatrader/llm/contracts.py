@@ -13,6 +13,8 @@ from moatrader.context.pack import CompanyEvidencePack
 from moatrader.context.moat_strength import MoatStrengthContext
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
+    CandidateAtomicAuditResult,
+    CandidateMechanism,
     CompanyDossier,
     ContextualMoatAssessment,
     EvidenceBatchExtractionResult,
@@ -29,6 +31,7 @@ from moatrader.semantic.chunker import SemanticChunk
 class LLMTask(StrEnum):
     LOCAL_EVIDENCE_EXTRACTION = "LOCAL_EVIDENCE_EXTRACTION"
     CONTEXTUAL_MOAT_STRENGTH = "CONTEXTUAL_MOAT_STRENGTH"
+    CANDIDATE_ATOMIC_AUDIT = "CANDIDATE_ATOMIC_AUDIT"
     SECTION_SUMMARY = "SECTION_SUMMARY"
     FINAL_MOAT_SCORING = "FINAL_MOAT_SCORING"
 
@@ -150,8 +153,8 @@ Outcome confirmation may only use PRICING_POWER, CUSTOMER_RETENTION, MARKET_SHAR
 Assess scope materiality independently: a reliable fact applying to a small segment can still have low company-wide materiality.
 Buckets are ordinal research attributes, not a final score: 0=absent, 1=weak, 2=moderate, 3=strong, 4=exceptional.
 
-For every mechanism, outcome, and counterevidence item cite one or more listed Chunk IDs, valid Node IDs from that chunk, and a verbatim RawQuote substring. Preserve material numbers, periods, qualifiers, and uncertainty. Include adverse evidence even when it conflicts with a positive thesis. Do not infer persistence from a single period. Do not invent missing facts or citations.
-Python validates citations, reconciles mechanisms against the atomic/canonical audit lane, preserves atomic counterevidence, and computes the public score deterministically."""
+For every mechanism, outcome, and counterevidence item return only one or more listed opaque Reference IDs. Never return or reconstruct chunk IDs, node IDs, quotes, document IDs, source coordinates, or numeric facts. Keep rationale qualitative and do not write digits. Include adverse evidence even when it conflicts with a positive thesis. Do not infer persistence from a single period. Durability belongs to each mechanism, not to the company globally.
+Python hydrates references, assigns candidate IDs, reconciles each candidate against the atomic/canonical audit lane, preserves atomic counterevidence, and computes the public score deterministically."""
     user = f"""Issuer: {issuer_id or 'UNKNOWN_ISSUER'}
 As of: {as_of.isoformat()}
 Selected canonical chunks: {len(context.selected_chunk_ids)}
@@ -172,17 +175,106 @@ Context token estimate: {context.token_count}
         response_schema=response_schema,
         input_sha256=_hash_input(system, user),
         prompt_cache_key=_prompt_cache_key(
-            "contextual-strength-v1",
+            "contextual-strength-v2",
             static_prefix=system + "\n" + canonical_schema,
             routing_identity=issuer_id,
         ),
         prompt_cache_breakpoint=True,
         metadata={
-            "prompt_version": "contextual-moat-strength/1",
-            "rubric_version": "dual-lane-moat/1",
+            "prompt_version": "contextual-moat-strength/2",
+            "rubric_version": "dual-lane-moat/2",
             "issuer_id": issuer_id,
             "as_of": as_of.isoformat(),
             "selected_chunk_ids": context.selected_chunk_ids,
+            "reference_ids": [reference.ref_id for reference in context.references],
+        },
+    )
+
+
+def build_candidate_atomic_audit_request(
+    candidates: list[CandidateMechanism],
+    evidence: list[EvidenceCard],
+    *,
+    allowed_evidence_ids: dict[str, list[str]],
+    issuer_id: str | None,
+) -> LLMRequest:
+    """Ask the atomic lane whether each Python-owned candidate is supported.
+
+    The response contains IDs and fixed enums only. Source coordinates and
+    source text remain Python-owned and cannot be mistranscribed by the model.
+    """
+
+    if not candidates:
+        raise ValueError("candidate atomic audit requires at least one candidate")
+    evidence_by_id = {card.evidence_id: card for card in evidence}
+    visible_ids = sorted(
+        {
+            evidence_id
+            for candidate in candidates
+            for evidence_id in allowed_evidence_ids.get(candidate.candidate_id, [])
+            if evidence_id in evidence_by_id
+        }
+    )
+    candidate_payload = [
+        {
+            "candidate_id": candidate.candidate_id,
+            "type": candidate.evidence_type.value,
+            "scope": candidate.economic_scope.value,
+            "reference_ids": candidate.reference_ids,
+            "qualitative_rationale": candidate.rationale,
+            "allowed_atomic_evidence_ids": allowed_evidence_ids.get(
+                candidate.candidate_id, []
+            ),
+        }
+        for candidate in candidates
+    ]
+    evidence_payload = [
+        {
+            "evidence_id": card.evidence_id,
+            "type": card.evidence_type.value,
+            "direction": card.direction.value,
+            "scope": card.economic_scope.value,
+            "fact": card.fact,
+            "mechanism": card.mechanism,
+            "raw_quote": card.raw_quote,
+        }
+        for evidence_id in visible_ids
+        if (card := evidence_by_id[evidence_id])
+    ]
+    system = """Audit Python-owned economic-moat candidates against atomic source evidence.
+Use only the supplied atomic evidence. Return exactly one decision per candidate_id and cite only that candidate's allowed atomic evidence IDs. Do not output source coordinates, quotes, free-form explanations, numbers, or a company score.
+SUPPORTED requires an explicit company/segment causal barrier of the candidate's exact type. Growth, demand, margin, market share, or other outcomes alone are not mechanisms. Industry/category facts are not company moats. Use fixed support and reason enums only."""
+    user = (
+        "Candidates:\n"
+        + json.dumps(candidate_payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\nAtomic evidence:\n"
+        + json.dumps(evidence_payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    response_schema = CandidateAtomicAuditResult.model_json_schema()
+    canonical_schema = json.dumps(
+        response_schema,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return LLMRequest(
+        task=LLMTask.CANDIDATE_ATOMIC_AUDIT,
+        system=system,
+        user=user,
+        response_schema=response_schema,
+        input_sha256=_hash_input(system, user),
+        prompt_cache_key=_prompt_cache_key(
+            "candidate-atomic-audit-v1",
+            static_prefix=system + "\n" + canonical_schema,
+            routing_identity=issuer_id,
+        ),
+        prompt_cache_breakpoint=True,
+        metadata={
+            "prompt_version": "candidate-atomic-audit/1",
+            "rubric_version": "dual-lane-moat/2",
+            "issuer_id": issuer_id,
+            "candidate_ids": [candidate.candidate_id for candidate in candidates],
+            "allowed_evidence_ids": allowed_evidence_ids,
         },
     )
 

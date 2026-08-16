@@ -16,6 +16,7 @@ def rank_run_result(
     for company in result.companies:
         if (
             not company.moat_score
+            or not company.moat_score.score_eligible
             or not company.dcf
             or company.dcf.fair_value_per_share <= 0
             or not company.dcf.screening_eligible
@@ -57,6 +58,8 @@ def results_csv(result: UniverseRunResult) -> str:
         "moat_score",
         "durability",
         "audit_status",
+        "score_eligible",
+        "eligibility_status",
         "scoring_method",
         "evidence_confidence",
         "model_confidence",
@@ -88,6 +91,8 @@ def results_csv(result: UniverseRunResult) -> str:
                 "moat_score": score.economic_moat_score if score else None,
                 "durability": score.durability.value if score else None,
                 "audit_status": score.audit_status.value if score else None,
+                "score_eligible": score.score_eligible if score else None,
+                "eligibility_status": score.eligibility_status.value if score else None,
                 "scoring_method": score.scoring_method if score else None,
                 "evidence_confidence": score.evidence_confidence if score else None,
                 "model_confidence": score.model_confidence if score else None,
