@@ -7,6 +7,7 @@ from collections import defaultdict
 
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import SectionRole, SourceRef, SourceType
+from moatrader.evidence.models import ContextualMoatAssessment
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 
@@ -278,6 +279,62 @@ def select_atomic_evidence_units(
     )
     selected = ranked if maximum is None else ranked[:maximum]
     return sorted(selected, key=lambda unit: str(unit.metadata["atomic_evidence_key"]))
+
+
+def select_context_cited_atomic_units(
+    units: list[SemanticChunk],
+    assessment: ContextualMoatAssessment,
+) -> list[SemanticChunk]:
+    """Select every atomic unit needed to audit contextual source citations.
+
+    Exact quote overlap is preferred. If a cited source span cannot be mapped
+    to one atomic sentence/row, all units from that canonical chunk are kept;
+    correctness takes priority over a smaller audit request set.
+    """
+
+    citations = [
+        citation
+        for item in [
+            *assessment.mechanisms,
+            *assessment.outcome_confirmation,
+            *assessment.counterevidence,
+        ]
+        for citation in item.citations
+    ]
+    selected: dict[str, SemanticChunk] = {}
+    for citation in citations:
+        quote = normalize_atomic_text(citation.raw_quote).casefold()
+        origin_candidates = [
+            unit
+            for unit in units
+            if citation.chunk_id in set(unit.metadata.get("origin_chunk_ids") or [])
+        ]
+        exact = [
+            unit
+            for unit in origin_candidates
+            if (
+                (unit_text := normalize_atomic_text(unit.markdown).casefold())
+                and quote
+                and (unit_text in quote or quote in unit_text)
+            )
+        ]
+        if not exact and quote:
+            # Metamorphic chunking may change chunk IDs while preserving the
+            # cited source sentence. Match the atomic source text globally.
+            exact = [
+                unit
+                for unit in units
+                if (
+                    (unit_text := normalize_atomic_text(unit.markdown).casefold())
+                    and (unit_text in quote or quote in unit_text)
+                )
+            ]
+        for unit in exact or origin_candidates:
+            selected[unit.chunk_id] = unit
+    return sorted(
+        selected.values(),
+        key=lambda unit: str(unit.metadata["atomic_evidence_key"]),
+    )
 
 
 def atomic_unit_set_sha256(units: list[SemanticChunk]) -> str:

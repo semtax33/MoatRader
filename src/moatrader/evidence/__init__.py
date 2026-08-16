@@ -1,5 +1,6 @@
 from moatrader.evidence.atomic import (
     build_atomic_evidence_units,
+    select_context_cited_atomic_units,
     select_atomic_evidence_units,
 )
 from moatrader.evidence.models import (
@@ -8,6 +9,8 @@ from moatrader.evidence.models import (
     CitedSummaryClaim,
     ClaimCluster,
     CompanyDossier,
+    ContextCitation,
+    ContextualMoatAssessment,
     DcfLink,
     EconomicScope,
     EvidenceBatchExtractionResult,
@@ -19,6 +22,7 @@ from moatrader.evidence.models import (
     ForwardDriverCard,
     ForwardDriverType,
     MoatScore,
+    ReconciledMoatAssessment,
 )
 from moatrader.evidence.processing import (
     assign_canonical_claim_identity,
@@ -29,7 +33,13 @@ from moatrader.evidence.processing import (
     cluster_duplicate_evidence,
     normalize_card_semantics,
 )
-from moatrader.evidence.validation import validate_evidence_result, validate_moat_score
+from moatrader.evidence.validation import (
+    derive_audited_moat_score,
+    reconcile_context_and_claims,
+    validate_contextual_moat_assessment,
+    validate_evidence_result,
+    validate_moat_score,
+)
 
 __all__ = [
     "AtomicEvidenceJudgment",
@@ -37,6 +47,8 @@ __all__ = [
     "CitedSummaryClaim",
     "ClaimCluster",
     "CompanyDossier",
+    "ContextCitation",
+    "ContextualMoatAssessment",
     "DcfLink",
     "EconomicScope",
     "EvidenceBatchExtractionResult",
@@ -48,8 +60,10 @@ __all__ = [
     "ForwardDriverCard",
     "ForwardDriverType",
     "MoatScore",
+    "ReconciledMoatAssessment",
     "assign_canonical_claim_identity",
     "build_atomic_evidence_units",
+    "select_context_cited_atomic_units",
     "build_canonical_claim_set",
     "build_evidence_relations",
     "build_forward_driver_cards",
@@ -57,6 +71,9 @@ __all__ = [
     "cluster_duplicate_evidence",
     "normalize_card_semantics",
     "select_atomic_evidence_units",
+    "derive_audited_moat_score",
+    "reconcile_context_and_claims",
+    "validate_contextual_moat_assessment",
     "validate_evidence_result",
     "validate_moat_score",
 ]

@@ -144,24 +144,36 @@ def test_atomic_replay_identity_uses_evidence_key_not_full_prompt(tmp_path) -> N
     )[0]
 
 
-def test_atomic_api_schema_uses_single_letter_aliases_without_changing_internal_fields() -> None:
+def test_atomic_api_schema_uses_explicit_aliases_without_changing_internal_fields() -> None:
     schema = AtomicEvidenceExtraction.model_json_schema()
     properties = schema["properties"]
 
-    assert {"r", "t", "d", "f", "m", "s", "g", "u", "p", "h", "x"} <= set(properties)
+    assert {
+        "relevant",
+        "type",
+        "direction",
+        "fact",
+        "mechanism",
+        "scope",
+        "segment",
+        "subject",
+        "predicate",
+        "horizon",
+        "metric",
+    } <= set(properties)
     assert "is_investment_relevant" not in properties
     parsed = AtomicEvidenceExtraction.model_validate(
         {
-            "r": True,
-            "t": "SWITCHING_COST",
-            "f": "Five-year contracts create switching friction.",
-            "m": ["long contract"],
-            "d": "MOAT_POSITIVE",
-            "s": "COMPANY",
-            "g": None,
-            "h": "LONG",
-            "u": "customer contract",
-            "p": "switching friction",
+            "relevant": True,
+            "type": "SWITCHING_COST",
+            "fact": "Five-year contracts create switching friction.",
+            "mechanism": ["long contract"],
+            "direction": "MOAT_POSITIVE",
+            "scope": "COMPANY",
+            "segment": None,
+            "horizon": "LONG",
+            "subject": "customer contract",
+            "predicate": "switching friction",
         }
     )
 

@@ -167,20 +167,19 @@ class AtomicEvidenceExtraction(ContractModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    # Single-letter API aliases cut both the repeated Structured Outputs schema
-    # and every generated atomic response. Internal/checkpoint field names stay
-    # descriptive through ``populate_by_name`` and normal ``model_dump``.
-    is_investment_relevant: bool = Field(default=False, alias="r")
-    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="t")
-    direction: EvidenceDirection = Field(default=EvidenceDirection.NEUTRAL, alias="d")
-    fact: str = Field(default="No investment-relevant evidence", alias="f")
-    mechanism: list[str] = Field(default_factory=list, alias="m")
-    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="s")
-    segment: str | None = Field(default=None, alias="g")
-    claim_subject: str = Field(default="company", alias="u")
-    claim_predicate: str = Field(default="unspecified", alias="p")
-    claim_horizon: str | None = Field(default=None, alias="h")
-    claim_metric: str | None = Field(default=None, alias="x")
+    # Keep API names explicit. This lane is the audit/grounding authority, so
+    # label clarity takes priority over a small schema-token saving.
+    is_investment_relevant: bool = Field(default=False, alias="relevant")
+    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
+    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
+    fact: str = "No investment-relevant evidence"
+    mechanism: list[str] = Field(default_factory=list)
+    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="scope")
+    segment: str | None = None
+    claim_subject: str = Field(default="company", alias="subject")
+    claim_predicate: str = Field(default="unspecified", alias="predicate")
+    claim_horizon: str | None = Field(default=None, alias="horizon")
+    claim_metric: str | None = Field(default=None, alias="metric")
 
 
 class AtomicEvidenceJudgment(ContractModel):
@@ -553,10 +552,125 @@ class Durability(StrEnum):
     HIGH = "HIGH"
 
 
+class MoatAuditStatus(StrEnum):
+    PASS = "PASS"
+    PARTIAL = "PARTIAL"
+    FAIL = "FAIL"
+
+
+class ContextCitation(ContractModel):
+    """A contextual-strength claim anchored directly to canonical source text."""
+
+    chunk_id: str = Field(min_length=1)
+    node_ids: list[str] = Field(min_length=1)
+    raw_quote: str = Field(min_length=1)
+
+
+class ContextualMechanismAssessment(ContractModel):
+    evidence_type: EvidenceType
+    strength_bucket: int = Field(ge=0, le=4)
+    scope_materiality_bucket: int = Field(ge=0, le=4)
+    economic_scope: EconomicScope
+    citations: list[ContextCitation] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class ContextualOutcomeAssessment(ContractModel):
+    evidence_type: EvidenceType
+    strength_bucket: int = Field(ge=0, le=4)
+    persistence_bucket: int = Field(ge=0, le=4)
+    citations: list[ContextCitation] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class ContextualCounterevidenceAssessment(ContractModel):
+    evidence_type: EvidenceType
+    severity_bucket: int = Field(ge=0, le=4)
+    citations: list[ContextCitation] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class ContextualMoatAssessment(ContractModel):
+    """Economic-strength attributes extracted from broad canonical context.
+
+    This is deliberately not the public score. Python reconciles every item
+    with grounded context and the atomic/canonical audit lane before scoring.
+    """
+
+    evidence_sufficiency: int = Field(ge=0, le=4)
+    mechanisms: list[ContextualMechanismAssessment] = Field(default_factory=list)
+    outcome_confirmation: list[ContextualOutcomeAssessment] = Field(default_factory=list)
+    durability_bucket: int = Field(ge=0, le=4)
+    counterevidence: list[ContextualCounterevidenceAssessment] = Field(default_factory=list)
+    llm_proposed_score: float | None = Field(default=None, ge=0.0, le=10.0)
+
+
+class ReconciliationDecision(ContractModel):
+    category: str
+    evidence_type: EvidenceType
+    accepted: bool
+    reason: str
+    context_chunk_ids: list[str] = Field(default_factory=list)
+    atomic_evidence_ids: list[str] = Field(default_factory=list)
+
+
+class ReconciledMechanismStrength(ContractModel):
+    evidence_type: EvidenceType
+    strength_bucket: int = Field(ge=0, le=4)
+    scope_materiality_bucket: int = Field(ge=0, le=4)
+    economic_scope: EconomicScope
+    context_chunk_ids: list[str] = Field(min_length=1)
+    atomic_evidence_ids: list[str] = Field(min_length=1)
+    rationale: str
+
+
+class ReconciledOutcomeStrength(ContractModel):
+    evidence_type: EvidenceType
+    strength_bucket: int = Field(ge=0, le=4)
+    persistence_bucket: int = Field(ge=0, le=4)
+    context_chunk_ids: list[str] = Field(min_length=1)
+    atomic_evidence_ids: list[str] = Field(min_length=1)
+    rationale: str
+
+
+class ReconciledCounterevidence(ContractModel):
+    evidence_type: EvidenceType
+    severity_bucket: int = Field(ge=0, le=4)
+    context_chunk_ids: list[str] = Field(default_factory=list)
+    atomic_evidence_ids: list[str] = Field(default_factory=list)
+    rationale: str
+
+
+class ReconciledMoatAssessment(ContractModel):
+    evidence_sufficiency: int = Field(ge=0, le=4)
+    durability_bucket: int = Field(ge=0, le=4)
+    mechanisms: list[ReconciledMechanismStrength] = Field(default_factory=list)
+    outcomes: list[ReconciledOutcomeStrength] = Field(default_factory=list)
+    counterevidence: list[ReconciledCounterevidence] = Field(default_factory=list)
+    decisions: list[ReconciliationDecision] = Field(default_factory=list)
+    context_chunk_ids: list[str] = Field(default_factory=list)
+    context_document_ids: list[str] = Field(default_factory=list)
+    atomic_evidence_ids: list[str] = Field(default_factory=list)
+    audit_status: MoatAuditStatus
+
+
 class MoatMechanismScore(ContractModel):
     evidence_type: EvidenceType
     score: float = Field(ge=0.0, le=10.0)
     evidence_ids: list[str] = Field(min_length=1)
+    rationale: str
+    strength_bucket: int | None = Field(default=None, ge=0, le=4)
+    scope_materiality_bucket: int | None = Field(default=None, ge=0, le=4)
+    context_chunk_ids: list[str] = Field(default_factory=list)
+
+
+class MoatOutcomeScore(ContractModel):
+    evidence_type: EvidenceType
+    score: float = Field(ge=0.0, le=2.0)
+    strength_bucket: int = Field(ge=0, le=4)
+    persistence_bucket: int = Field(ge=0, le=4)
+    evidence_ids: list[str] = Field(min_length=1)
+    context_chunk_ids: list[str] = Field(min_length=1)
     rationale: str
 
 
@@ -578,11 +692,19 @@ class MoatScore(ContractModel):
     as_of: date
     economic_moat_score: float = Field(ge=0.0, le=10.0)
     mechanisms: list[MoatMechanismScore] = Field(default_factory=list)
+    outcome_strengths: list[MoatOutcomeScore] = Field(default_factory=list)
     counterevidence_ids: list[str] = Field(default_factory=list)
+    counterevidence_context_chunk_ids: list[str] = Field(default_factory=list)
     canonical_claim_ids: list[str] = Field(default_factory=list)
+    context_chunk_ids: list[str] = Field(default_factory=list)
+    context_document_ids: list[str] = Field(default_factory=list)
+    atomic_evidence_ids: list[str] = Field(default_factory=list)
     durability: Durability
     model_confidence: float = Field(ge=0.0, le=1.0)
+    evidence_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     document_coverage: CoverageMetrics
+    audit_status: MoatAuditStatus = MoatAuditStatus.PARTIAL
+    scoring_method: str = "LEGACY_RELIABILITY_REDUCER"
     caveats: list[str] = Field(default_factory=list)
     # Preserves the model's holistic proposal for audit.  The public economic
     # moat score is recomputed deterministically from validated mechanisms.
@@ -592,4 +714,6 @@ class MoatScore(ContractModel):
     def positive_score_has_evidence(self) -> "MoatScore":
         if self.economic_moat_score > 0 and not self.mechanisms:
             raise ValueError("a positive moat score requires cited mechanisms")
+        if self.evidence_confidence is None:
+            self.evidence_confidence = self.model_confidence
         return self

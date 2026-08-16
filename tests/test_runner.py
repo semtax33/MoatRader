@@ -13,8 +13,12 @@ from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
     CitedSummaryClaim,
+    ContextCitation,
+    ContextualMechanismAssessment,
+    ContextualMoatAssessment,
     CoverageMetrics,
     Durability,
+    EconomicScope,
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
@@ -42,6 +46,35 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
             claim_subject="customer workflow",
             claim_predicate="switching friction",
             claim_horizon="LONG",
+        )
+    if request.task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
+        chunk_id = re.search(r"^## CHUNK (\S+)", request.user, re.MULTILINE).group(1)
+        node_line = re.search(r"^Node IDs: (.+)$", request.user, re.MULTILINE).group(1)
+        source = re.search(
+            r"--- BEGIN UNTRUSTED SOURCE ---\n(.+?)\n--- END UNTRUSTED SOURCE ---",
+            request.user,
+            re.DOTALL,
+        ).group(1)
+        raw_quote = next(line for line in source.splitlines() if line.strip())
+        return ContextualMoatAssessment(
+            evidence_sufficiency=3,
+            mechanisms=[
+                ContextualMechanismAssessment(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    strength_bucket=3,
+                    scope_materiality_bucket=4,
+                    economic_scope=EconomicScope.COMPANY,
+                    citations=[
+                        ContextCitation(
+                            chunk_id=chunk_id,
+                            node_ids=[node_line.split(",")[0]],
+                            raw_quote=raw_quote,
+                        )
+                    ],
+                    rationale="Grounded context indicates switching friction.",
+                )
+            ],
+            durability_bucket=3,
         )
     if request.task == LLMTask.SECTION_SUMMARY:
         evidence_ids = list(request.metadata["evidence_ids"])
@@ -110,7 +143,7 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
-    assert company.moat_score.economic_moat_score == 5.0
+    assert company.moat_score.economic_moat_score == 5.62
     assert company.moat_score.llm_proposed_score is None
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
@@ -139,7 +172,10 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     ]
     assert all(item.get("raw_response_sha256") for item in call_audit)
     assert all(Path(item["raw_response_path"]).is_file() for item in call_audit)
-    assert all(item["task"] == "LOCAL_EVIDENCE_EXTRACTION" for item in call_audit)
+    assert {item["task"] for item in call_audit} == {
+        "LOCAL_EVIDENCE_EXTRACTION",
+        "CONTEXTUAL_MOAT_STRENGTH",
+    }
     summary_manifest = json.loads(
         (company_dir / "section-summary-manifest.json").read_text(encoding="utf-8")
     )
@@ -150,13 +186,29 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert compression["claim_jaccard"] == 1.0
     assert compression["counterevidence_recall"] == 1.0
     token_budget = json.loads((company_dir / "llm-token-budget.json").read_text(encoding="utf-8"))
-    assert token_budget["schema_version"] == "llm-token-budget/2"
-    assert token_budget["schema_token_reduction_fraction"] > 0.5
+    assert token_budget["schema_version"] == "llm-token-budget/4"
+    assert token_budget["schema_token_reduction_fraction"] > 0
     assert token_budget["estimated_schema_tokens_avoided"] > 0
     assert token_budget["prompt_cache_mode"] == "explicit"
-    assert token_budget["prompt_cache_breakpoint_count"] == token_budget["atomic_request_count"]
-    assert token_budget["atomic_reasoning_effort"] == "low"
-    assert token_budget["atomic_max_output_tokens"] == 1_200
+    assert token_budget["prompt_cache_breakpoint_count"] == (
+        token_budget["atomic_request_count"] + token_budget["strength_request_count"]
+    )
+    assert token_budget["estimated_cacheable_prefix_tokens_total"] >= 0
+    assert token_budget["estimated_dynamic_suffix_tokens_all_tasks"] > 0
+    assert token_budget["expected_output_token_cap_total"] >= 8_000
+    assert token_budget["strength_context_compression_ratio"] == 1.0
+    assert token_budget["actual_llm_call_count"] == len(call_audit)
+    assert token_budget["actual_provider_tokens_per_call"] >= 0
+    assert token_budget["atomic_reasoning_effort"] == "medium"
+    assert token_budget["atomic_max_output_tokens"] == 2_000
+    assert token_budget["strength_request_count"] == 1
+    assert token_budget["strength_compression_ablation_enabled"] is False
+    assert token_budget["atomic_selection_policy"] == "BASELINE_PLUS_CONTEXT_CITATION_AUDIT"
+    selection = json.loads(
+        (company_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    assert selection["method"] == "dual_lane_citation_audit/1"
+    assert selection["parent_fallback_enabled"] is False
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None
@@ -168,9 +220,11 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert dcf_payload["assumptions"]["base_revenue"] == "1000"
     assert "terminal_value_share" in dcf_payload
     run_manifest = json.loads((company_dir / "run-manifest.json").read_text(encoding="utf-8"))
-    assert run_manifest["model"] == "deterministic-python"
+    assert run_manifest["model"] == "gpt-5.6-luna+deterministic-python"
     assert (company_dir / "moat-reducer-input.json").is_file()
-    assert not (company_dir / "moat-request.json").exists()
+    assert (company_dir / "moat-strength-context.md").is_file()
+    assert (company_dir / "contextual-moat-assessment.json").is_file()
+    assert (company_dir / "moat-reconciliation.json").is_file()
     assert all(item["task"] != "FINAL_MOAT_SCORING" for item in call_audit)
 
 

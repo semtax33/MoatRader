@@ -33,7 +33,13 @@ def rank_run_result(
                 current_price=company.current_price,
                 dcf_fair_value=company.dcf.fair_value_per_share,
                 moat_score=Decimal(str(company.moat_score.economic_moat_score)),
-                model_confidence=Decimal(str(company.moat_score.model_confidence)),
+                model_confidence=Decimal(
+                    str(
+                        company.moat_score.evidence_confidence
+                        if company.moat_score.evidence_confidence is not None
+                        else company.moat_score.model_confidence
+                    )
+                ),
                 document_coverage=coverage_scalar,
                 valuation_as_of=company.valuation_as_of,
                 price_as_of=company.price_as_of,
@@ -50,7 +56,12 @@ def results_csv(result: UniverseRunResult) -> str:
         "status",
         "moat_score",
         "durability",
+        "audit_status",
+        "scoring_method",
+        "evidence_confidence",
         "model_confidence",
+        "mechanism_strengths",
+        "outcome_strengths",
         "document_coverage",
         "dcf_fair_value",
         "current_price",
@@ -58,6 +69,7 @@ def results_csv(result: UniverseRunResult) -> str:
         "evidence_count",
         "chunk_count",
         "selected_chunk_count",
+        "strength_context_chunk_count",
         "input_tokens",
         "output_tokens",
         "error",
@@ -75,7 +87,26 @@ def results_csv(result: UniverseRunResult) -> str:
                 "status": company.status.value,
                 "moat_score": score.economic_moat_score if score else None,
                 "durability": score.durability.value if score else None,
+                "audit_status": score.audit_status.value if score else None,
+                "scoring_method": score.scoring_method if score else None,
+                "evidence_confidence": score.evidence_confidence if score else None,
                 "model_confidence": score.model_confidence if score else None,
+                "mechanism_strengths": (
+                    ";".join(
+                        f"{item.evidence_type.value}:{item.strength_bucket}"
+                        for item in score.mechanisms
+                    )
+                    if score
+                    else None
+                ),
+                "outcome_strengths": (
+                    ";".join(
+                        f"{item.evidence_type.value}:{item.strength_bucket}/{item.persistence_bucket}"
+                        for item in score.outcome_strengths
+                    )
+                    if score
+                    else None
+                ),
                 "document_coverage": coverage,
                 "dcf_fair_value": fair_value,
                 "current_price": company.current_price,
@@ -83,6 +114,7 @@ def results_csv(result: UniverseRunResult) -> str:
                 "evidence_count": company.evidence_count,
                 "chunk_count": company.chunk_count,
                 "selected_chunk_count": company.selected_chunk_count,
+                "strength_context_chunk_count": company.strength_context_chunk_count,
                 "input_tokens": company.llm_usage.input_tokens,
                 "output_tokens": company.llm_usage.output_tokens,
                 "error": company.error,

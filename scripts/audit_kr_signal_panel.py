@@ -52,15 +52,23 @@ def _signal_expected(company: object) -> tuple[bool, Decimal | None, list[str]]:
         reasons.append(getattr(company, "status").value)
     if score is None:
         reasons.append("NO_MOAT_SCORE")
-    elif Decimal(str(score.economic_moat_score)) < Decimal("5"):
-        reasons.append("MOAT_BELOW_5")
+    else:
+        if Decimal(str(score.economic_moat_score)) < Decimal("5"):
+            reasons.append("MOAT_BELOW_5")
+        if score.audit_status.value == "FAIL":
+            reasons.append("MOAT_AUDIT_FAIL")
     if margin is None:
         reasons.append("NO_POSITIVE_DCF")
     elif margin < Decimal("0.20"):
         reasons.append("MARGIN_BELOW_20PCT")
     if dcf is not None and not dcf.screening_eligible:
         reasons.extend(dcf.screening_exclusion_reasons)
-    if score is not None and Decimal(str(score.model_confidence)) < Decimal("0.50"):
+    confidence = (
+        score.evidence_confidence
+        if score is not None and score.evidence_confidence is not None
+        else (score.model_confidence if score is not None else None)
+    )
+    if confidence is not None and Decimal(str(confidence)) < Decimal("0.50"):
         reasons.append("CONFIDENCE_BELOW_0_50")
     if score is not None and Decimal(str(score.document_coverage.moat_evidence_coverage or 0)) < Decimal("0.50"):
         reasons.append("MOAT_COVERAGE_BELOW_0_50")
@@ -228,6 +236,10 @@ def main() -> int:
                     call["model"]
                 ).startswith(("gpt-5.6-luna", "fixture")):
                     routing_errors.append(f"{as_of}/{ticker}: {call['task']} -> {call['model']}")
+                if call["task"] == "CONTEXTUAL_MOAT_STRENGTH" and not str(
+                    call["model"]
+                ).startswith(("gpt-5.6-luna", "fixture")):
+                    routing_errors.append(f"{as_of}/{ticker}: {call['task']} -> {call['model']}")
                 if call["task"] == "SECTION_SUMMARY" and not str(call["model"]).startswith(
                     ("gpt-5-nano", "fixture")
                 ):
@@ -328,7 +340,7 @@ def main() -> int:
     eligible_signal_count = sum(eligible_counts.values())
     provider_token_count = input_tokens + output_tokens
     audit = {
-        "schema_version": "moatrader-kr-signal-audit/2",
+        "schema_version": "moatrader-kr-signal-audit/3",
         "audited_at": datetime.now(timezone.utc).isoformat(),
         "workspace": str(workspace),
         "fresh_workspace_only": True,

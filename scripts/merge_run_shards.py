@@ -41,13 +41,18 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
         coverage_min, evidence_coverage = _coverage_values(company)
         ratio = price / fair_value if price is not None and fair_value and fair_value > 0 else None
         margin = Decimal(1) - ratio if ratio is not None else None
+        evidence_confidence = (
+            score.evidence_confidence
+            if score is not None and score.evidence_confidence is not None
+            else (score.model_confidence if score is not None else None)
+        )
         composite = None
         if score is not None and margin is not None and coverage_min is not None:
             composite = (
                 Decimal(str(score.economic_moat_score))
                 / Decimal(10)
                 * max(Decimal(0), margin)
-                * Decimal(str(score.model_confidence))
+                * Decimal(str(evidence_confidence))
                 * Decimal(str(coverage_min))
             )
         rows.append(
@@ -57,6 +62,8 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
                 "status": company.status.value,
                 "moat_score": score.economic_moat_score if score else None,
                 "durability": score.durability.value if score else None,
+                "audit_status": score.audit_status.value if score else None,
+                "evidence_confidence": evidence_confidence,
                 "model_confidence": score.model_confidence if score else None,
                 "document_coverage_min": coverage_min,
                 "evidence_coverage": evidence_coverage,
@@ -176,7 +183,8 @@ def main() -> None:
         for row in rankable
         if Decimal(str(row["moat_score"])) >= Decimal(5)
         and Decimal(str(row["margin_of_safety"])) >= Decimal("0.20")
-        and Decimal(str(row["model_confidence"])) >= Decimal("0.50")
+        and Decimal(str(row["evidence_confidence"])) >= Decimal("0.50")
+        and row["audit_status"] != "FAIL"
     ]
 
     store = RunStore(args.output)

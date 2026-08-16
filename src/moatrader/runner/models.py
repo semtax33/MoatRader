@@ -26,10 +26,12 @@ class UniverseRunConfig(ContractModel):
     summary_model: str = Field(default="gpt-5-nano", min_length=1)
     moat_model: str = Field(default="gpt-5.6-luna", min_length=1)
     summary_reasoning_effort: str = Field(default="low", min_length=1)
-    atomic_reasoning_effort: str = Field(default="low", min_length=1)
+    atomic_reasoning_effort: str = Field(default="medium", min_length=1)
     moat_reasoning_effort: str = Field(default="medium", min_length=1)
     context_tokens: int = Field(default=64_000, gt=8_000)
     prompt_reserve_tokens: int = Field(default=8_000, ge=1_000)
+    strength_context_tokens: int = Field(default=100_000, gt=16_000)
+    strength_prompt_reserve_tokens: int = Field(default=12_000, ge=4_000)
     max_output_tokens: int = Field(default=8_000, ge=1_000, le=100_000)
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
@@ -57,6 +59,10 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("as_of must be timezone-aware")
         if self.context_tokens <= self.prompt_reserve_tokens:
             raise ValueError("context_tokens must exceed prompt_reserve_tokens")
+        if self.strength_context_tokens <= self.strength_prompt_reserve_tokens:
+            raise ValueError(
+                "strength_context_tokens must exceed strength_prompt_reserve_tokens"
+            )
         if bool(self.experiment_id) != bool(self.llm_replay_cache_directory):
             raise ValueError(
                 "experiment_id and llm_replay_cache_directory must be configured together"
@@ -94,6 +100,7 @@ class CompanyRunResult(ContractModel):
     evidence_count: int = Field(default=0, ge=0)
     chunk_count: int = Field(default=0, ge=0)
     selected_chunk_count: int = Field(default=0, ge=0)
+    strength_context_chunk_count: int = Field(default=0, ge=0)
     moat_score: MoatScore | None = None
     dcf: DcfValuation | None = None
     current_price: Decimal | None = None

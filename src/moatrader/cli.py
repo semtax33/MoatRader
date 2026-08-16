@@ -301,6 +301,8 @@ def _moat_run(args: argparse.Namespace) -> int:
         moat_reasoning_effort=args.reasoning_effort or args.moat_reasoning_effort,
         context_tokens=args.context_tokens,
         prompt_reserve_tokens=args.prompt_reserve_tokens,
+        strength_context_tokens=args.strength_context_tokens,
+        strength_prompt_reserve_tokens=args.strength_prompt_reserve_tokens,
         max_output_tokens=args.max_output_tokens,
         minimum_text_retention=args.minimum_text_retention,
         minimum_numeric_retention=args.minimum_numeric_retention,
@@ -644,8 +646,8 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument(
         "--atomic-reasoning-effort",
         choices=["none", "low", "medium", "high", "xhigh", "max"],
-        default="low",
-        help="reasoning effort for atomic evidence classification (default: low)",
+        default="medium",
+        help="reasoning effort for audit-lane atomic classification (default: medium)",
     )
     moat_run.add_argument(
         "--moat-reasoning-effort",
@@ -655,6 +657,8 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument("--reasoning-effort", help=argparse.SUPPRESS)
     moat_run.add_argument("--context-tokens", type=int, default=64_000)
     moat_run.add_argument("--prompt-reserve-tokens", type=int, default=8_000)
+    moat_run.add_argument("--strength-context-tokens", type=int, default=100_000)
+    moat_run.add_argument("--strength-prompt-reserve-tokens", type=int, default=12_000)
     moat_run.add_argument("--max-output-tokens", type=int, default=8_000)
     moat_run.add_argument("--minimum-text-retention", type=float, default=0.95)
     moat_run.add_argument("--minimum-numeric-retention", type=float, default=0.99)

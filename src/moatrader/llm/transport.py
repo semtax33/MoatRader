@@ -83,7 +83,7 @@ class OpenAIResponsesTransport:
         summary_model: str = "gpt-5-nano",
         moat_model: str = "gpt-5.6-luna",
         summary_reasoning_effort: str = "low",
-        atomic_reasoning_effort: str = "low",
+        atomic_reasoning_effort: str = "medium",
         moat_reasoning_effort: str = "medium",
         max_output_tokens: int = 8_000,
         max_retries: int = 4,
@@ -213,7 +213,11 @@ class OpenAIResponsesTransport:
         raise RuntimeError(f"OpenAI request failed after {self.max_retries + 1} attempt(s): {last_error}") from last_error
 
     def _model_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_model
         return self.summary_model
 
@@ -398,7 +402,7 @@ class OpenAIResponsesTransport:
     def _effort_for(self, task: LLMTask) -> str:
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
             return self.atomic_reasoning_effort
-        if task == LLMTask.FINAL_MOAT_SCORING:
+        if task in {LLMTask.CONTEXTUAL_MOAT_STRENGTH, LLMTask.FINAL_MOAT_SCORING}:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
 
@@ -407,7 +411,9 @@ class OpenAIResponsesTransport:
         # company-level answer budget. Caps prevent malformed verbose outputs
         # while the configured global maximum remains a compatibility ceiling.
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
-            return min(self.max_output_tokens, 1_200)
+            return min(self.max_output_tokens, 2_000)
+        if task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
+            return min(self.max_output_tokens, 8_000)
         if task == LLMTask.SECTION_SUMMARY:
             return min(self.max_output_tokens, 3_000)
         return min(self.max_output_tokens, 4_000)

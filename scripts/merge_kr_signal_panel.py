@@ -167,6 +167,8 @@ def main() -> int:
                         "moat_percentile": "",
                         "value_percentile": "",
                         "moat_score": "",
+                        "audit_status": "",
+                        "evidence_confidence": "",
                         "model_confidence": "",
                         "document_coverage": "",
                         "dcf_fair_value": "",
@@ -183,20 +185,28 @@ def main() -> int:
             ratio = price / fair_value if price is not None and fair_value is not None and fair_value > 0 else None
             margin = Decimal(1) - ratio if ratio is not None else None
             coverage = moat_coverage(company)
+            evidence_confidence = (
+                score.evidence_confidence
+                if score is not None and score.evidence_confidence is not None
+                else (score.model_confidence if score is not None else None)
+            )
             reasons = []
             if company.status != CompanyRunStatus.COMPLETE:
                 reasons.append(company.status.value)
             if score is None:
                 reasons.append("NO_MOAT_SCORE")
-            elif Decimal(str(score.economic_moat_score)) < Decimal("5"):
-                reasons.append("MOAT_BELOW_5")
+            else:
+                if Decimal(str(score.economic_moat_score)) < Decimal("5"):
+                    reasons.append("MOAT_BELOW_5")
+                if score.audit_status.value == "FAIL":
+                    reasons.append("MOAT_AUDIT_FAIL")
             if ratio is None or margin is None:
                 reasons.append("NO_POSITIVE_DCF")
             elif margin < Decimal("0.20"):
                 reasons.append("MARGIN_BELOW_20PCT")
             if company.dcf is not None and not company.dcf.screening_eligible:
                 reasons.extend(company.dcf.screening_exclusion_reasons)
-            if score is not None and Decimal(str(score.model_confidence)) < Decimal("0.50"):
+            if evidence_confidence is not None and Decimal(str(evidence_confidence)) < Decimal("0.50"):
                 reasons.append("CONFIDENCE_BELOW_0_50")
             if score is not None and coverage < Decimal("0.50"):
                 reasons.append("MOAT_COVERAGE_BELOW_0_50")
@@ -217,6 +227,8 @@ def main() -> int:
                     "moat_percentile": "",
                     "value_percentile": "",
                     "moat_score": score.economic_moat_score if score else "",
+                    "audit_status": score.audit_status.value if score else "",
+                    "evidence_confidence": evidence_confidence if score else "",
                     "model_confidence": score.model_confidence if score else "",
                     "document_coverage": coverage if score else "",
                     "dcf_fair_value": fair_value or "",
@@ -288,7 +300,7 @@ def main() -> int:
         "date", "ticker", "issuer_name", "market", "size_bucket", "sector",
         "status", "signal_eligible", "eligibility_reason", "signal",
         "signal_rank", "moat_percentile", "value_percentile",
-        "moat_score", "model_confidence", "document_coverage",
+        "moat_score", "audit_status", "evidence_confidence", "model_confidence", "document_coverage",
         "dcf_fair_value", "current_price", "price_to_dcf", "margin_of_safety",
     ]
     output = args.output.resolve()
@@ -309,8 +321,8 @@ def main() -> int:
         )
     write_csv(output.with_name("signal-coverage.csv"), coverage_rows, list(coverage_rows[0]))
     manifest = {
-        "schema_version": "moatrader-moat-dcf-signal/2",
-        "signal_formula": "0.5 * cross_sectional_percentile(moat_score) + 0.5 * cross_sectional_percentile(margin_of_safety); confidence and MOAT coverage are eligibility gates",
+        "schema_version": "moatrader-moat-dcf-signal/3",
+        "signal_formula": "0.5 * cross_sectional_percentile(economic_moat_score) + 0.5 * cross_sectional_percentile(margin_of_safety); evidence_confidence, audit_status, and MOAT coverage are separate eligibility gates",
         "fallback_signal": None,
         "row_count": len(rows),
         "expected_row_count": len(tickers) * len(dates),

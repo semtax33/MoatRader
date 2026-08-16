@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from moatrader.evidence.models import EvidenceExtractionResult
+from moatrader.evidence.models import ContextualMoatAssessment, EvidenceExtractionResult
 from moatrader.evidence.models import MoatScore
 from moatrader.llm import LLMRequest, LLMTask, OpenAIResponsesTransport
+from moatrader.llm.contracts import _prompt_cache_key
 from moatrader.llm.transport import _canonical_json_object, _openai_compatible_schema
 
 
@@ -31,6 +32,27 @@ def test_canonical_json_object_recursively_sorts_keys() -> None:
     assert list(_canonical_json_object(value)) == ["a", "z"]
     assert list(_canonical_json_object(value)["a"]) == ["c", "d"]
     assert list(_canonical_json_object(value)["z"][0]) == ["a", "b"]
+
+
+def test_prompt_cache_key_is_stable_and_rate_partitioned() -> None:
+    first = _prompt_cache_key(
+        "atomic-v4", static_prefix="stable rubric", routing_identity="EVIDENCE-1"
+    )
+    repeated = _prompt_cache_key(
+        "atomic-v4", static_prefix="stable rubric", routing_identity="EVIDENCE-1"
+    )
+    routed = {
+        _prompt_cache_key(
+            "atomic-v4",
+            static_prefix="stable rubric",
+            routing_identity=f"EVIDENCE-{index}",
+        )
+        for index in range(128)
+    }
+
+    assert first == repeated
+    assert 1 < len(routed) <= 32
+    assert all(key.startswith("moatrader:atomic-v4:") for key in routed)
 
 
 def test_openai_transport_uses_responses_create_and_usage() -> None:
@@ -67,8 +89,8 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
     assert captured[0]["model"] == "gpt-5.6-luna"
     assert captured[0]["text"]["format"]["type"] == "json_schema"  # type: ignore[index]
     assert captured[0]["text"]["verbosity"] == "low"  # type: ignore[index]
-    assert captured[0]["reasoning"] == {"effort": "low"}
-    assert captured[0]["max_output_tokens"] == 1_200
+    assert captured[0]["reasoning"] == {"effort": "medium"}
+    assert captured[0]["max_output_tokens"] == 2_000
     assert captured[0]["prompt_cache_key"] == "moatrader:test"
     assert captured[0]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
     assert captured[0]["input"][0]["content"][0]["prompt_cache_breakpoint"] == {  # type: ignore[index]
@@ -116,6 +138,36 @@ def test_openai_transport_legacy_model_alias_routes_every_task_to_one_model() ->
     transport.execute(request, EvidenceExtractionResult)
 
     assert captured == ["fixture-model"]
+
+
+def test_contextual_strength_routes_to_luna_with_full_quality_budget() -> None:
+    captured: list[dict[str, object]] = []
+
+    class FakeResponses:
+        def create(self, **kwargs: object) -> object:
+            captured.append(kwargs)
+            return SimpleNamespace(
+                id="resp_strength",
+                model=kwargs["model"],
+                output_text='{"evidence_sufficiency":0,"durability_bucket":0}',
+                usage=None,
+            )
+
+    request = LLMRequest(
+        task=LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+        system="strength rubric",
+        user="broad context",
+        response_schema=ContextualMoatAssessment.model_json_schema(),
+        input_sha256="1" * 64,
+    )
+    result = OpenAIResponsesTransport(
+        client=SimpleNamespace(responses=FakeResponses())
+    ).execute(request, ContextualMoatAssessment)
+
+    assert captured[0]["model"] == "gpt-5.6-luna"
+    assert captured[0]["reasoning"] == {"effort": "medium"}
+    assert captured[0]["max_output_tokens"] == 8_000
+    assert result.parsed.mechanisms == []
 
 
 def test_openai_transport_recovers_literal_control_character_in_json_string() -> None:
