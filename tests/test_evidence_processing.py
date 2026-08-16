@@ -268,6 +268,134 @@ def test_validation_recovers_a_year_joined_to_an_ascii_section_label() -> None:
     assert [item.evidence_id for item in result.cards] == ["E1"]
 
 
+def test_validation_accepts_spaced_percent_and_iso_date_range() -> None:
+    source = "Contract value is 3.8 % of sales for 2025-03-17~2025-10-27."
+    card = _card(
+        "E1",
+        "The contract is 3.8% of sales and runs from 2025-03-17 to 2025-10-27.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = source
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown=source,
+        token_count=8,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
+def test_validation_does_not_treat_iso_date_day_as_a_signed_value() -> None:
+    source = "The contract ends on 2025-10-27."
+    card = _card("E1", "The contract declined by -27 units.", EvidenceDirection.NEUTRAL)
+    card.raw_quote = source
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown=source,
+        token_count=6,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert any("-27" in error for error in errors)
+    assert result.cards == []
+
+
+def test_validation_recovers_year_joined_to_comma_grouped_amount() -> None:
+    source = "Milestone amount $34,000,0002020년 5월과 11월에 수익을 인식했습니다."
+    card = _card(
+        "E1",
+        "The milestone revenue was recognized in May and November 2020.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = source
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown=source,
+        token_count=7,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
+def test_validation_recovers_dates_joined_to_adjacent_dates_and_section_number() -> None:
+    source = (
+        "2025.10.172023.04.062020.07.14 | "
+        "The contract was extended to 2027-08-193. Other matters"
+    )
+    card = _card(
+        "E1",
+        "The disclosure was amended on 2023.04.06 and the contract ends 2027-08-19.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = source
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown=source,
+        token_count=9,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
+def test_validation_expands_compact_bond_issue_enumeration() -> None:
+    source = (
+        "Debt ratios must remain below 550% (issue 42-2) and "
+        "600% (issue 43-1,2)."
+    )
+    card = _card(
+        "E1",
+        "Debt ratios must remain below 550% for issue 42-2 and 600% for "
+        "issues 43-1 and 43-2.",
+        EvidenceDirection.NEUTRAL,
+    )
+    card.raw_quote = source
+    result = EvidenceExtractionResult(chunk_id="C1", cards=[card])
+    chunk = SemanticChunk(
+        chunk_id="C1",
+        document_id="D1",
+        node_ids=["N1"],
+        chunk_type="paragraph",
+        markdown=source,
+        token_count=14,
+    )
+    bundle = SimpleNamespace(ast=SimpleNamespace(node_index=lambda: {"N1": object()}))
+
+    errors = validate_evidence_result(result, chunk, bundle)
+
+    assert errors == []
+    assert [item.evidence_id for item in result.cards] == ["E1"]
+
+
 def test_validation_rejects_a_card_without_verbatim_grounding() -> None:
     card = _card("E1", "Paraphrased claim.", EvidenceDirection.MOAT_POSITIVE)
     card.raw_quote = "Text that is not present"

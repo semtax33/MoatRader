@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from moatrader.evidence.models import EvidenceExtractionResult
 from moatrader.evidence.models import MoatScore
 from moatrader.llm import LLMRequest, LLMTask, OpenAIResponsesTransport
-from moatrader.llm.transport import _openai_compatible_schema
+from moatrader.llm.transport import _canonical_json_object, _openai_compatible_schema
 
 
 def test_openai_schema_removes_unsupported_lookaround_but_keeps_safe_patterns() -> None:
@@ -23,6 +23,14 @@ def test_openai_schema_removes_unsupported_lookaround_but_keeps_safe_patterns() 
     assert compatible["properties"]["ticker"]["pattern"] == r"^\d{6}$"
     assert "pattern" not in compatible["$defs"][0]
     assert schema["properties"]["decimal"]["pattern"]  # input is not mutated
+
+
+def test_canonical_json_object_recursively_sorts_keys() -> None:
+    value = {"z": [{"b": 2, "a": 1}], "a": {"d": 4, "c": 3}}
+
+    assert list(_canonical_json_object(value)) == ["a", "z"]
+    assert list(_canonical_json_object(value)["a"]) == ["c", "d"]
+    assert list(_canonical_json_object(value)["z"][0]) == ["a", "b"]
 
 
 def test_openai_transport_uses_responses_create_and_usage() -> None:
@@ -50,6 +58,7 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
         response_schema=EvidenceExtractionResult.model_json_schema(),
         input_sha256="0" * 64,
         prompt_cache_key="moatrader:test",
+        prompt_cache_breakpoint=True,
     )
     transport = OpenAIResponsesTransport(client=client)
 
@@ -58,10 +67,14 @@ def test_openai_transport_uses_responses_create_and_usage() -> None:
     assert captured[0]["model"] == "gpt-5.6-luna"
     assert captured[0]["text"]["format"]["type"] == "json_schema"  # type: ignore[index]
     assert captured[0]["text"]["verbosity"] == "low"  # type: ignore[index]
-    assert captured[0]["reasoning"] == {"effort": "medium"}
-    assert captured[0]["max_output_tokens"] == 2_000
+    assert captured[0]["reasoning"] == {"effort": "low"}
+    assert captured[0]["max_output_tokens"] == 1_200
     assert captured[0]["prompt_cache_key"] == "moatrader:test"
-    assert captured[0]["prompt_cache_options"] == {"mode": "explicit"}
+    assert captured[0]["prompt_cache_options"] == {"mode": "explicit", "ttl": "30m"}
+    assert captured[0]["input"][0]["content"][0]["prompt_cache_breakpoint"] == {  # type: ignore[index]
+        "mode": "explicit"
+    }
+    assert captured[0]["input"][1]["content"][0]["text"] == "user"  # type: ignore[index]
     assert captured[0]["store"] is False
     assert result.response_id == "resp_fixture"
     assert result.model == "gpt-5.6-luna-fixture"

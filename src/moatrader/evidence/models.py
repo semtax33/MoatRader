@@ -167,17 +167,20 @@ class AtomicEvidenceExtraction(ContractModel):
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    is_investment_relevant: bool = Field(default=False, alias="relevant")
-    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
-    direction: EvidenceDirection = EvidenceDirection.NEUTRAL
-    fact: str = "No investment-relevant evidence"
-    mechanism: list[str] = Field(default_factory=list)
-    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="scope")
-    segment: str | None = None
-    claim_subject: str = Field(default="company", alias="subject")
-    claim_predicate: str = Field(default="unspecified", alias="predicate")
-    claim_horizon: str | None = Field(default=None, alias="horizon")
-    claim_metric: str | None = Field(default=None, alias="metric")
+    # Single-letter API aliases cut both the repeated Structured Outputs schema
+    # and every generated atomic response. Internal/checkpoint field names stay
+    # descriptive through ``populate_by_name`` and normal ``model_dump``.
+    is_investment_relevant: bool = Field(default=False, alias="r")
+    evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="t")
+    direction: EvidenceDirection = Field(default=EvidenceDirection.NEUTRAL, alias="d")
+    fact: str = Field(default="No investment-relevant evidence", alias="f")
+    mechanism: list[str] = Field(default_factory=list, alias="m")
+    economic_scope: EconomicScope = Field(default=EconomicScope.COMPANY, alias="s")
+    segment: str | None = Field(default=None, alias="g")
+    claim_subject: str = Field(default="company", alias="u")
+    claim_predicate: str = Field(default="unspecified", alias="p")
+    claim_horizon: str | None = Field(default=None, alias="h")
+    claim_metric: str | None = Field(default=None, alias="x")
 
 
 class AtomicEvidenceJudgment(ContractModel):

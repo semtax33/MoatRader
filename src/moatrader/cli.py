@@ -297,6 +297,7 @@ def _moat_run(args: argparse.Namespace) -> int:
         summary_model=args.model or args.summary_model,
         moat_model=args.model or args.moat_model,
         summary_reasoning_effort=args.reasoning_effort or args.summary_reasoning_effort,
+        atomic_reasoning_effort=args.reasoning_effort or args.atomic_reasoning_effort,
         moat_reasoning_effort=args.reasoning_effort or args.moat_reasoning_effort,
         context_tokens=args.context_tokens,
         prompt_reserve_tokens=args.prompt_reserve_tokens,
@@ -362,6 +363,7 @@ def _moat_run(args: argparse.Namespace) -> int:
             summary_model=config.summary_model,
             moat_model=config.moat_model,
             summary_reasoning_effort=config.summary_reasoning_effort,
+            atomic_reasoning_effort=config.atomic_reasoning_effort,
             moat_reasoning_effort=config.moat_reasoning_effort,
             max_output_tokens=args.max_output_tokens,
             max_retries=args.api_retries,
@@ -638,6 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--summary-reasoning-effort",
         choices=["minimal", "low", "medium", "high"],
         default="low",
+    )
+    moat_run.add_argument(
+        "--atomic-reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        default="low",
+        help="reasoning effort for atomic evidence classification (default: low)",
     )
     moat_run.add_argument(
         "--moat-reasoning-effort",

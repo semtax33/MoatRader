@@ -69,15 +69,6 @@ def assess_parser_quality(
         if isinstance(node, TableNode)
         and (node.period is not None or re.search(r"20\d{2}", node.raw_text))
     }
-    section_has_explicit_unit_marker: dict[tuple[str, ...], bool] = {}
-    for item in bundle.ast.walk():
-        key = tuple(item.section_path)
-        has_marker = bool(
-            re.search(r"(?:\bunit\s*:|단위\s*:)", item.raw_text, re.IGNORECASE)
-        )
-        section_has_explicit_unit_marker[key] = (
-            section_has_explicit_unit_marker.get(key, False) or has_marker
-        )
     for node in bundle.ast.walk():
         if not isinstance(node, TableNode):
             continue
@@ -112,7 +103,6 @@ def assess_parser_quality(
         source_omitted_dart_summary_unit = (
             bundle.metadata.source_type == SourceType.DART
             and "요약재무" in section_text
-            and not section_has_explicit_unit_marker.get(tuple(node.section_path), False)
         )
         if financial_context and is_data_table and config.require_financial_table_semantics:
             if not nonempty_headers:

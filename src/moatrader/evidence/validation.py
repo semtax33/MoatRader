@@ -22,16 +22,29 @@ from moatrader.evidence.models import (
 from moatrader.semantic.chunker import SemanticChunk
 
 
+MOAT_COUNTEREVIDENCE_TYPES = STRUCTURAL_MOAT_TYPES | {
+    EvidenceType.COMPETITIVE_THREAT,
+    EvidenceType.CUSTOMER_CONCENTRATION,
+    EvidenceType.SUBSTITUTION_RISK,
+    EvidenceType.TECHNOLOGY_RISK,
+    EvidenceType.CAPITAL_INTENSITY,
+}
+
+
+def _is_moat_counterevidence(card: EvidenceCard) -> bool:
+    return (
+        card.direction == EvidenceDirection.MOAT_NEGATIVE
+        and card.evidence_type in MOAT_COUNTEREVIDENCE_TYPES
+        and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+    )
+
+
 def _number_tokens(value: str) -> set[str]:
     """Return normalized numeric tokens so commas/decimal zeroes compare."""
     result: set[str] = set()
-    for token in re.findall(
-        r"(?:\d{4}(?=년)|(?<![A-Za-z])[-+]?\d[\d,.]*)(?:%|배|개|명|원|년|월|일)?",
-        value,
-    ):
-        suffix_match = re.search(r"(%|배|개|명|원|년|월|일)$", token)
-        suffix = suffix_match.group(1) if suffix_match else ""
-        number = token[: -len(suffix)] if suffix else token
+    suffix_pattern = r"%|배|개|명|원|년|월|일"
+
+    def add(number: str, suffix: str = "") -> None:
         # The source token regex intentionally accepts decimal separators, but
         # that also captures sentence/table punctuation after a number (for
         # example ``2013.12.``).  Strip only trailing punctuation so an exact
@@ -52,6 +65,84 @@ def _number_tokens(value: str) -> set[str]:
             # comma or period cannot create a false ungrounded-number error.
             result.add(candidate + suffix)
             result.add(candidate)
+
+    # Treat ISO/dotted dates as one token before scanning ordinary numbers.
+    # Otherwise the hyphenated month/day fragments (for example ``-27`` in
+    # ``2025-10-27``) look like invented signed values in an otherwise fully
+    # grounded claim.
+    masked = list(value)
+    full_date_pattern = re.compile(
+        r"(?P<year>\d{4})[.-](?P<month>\d{1,2})[.-](?P<day>\d{1,2})"
+        r"(?=$|[^\d]|20\d{2}[.-]|[1-9]\.)"
+    )
+    for match in full_date_pattern.finditer(value):
+        year = match.group("year")
+        month = int(match.group("month"))
+        day = int(match.group("day"))
+        if not (1 <= month <= 12 and 1 <= day <= 31):
+            continue
+        canonical = f"{year}-{month:02d}-{day:02d}"
+        result.add(canonical)
+        result.add(year)
+        for index in range(match.start(), match.end()):
+            masked[index] = " "
+
+    # A source line may concatenate adjacent dates without whitespace, and a
+    # rendered table may concatenate a date with the next numbered heading:
+    # ``2025.10.172023.04.06`` and ``2027-08-193. 기타``.  Full dates above
+    # deliberately accept those two bounded continuations.  Parse remaining
+    # year-month forms only after the full-date spans have been removed.
+    partially_masked = "".join(masked)
+    partial_date_pattern = re.compile(
+        r"(?<!\d)(?P<year>\d{4})[.-](?P<month>\d{1,2})(?=$|[^\d])"
+    )
+    for match in partial_date_pattern.finditer(partially_masked):
+        year = match.group("year")
+        month = int(match.group("month"))
+        if not 1 <= month <= 12:
+            continue
+        result.add(f"{year}-{month:02d}")
+        result.add(year)
+        for index in range(match.start(), match.end()):
+            masked[index] = " "
+    remaining = "".join(masked)
+
+    # DART issue/series labels compact repeated suffixes, for example
+    # ``제43-1,2회`` means issues ``43-1`` and ``43-2``.  Treat the comma as
+    # an enumerator here; the generic amount parser would otherwise collapse
+    # ``1,2`` into the unrelated number ``12``.
+    enumerated_label_pattern = re.compile(
+        r"(?<!\d)(?P<series>\d+)-(?P<variants>\d+(?:,\d+)+)(?=$|\D)"
+    )
+    enumerated_masked = list(remaining)
+    for match in enumerated_label_pattern.finditer(remaining):
+        add(match.group("series"))
+        for variant in match.group("variants").split(","):
+            add(variant)
+        for index in range(match.start(), match.end()):
+            enumerated_masked[index] = " "
+    remaining = "".join(enumerated_masked)
+
+    # DART table linearization can concatenate an amount and the following
+    # year, e.g. ``$34,000,0002020년``.  Recover only this narrow, comma-grouped
+    # boundary instead of accepting arbitrary four-digit substrings in IDs or
+    # unseparated amounts.
+    for match in re.finditer(
+        r"\d{1,3}(?:,\d{3})+(?P<year>20\d{2})(?=\D|$)",
+        remaining,
+    ):
+        add(match.group("year"))
+
+    # A year immediately followed by the Korean year suffix remains grounded
+    # even when it is joined to an ASCII section label such as ``GOLF2016년``.
+    for match in re.finditer(r"(?P<year>\d{4})(?=\s*년)", remaining):
+        add(match.group("year"), "년")
+
+    number_pattern = re.compile(
+        rf"(?<![A-Za-z0-9])(?P<number>[-+]?\d[\d,]*(?:\.\d+)?)(?:\s*(?P<suffix>{suffix_pattern}))?"
+    )
+    for match in number_pattern.finditer(remaining):
+        add(match.group("number"), match.group("suffix") or "")
     return result
 
 
@@ -201,7 +292,11 @@ def validate_moat_score(score: MoatScore, evidence: list[EvidenceCard]) -> list[
             errors.append(
                 f"counterevidence {evidence_id} direction is {card.direction.value}, expected MOAT_NEGATIVE"
             )
-    available_negative = any(card.direction == EvidenceDirection.MOAT_NEGATIVE for card in evidence)
+        elif not _is_moat_counterevidence(card):
+            errors.append(
+                f"counterevidence {evidence_id} is outside the company/segment structural risk rubric"
+            )
+    available_negative = any(_is_moat_counterevidence(card) for card in evidence)
     if score.mechanisms and available_negative and not score.counterevidence_ids:
         errors.append("positive moat assessment must cite available counterevidence")
     if score.economic_moat_score > 0 and not score.mechanisms:
@@ -285,20 +380,11 @@ def derive_moat_score(
     else:
         base_score = 0.8 * strengths[0] + 0.2 * strengths[1]
 
-    counter_types = STRUCTURAL_MOAT_TYPES | {
-        EvidenceType.COMPETITIVE_THREAT,
-        EvidenceType.CUSTOMER_CONCENTRATION,
-        EvidenceType.SUBSTITUTION_RISK,
-        EvidenceType.TECHNOLOGY_RISK,
-        EvidenceType.CAPITAL_INTENSITY,
-    }
     counter_cards = sorted(
         (
             card
             for card in evidence
-            if card.direction == EvidenceDirection.MOAT_NEGATIVE
-            and card.evidence_type in counter_types
-            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+            if _is_moat_counterevidence(card)
         ),
         key=lambda card: (-_deterministic_card_quality(card), card.evidence_id),
     )

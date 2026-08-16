@@ -26,6 +26,7 @@ class UniverseRunConfig(ContractModel):
     summary_model: str = Field(default="gpt-5-nano", min_length=1)
     moat_model: str = Field(default="gpt-5.6-luna", min_length=1)
     summary_reasoning_effort: str = Field(default="low", min_length=1)
+    atomic_reasoning_effort: str = Field(default="low", min_length=1)
     moat_reasoning_effort: str = Field(default="medium", min_length=1)
     context_tokens: int = Field(default=64_000, gt=8_000)
     prompt_reserve_tokens: int = Field(default=8_000, ge=1_000)

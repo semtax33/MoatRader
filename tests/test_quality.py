@@ -123,3 +123,27 @@ def test_dart_summary_financial_table_preserves_unknown_source_omitted_unit() ->
         "preserves unknown unit because the source section omits unit context" in warning
         for warning in assessment.warnings
     )
+
+
+def test_dart_summary_unit_marker_for_later_table_does_not_fail_earlier_unknown_unit() -> None:
+    bundle = build_dart_bundle(
+        "<html><body><h1>1. 요약재무정보</h1>"
+        "<p>가. 요약 연결 재무정보</p>"
+        "<table><tr><th>구분</th><th>2026년 3월말</th></tr>"
+        "<tr><td>자산총계</td><td>2,781,388</td></tr>"
+        "<tr><td>부채총계</td><td>2,057,513</td></tr></table>"
+        "<p>나. 요약 별도재무정보</p><p>(단위 : 백만원)</p>"
+        "<table><tr><th>구분</th><th>2026년 3월말</th></tr>"
+        "<tr><td>자산총계</td><td>1,000</td></tr>"
+        "<tr><td>부채총계</td><td>500</td></tr></table>"
+        "</body></html>",
+        period_end="2026-03-31",
+    )
+
+    assessment = assess_parser_quality(bundle)
+
+    assert assessment.passed is True
+    assert any(
+        "preserves unknown unit because the source section omits unit context" in warning
+        for warning in assessment.warnings
+    )

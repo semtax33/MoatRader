@@ -44,6 +44,16 @@ def _openai_compatible_schema(value: Any) -> Any:
     return value
 
 
+def _canonical_json_object(value: Any) -> Any:
+    """Return a recursively key-sorted JSON value for byte-stable API input."""
+
+    if isinstance(value, dict):
+        return {key: _canonical_json_object(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_json_object(item) for item in value]
+    return value
+
+
 class TransportUsage(ContractModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
@@ -73,6 +83,7 @@ class OpenAIResponsesTransport:
         summary_model: str = "gpt-5-nano",
         moat_model: str = "gpt-5.6-luna",
         summary_reasoning_effort: str = "low",
+        atomic_reasoning_effort: str = "low",
         moat_reasoning_effort: str = "medium",
         max_output_tokens: int = 8_000,
         max_retries: int = 4,
@@ -88,10 +99,12 @@ class OpenAIResponsesTransport:
             moat_model = model
         if reasoning_effort is not None:
             summary_reasoning_effort = reasoning_effort
+            atomic_reasoning_effort = reasoning_effort
             moat_reasoning_effort = reasoning_effort
         self.summary_model = summary_model
         self.moat_model = moat_model
         self.summary_reasoning_effort = summary_reasoning_effort
+        self.atomic_reasoning_effort = atomic_reasoning_effort
         self.moat_reasoning_effort = moat_reasoning_effort
         self.max_output_tokens = max_output_tokens
         self.max_retries = max_retries
@@ -117,11 +130,20 @@ class OpenAIResponsesTransport:
                     from openai.lib._pydantic import to_strict_json_schema
                 except ImportError as exc:
                     raise RuntimeError("installed OpenAI SDK cannot build a strict response schema") from exc
+                static_content: dict[str, Any] = {
+                    "type": "input_text",
+                    "text": request.system,
+                }
+                if request_model.startswith("gpt-5.6") and request.prompt_cache_breakpoint:
+                    static_content["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 create_kwargs: dict[str, Any] = dict(
                     model=request_model,
                     input=[
-                        {"role": "system", "content": request.system},
-                        {"role": "user", "content": request.user},
+                        {"role": "system", "content": [static_content]},
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": request.user}],
+                        },
                     ],
                     text={
                         "verbosity": "low",
@@ -129,8 +151,10 @@ class OpenAIResponsesTransport:
                             "type": "json_schema",
                             "name": response_model.__name__,
                             "strict": True,
-                            "schema": _openai_compatible_schema(
-                                to_strict_json_schema(response_model)
+                            "schema": _canonical_json_object(
+                                _openai_compatible_schema(
+                                    to_strict_json_schema(response_model)
+                                )
                             ),
                         }
                     },
@@ -141,12 +165,13 @@ class OpenAIResponsesTransport:
                 if request.prompt_cache_key:
                     create_kwargs["prompt_cache_key"] = request.prompt_cache_key
                 if request_model.startswith("gpt-5.6"):
-                    # The stable atomic instruction block is below GPT-5.6's
-                    # 1,024-token cache minimum. Explicit-only mode with no
-                    # breakpoint prevents a cache write for every changing
-                    # source unit; exact unchanged units use the local replay
-                    # cache instead.
-                    create_kwargs["prompt_cache_options"] = {"mode": "explicit"}
+                    # Explicit-only mode prevents one-off company/source
+                    # suffixes from becoming paid cache writes. Prefixes below
+                    # GPT-5.6's 1,024-token minimum simply remain uncached.
+                    cache_options: dict[str, str] = {"mode": "explicit"}
+                    if request.prompt_cache_breakpoint:
+                        cache_options["ttl"] = request.prompt_cache_ttl
+                    create_kwargs["prompt_cache_options"] = cache_options
                 response = self.client.responses.create(**create_kwargs)
                 output_text = str(getattr(response, "output_text", "") or "")
                 if not output_text:
@@ -371,7 +396,9 @@ class OpenAIResponsesTransport:
                 return repair_json(candidate, return_objects=True)
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+            return self.atomic_reasoning_effort
+        if task == LLMTask.FINAL_MOAT_SCORING:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
 
@@ -380,7 +407,7 @@ class OpenAIResponsesTransport:
         # company-level answer budget. Caps prevent malformed verbose outputs
         # while the configured global maximum remains a compatibility ceiling.
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
-            return min(self.max_output_tokens, 2_000)
+            return min(self.max_output_tokens, 1_200)
         if task == LLMTask.SECTION_SUMMARY:
             return min(self.max_output_tokens, 3_000)
         return min(self.max_output_tokens, 4_000)

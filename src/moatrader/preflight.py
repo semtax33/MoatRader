@@ -14,6 +14,7 @@ EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
     "summary_reasoning_effort",
+    "atomic_reasoning_effort",
     "moat_reasoning_effort",
     "context_tokens",
     "prompt_reserve_tokens",
@@ -51,6 +52,13 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["compression_invariance_gate_required"] = True
     contract["metamorphic_gate_required"] = True
     contract["moat_model_snapshot_policy"] = "EXACT_ID_NO_LATEST_ALIAS"
+    contract["atomic_prompt_version"] = "atomic-evidence-classifier/3"
+    contract["atomic_api_schema"] = "single-letter-aliases/1"
+    contract["atomic_output_token_cap"] = min(config.max_output_tokens, 1_200)
+    contract["prompt_cache_mode"] = "explicit"
+    contract["prompt_cache_ttl"] = "30m"
+    contract["prompt_cache_breakpoint"] = "STATIC_SYSTEM_PREFIX_END"
+    contract["canonical_schema_serialization"] = True
     return contract
 
 

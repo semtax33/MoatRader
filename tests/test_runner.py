@@ -150,8 +150,13 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert compression["claim_jaccard"] == 1.0
     assert compression["counterevidence_recall"] == 1.0
     token_budget = json.loads((company_dir / "llm-token-budget.json").read_text(encoding="utf-8"))
+    assert token_budget["schema_version"] == "llm-token-budget/2"
     assert token_budget["schema_token_reduction_fraction"] > 0.5
     assert token_budget["estimated_schema_tokens_avoided"] > 0
+    assert token_budget["prompt_cache_mode"] == "explicit"
+    assert token_budget["prompt_cache_breakpoint_count"] == token_budget["atomic_request_count"]
+    assert token_budget["atomic_reasoning_effort"] == "low"
+    assert token_budget["atomic_max_output_tokens"] == 1_200
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None

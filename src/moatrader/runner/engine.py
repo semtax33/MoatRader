@@ -118,6 +118,7 @@ class MoatUniverseRunner:
                 summary_model=config.summary_model,
                 moat_model=config.moat_model,
                 summary_reasoning_effort=config.summary_reasoning_effort,
+                atomic_reasoning_effort=config.atomic_reasoning_effort,
                 moat_reasoning_effort=config.moat_reasoning_effort,
                 engine_version=RUNNER_VERSION,
             )
@@ -308,21 +309,31 @@ class MoatUniverseRunner:
             )
             minimal_schema_tokens = token_counter.count(minimal_schema_json)
             prior_schema_tokens = token_counter.count(prior_schema_json)
+            static_prefix_tokens = (
+                token_counter.count(evidence_requests[0].system + minimal_schema_json)
+                if evidence_requests
+                else 0
+            )
+            dynamic_suffix_tokens = sum(
+                token_counter.count(request.user) for request in evidence_requests
+            )
+            source_evidence_tokens = sum(
+                token_counter.count(chunk.markdown) for chunk in evidence_chunks
+            )
+            estimated_atomic_input_tokens = (
+                static_prefix_tokens * len(evidence_requests) + dynamic_suffix_tokens
+            )
             token_budget_audit = {
-                "schema_version": "llm-token-budget/1",
+                "schema_version": "llm-token-budget/2",
                 "atomic_request_count": len(evidence_requests),
-                "estimated_atomic_input_tokens": sum(
-                    token_counter.count(
-                        request.system
-                        + request.user
-                        + json.dumps(
-                            request.response_schema,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                    )
-                    for request in evidence_requests
+                "estimated_atomic_input_tokens": estimated_atomic_input_tokens,
+                "estimated_static_prefix_tokens_per_request": static_prefix_tokens,
+                "estimated_dynamic_suffix_tokens_total": dynamic_suffix_tokens,
+                "estimated_source_evidence_tokens_total": source_evidence_tokens,
+                "estimated_useful_source_token_ratio": (
+                    source_evidence_tokens / estimated_atomic_input_tokens
+                    if estimated_atomic_input_tokens
+                    else 0.0
                 ),
                 "minimal_atomic_schema_tokens": minimal_schema_tokens,
                 "prior_full_atomic_schema_tokens": prior_schema_tokens,
@@ -335,8 +346,22 @@ class MoatUniverseRunner:
                     0,
                     (prior_schema_tokens - minimal_schema_tokens) * len(evidence_requests),
                 ),
-                "atomic_max_output_tokens": min(self.config.max_output_tokens, 2_000),
+                "atomic_reasoning_effort": self.config.atomic_reasoning_effort,
+                "atomic_max_output_tokens": min(self.config.max_output_tokens, 1_200),
+                "canonical_schema_serialization": True,
+                "prompt_cache_mode": "explicit",
+                "prompt_cache_ttl": "30m",
+                "prompt_cache_breakpoint_count": sum(
+                    request.prompt_cache_breakpoint for request in evidence_requests
+                ),
+                "prompt_cache_minimum_prefix_tokens": 1_024,
+                "estimated_prefix_cache_eligible": static_prefix_tokens >= 1_024,
+                "cache_eligibility_note": (
+                    "heuristic only; provider-rendered prefix length controls eligibility"
+                ),
+                "context_strategy": "STATIC_INSTRUCTIONS_PLUS_CURRENT_ATOMIC_DELTA",
                 "exact_usage_source": "llm-calls.jsonl provider response usage",
+                "exact_counting_endpoint": "POST /v1/responses/input_tokens",
             }
             self.store.write_json(company_dir / "llm-token-budget.json", token_budget_audit)
             if self.config.dry_run:
@@ -1080,7 +1105,14 @@ class MoatUniverseRunner:
             raw_response_sha256 = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
             normalized_output_sha256 = hashlib.sha256(normalized_output.encode("utf-8")).hexdigest()
             raw_path = company_dir / "llm-raw" / (
-                stable_id("LLM", current.task.value, current.input_sha256, attempt) + ".json"
+                stable_id(
+                    "LLM",
+                    current.task.value,
+                    current.input_sha256,
+                    attempt,
+                    raw_response_sha256,
+                )
+                + ".json"
             )
             self.store.write_json(
                 raw_path,
@@ -1476,6 +1508,7 @@ class MoatUniverseRunner:
                     "summary_model": self.config.summary_model,
                     "moat_model": self.config.moat_model,
                     "summary_reasoning_effort": self.config.summary_reasoning_effort,
+                    "atomic_reasoning_effort": self.config.atomic_reasoning_effort,
                     "moat_reasoning_effort": self.config.moat_reasoning_effort,
                     "context_tokens": self.config.context_tokens,
                     "prompt_reserve_tokens": self.config.prompt_reserve_tokens,

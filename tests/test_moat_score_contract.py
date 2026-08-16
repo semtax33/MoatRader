@@ -80,6 +80,30 @@ def test_score_requires_positive_direction_and_negative_counterevidence() -> Non
     assert any("expected MOAT_NEGATIVE" in error for error in errors)
 
 
+def test_industry_negative_is_not_company_counterevidence() -> None:
+    positive = _card("E1", EvidenceType.SWITCHING_COST, EvidenceDirection.MOAT_POSITIVE)
+    industry_negative = _card(
+        "E2",
+        EvidenceType.COMPETITIVE_THREAT,
+        EvidenceDirection.MOAT_NEGATIVE,
+    ).model_copy(update={"economic_scope": EconomicScope.INDUSTRY})
+    score = _score(evidence_type=EvidenceType.SWITCHING_COST, evidence_ids=["E1"])
+
+    assert validate_moat_score(score, [positive, industry_negative]) == []
+
+
+def test_company_negative_must_be_cited_as_counterevidence() -> None:
+    cards = [
+        _card("E1", EvidenceType.SWITCHING_COST, EvidenceDirection.MOAT_POSITIVE),
+        _card("E2", EvidenceType.COMPETITIVE_THREAT, EvidenceDirection.MOAT_NEGATIVE),
+    ]
+    score = _score(evidence_type=EvidenceType.SWITCHING_COST, evidence_ids=["E1"])
+
+    errors = validate_moat_score(score, cards)
+
+    assert "positive moat assessment must cite available counterevidence" in errors
+
+
 def test_published_score_ignores_llm_numeric_score_and_durability() -> None:
     cards = [_card("E1", EvidenceType.SWITCHING_COST, EvidenceDirection.MOAT_POSITIVE)]
     proposed = _score(
