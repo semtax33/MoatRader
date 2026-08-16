@@ -145,7 +145,9 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
     assert company.moat_score.economic_moat_score == 3.75
-    assert company.moat_score.economic_moat_rank_score == 5.625
+    assert company.moat_score.rank_refinement_status.value == "STABLE_COMPONENTS"
+    assert company.moat_score.rank_refinement is not None
+    assert company.moat_score.rank_refinement.mechanism_component == 2
     assert company.moat_score.llm_proposed_score is None
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
@@ -164,9 +166,16 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     public_strength = json.loads(
         (company_dir / "contextual-moat-assessment.json").read_text(encoding="utf-8")
     )
+    structural_strength = json.loads(
+        (company_dir / "contextual-moat-assessment-structural.json").read_text(
+            encoding="utf-8"
+        )
+    )
     assert raw_strength["mechanisms"][0]["strength_bucket"] == 3
+    assert structural_strength["mechanisms"][0]["strength_bucket"] == 3
     assert public_strength["mechanisms"][0]["strength_bucket"] == 2
-    assert (company_dir / "contextual-moat-rank-field-repair.json").is_file()
+    assert (company_dir / "contextual-moat-structural-repair.json").is_file()
+    assert (company_dir / "contextual-moat-ordinal-calibration.json").is_file()
     assert (company_dir / "section-summary-manifest.json").is_file()
     assert (company_dir / "llm-token-budget.json").is_file()
     assert (company_dir / "run-manifest.json").is_file()

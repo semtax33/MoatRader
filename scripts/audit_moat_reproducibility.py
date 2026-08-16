@@ -49,6 +49,38 @@ def _strength_signature(company: object) -> tuple[object, ...]:
             for item in score.mechanisms
         )
     )
+
+
+def _stable_moat_rank_keys(companies: list[object]) -> list[tuple[float, ...]]:
+    complete_by_public: dict[float, bool] = {}
+    for company in companies:
+        score = company.moat_score
+        public = float(score.economic_moat_score)
+        stable = bool(
+            score.score_eligible
+            and score.rank_refinement is not None
+            and score.rank_refinement_status is not None
+            and score.rank_refinement_status.value == "STABLE_COMPONENTS"
+        )
+        complete_by_public[public] = complete_by_public.get(public, True) and stable
+    keys = []
+    for company in companies:
+        score = company.moat_score
+        public = float(score.economic_moat_score)
+        refinement = score.rank_refinement
+        if complete_by_public[public] and refinement is not None:
+            keys.append(
+                (
+                    public,
+                    float(refinement.mechanism_component),
+                    float(refinement.outcome_component),
+                    float(refinement.durability_component),
+                    -float(refinement.counter_component),
+                )
+            )
+        else:
+            keys.append((public,))
+    return keys
     outcomes = tuple(
         sorted(
             (
@@ -100,6 +132,11 @@ def compare_runs(
     rank_correlation = spearman(before_scores, after_scores)
     if rank_correlation is None and all(delta == 0 for delta in deltas):
         rank_correlation = 1.0
+    before_rank_keys = _stable_moat_rank_keys([before[ticker] for ticker in common])
+    after_rank_keys = _stable_moat_rank_keys([after[ticker] for ticker in common])
+    rank_key_correlation = spearman(before_rank_keys, after_rank_keys)
+    if rank_key_correlation is None and before_rank_keys == after_rank_keys:
+        rank_key_correlation = 1.0
     jaccards = [
         _jaccard(_evidence_ids(before[ticker]), _evidence_ids(after[ticker])) for ticker in common
     ]
@@ -119,6 +156,11 @@ def compare_runs(
     if rank_correlation is None or rank_correlation < minimum_score_spearman:
         failures.append(
             f"score Spearman {rank_correlation!r} is below {minimum_score_spearman:.3f}"
+        )
+    if rank_key_correlation is None or rank_key_correlation < minimum_score_spearman:
+        failures.append(
+            f"rank-key Spearman {rank_key_correlation!r} is below "
+            f"{minimum_score_spearman:.3f}"
         )
     median_delta = statistics.median(deltas)
     largest_delta = max(deltas)
@@ -158,6 +200,8 @@ def compare_runs(
             "baseline_score": before_scores[index],
             "candidate_score": after_scores[index],
             "absolute_score_delta": deltas[index],
+            "baseline_rank_key": before_rank_keys[index],
+            "candidate_rank_key": after_rank_keys[index],
             "evidence_jaccard": jaccards[index],
             "claim_jaccard": claim_jaccards[index],
             "context_jaccard": context_jaccards[index],
@@ -166,13 +210,14 @@ def compare_runs(
         for index, ticker in enumerate(common)
     ]
     return {
-        "schema_version": "moatrader-moat-reproducibility/3",
+        "schema_version": "moatrader-moat-reproducibility/4",
         "baseline_run_id": baseline.run_id,
         "candidate_run_id": candidate.run_id,
         "common_company_count": len(common),
         "missing_tickers": missing,
         "added_tickers": added,
         "score_spearman": rank_correlation,
+        "rank_key_spearman": rank_key_correlation,
         "median_absolute_score_delta": median_delta,
         "maximum_absolute_score_delta": largest_delta,
         "mean_evidence_jaccard": mean_jaccard,

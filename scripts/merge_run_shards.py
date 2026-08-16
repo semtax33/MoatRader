@@ -50,12 +50,11 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
         if (
             score is not None
             and score.score_eligible
-            and score.economic_moat_rank_score is not None
             and margin is not None
             and coverage_min is not None
         ):
             composite = (
-                Decimal(str(score.economic_moat_rank_score))
+                Decimal(str(score.economic_moat_score))
                 / Decimal(10)
                 * max(Decimal(0), margin)
                 * Decimal(str(evidence_confidence))
@@ -67,7 +66,31 @@ def _detail_rows(result: UniverseRunResult) -> list[dict[str, object]]:
                 "issuer_name": company.issuer_name,
                 "status": company.status.value,
                 "moat_score": score.economic_moat_score if score else None,
-                "moat_rank_score": score.economic_moat_rank_score if score else None,
+                "rank_refinement_status": (
+                    score.rank_refinement_status.value
+                    if score and score.rank_refinement_status
+                    else None
+                ),
+                "rank_mechanism_component": (
+                    score.rank_refinement.mechanism_component
+                    if score and score.rank_refinement
+                    else None
+                ),
+                "rank_outcome_component": (
+                    score.rank_refinement.outcome_component
+                    if score and score.rank_refinement
+                    else None
+                ),
+                "rank_durability_component": (
+                    score.rank_refinement.durability_component
+                    if score and score.rank_refinement
+                    else None
+                ),
+                "rank_counter_component": (
+                    score.rank_refinement.counter_component
+                    if score and score.rank_refinement
+                    else None
+                ),
                 "durability": score.durability.value if score else None,
                 "audit_status": score.audit_status.value if score else None,
                 "score_eligible": score.score_eligible if score else None,

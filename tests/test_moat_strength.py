@@ -21,10 +21,12 @@ from moatrader.evidence.models import (
 from moatrader.evidence.atomic import select_context_cited_atomic_units
 from moatrader.evidence.validation import (
     build_candidate_manifest,
-    derive_audited_moat_rank_score,
     derive_audited_moat_score,
+    derive_rank_refinement,
+    derive_raw_ordinal_shadow_score,
+    calibrate_contextual_moat_ordinals,
     normalize_contextual_moat_assessment,
-    normalize_contextual_moat_rank_assessment,
+    repair_contextual_moat_structure,
     reconcile_context_and_claims,
     validate_contextual_moat_assessment,
 )
@@ -228,7 +230,7 @@ def test_contextual_reference_contract_repairs_unknown_ref_number_and_duplicate(
     assert report["action_count"] >= 3
 
 
-def test_rank_normalization_preserves_raw_ordinals_and_conservative_merge() -> None:
+def test_structural_repair_preserves_ordinals_before_public_calibration() -> None:
     chunk = _chunk("C1", "Customers sign five-year contracts.")
     raw = ContextualMoatAssessment(
         evidence_sufficiency=4,
@@ -254,19 +256,20 @@ def test_rank_normalization_preserves_raw_ordinals_and_conservative_merge() -> N
         ],
     )
 
-    public, _ = normalize_contextual_moat_assessment(raw, [_reference(chunk)])
-    rank_input, report = normalize_contextual_moat_rank_assessment(
+    structural, report = repair_contextual_moat_structure(
         raw, [_reference(chunk)]
     )
+    public, calibration = calibrate_contextual_moat_ordinals(structural)
 
     assert public.mechanisms[0].strength_bucket == 2
-    assert rank_input.mechanisms[0].strength_bucket == 2
-    assert rank_input.mechanisms[0].scope_materiality_bucket == 3
-    assert rank_input.mechanisms[0].durability_bucket == 3
-    assert report["schema_version"] == "contextual-rank-field-repair/1"
+    assert structural.mechanisms[0].strength_bucket == 2
+    assert structural.mechanisms[0].scope_materiality_bucket == 3
+    assert structural.mechanisms[0].durability_bucket == 3
+    assert report["schema_version"] == "contextual-structural-repair/1"
+    assert calibration["schema_version"] == "contextual-ordinal-calibration/1"
 
 
-def test_rank_score_restores_raw_resolution_after_reconciliation() -> None:
+def test_raw_shadow_is_separate_from_stable_public_component_refinement() -> None:
     chunk = _chunk("C1", "Customers sign five-year contracts.")
     raw = ContextualMoatAssessment(
         evidence_sufficiency=4,
@@ -283,7 +286,7 @@ def test_rank_score_restores_raw_resolution_after_reconciliation() -> None:
         ],
     )
     public, _ = normalize_contextual_moat_assessment(raw, [_reference(chunk)])
-    rank_input, _ = normalize_contextual_moat_rank_assessment(raw, [_reference(chunk)])
+    structural, _ = repair_contextual_moat_structure(raw, [_reference(chunk)])
     reconciled = reconcile_context_and_claims(
         public,
         [_positive_card()],
@@ -301,17 +304,29 @@ def test_rank_score_restores_raw_resolution_after_reconciliation() -> None:
         document_coverage=CoverageMetrics(moat_evidence_coverage=1.0),
     )
 
-    rank_score = derive_audited_moat_rank_score(
-        rank_input,
+    raw_shadow = derive_raw_ordinal_shadow_score(
+        structural,
         reconciled,
         score_eligible=public_score.score_eligible,
     )
+    refinement, status = derive_rank_refinement(
+        reconciled, score_eligible=public_score.score_eligible
+    )
 
     assert public_score.economic_moat_score == 3.75
-    assert rank_score == 5.625
-    assert derive_audited_moat_rank_score(
-        rank_input, reconciled, score_eligible=False
+    assert raw_shadow == 5.625
+    assert status.value == "STABLE_COMPONENTS"
+    assert refinement is not None
+    assert refinement.mechanism_component == 2
+    assert refinement.durability_component == 1
+    assert derive_raw_ordinal_shadow_score(
+        structural, reconciled, score_eligible=False
     ) is None
+    no_refinement, ineligible_status = derive_rank_refinement(
+        reconciled, score_eligible=False
+    )
+    assert no_refinement is None
+    assert ineligible_status.value == "INELIGIBLE"
 
 
 def test_contextual_mechanism_requires_matching_atomic_claim() -> None:

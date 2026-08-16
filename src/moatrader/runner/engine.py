@@ -41,12 +41,13 @@ from moatrader.evidence.models import (
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
     build_candidate_manifest,
-    derive_audited_moat_rank_score,
     derive_audited_moat_score,
+    derive_rank_refinement,
     reconcile_context_and_claims,
+    calibrate_contextual_moat_ordinals,
     normalize_candidate_atomic_audit,
     normalize_contextual_moat_assessment,
-    normalize_contextual_moat_rank_assessment,
+    repair_contextual_moat_structure,
     validate_contextual_moat_assessment,
     validate_evidence_result,
     validate_moat_score,
@@ -108,7 +109,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.9.2"
+RUNNER_VERSION = "0.9.3"
 
 
 class MoatUniverseRunner:
@@ -504,16 +505,29 @@ class MoatUniverseRunner:
                     raw_strength_assessment_path,
                     raw_strength_assessment,
                 )
-            strength_assessment, strength_repair = normalize_contextual_moat_assessment(
-                raw_strength_assessment,
-                strength_context.references,
-            )
-            rank_strength_assessment, rank_strength_repair = (
-                normalize_contextual_moat_rank_assessment(
+            structural_strength_assessment, structural_strength_repair = (
+                repair_contextual_moat_structure(
                     raw_strength_assessment,
                     strength_context.references,
                 )
             )
+            strength_assessment, ordinal_calibration = (
+                calibrate_contextual_moat_ordinals(
+                    structural_strength_assessment,
+                )
+            )
+            strength_repair_actions = [
+                *structural_strength_repair["actions"],
+                *ordinal_calibration["actions"],
+            ]
+            strength_repair = {
+                "schema_version": "contextual-field-repair/2",
+                "strategy": "STRUCTURAL_REPAIR_THEN_PUBLIC_ORDINAL_CALIBRATION",
+                "action_count": len(strength_repair_actions),
+                "actions": strength_repair_actions,
+                "structural_repair": structural_strength_repair,
+                "ordinal_calibration": ordinal_calibration,
+            }
             strength_errors = validate_contextual_moat_assessment(
                 strength_assessment,
                 strength_context.references,
@@ -525,12 +539,20 @@ class MoatUniverseRunner:
                 )
             self.store.write_json(strength_assessment_path, strength_assessment)
             self.store.write_json(
+                company_dir / "contextual-moat-assessment-structural.json",
+                structural_strength_assessment,
+            )
+            self.store.write_json(
                 company_dir / "contextual-moat-field-repair.json",
                 strength_repair,
             )
             self.store.write_json(
-                company_dir / "contextual-moat-rank-field-repair.json",
-                rank_strength_repair,
+                company_dir / "contextual-moat-structural-repair.json",
+                structural_strength_repair,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-ordinal-calibration.json",
+                ordinal_calibration,
             )
             candidate_manifest = build_candidate_manifest(strength_assessment)
             self.store.write_json(
@@ -786,13 +808,13 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "SCORING")
             score_path = company_dir / "moat-score.json"
             reducer_payload = {
-                "schema_version": "dual-lane-strength-reducer/3",
+                "schema_version": "dual-lane-strength-reducer/4",
                 "issuer_id": dossier.issuer_id,
                 "as_of": self.config.as_of.date().isoformat(),
                 "contextual_assessment": strength_assessment.model_dump(
                     mode="json", exclude_none=True
                 ),
-                "raw_rank_assessment": rank_strength_assessment.model_dump(
+                "structurally_repaired_assessment": structural_strength_assessment.model_dump(
                     mode="json", exclude_none=True
                 ),
                 "candidate_manifest": [
@@ -839,13 +861,15 @@ class MoatUniverseRunner:
                     as_of=self.config.as_of.date(),
                     document_coverage=score_coverage,
                 )
-            rank_score = derive_audited_moat_rank_score(
-                rank_strength_assessment,
+            rank_refinement, rank_refinement_status = derive_rank_refinement(
                 reconciled,
                 score_eligible=score.score_eligible,
             )
             score = score.model_copy(
-                update={"economic_moat_rank_score": rank_score}
+                update={
+                    "rank_refinement": rank_refinement,
+                    "rank_refinement_status": rank_refinement_status,
+                }
             )
             self.store.write_json(score_path, score)
 
@@ -1817,9 +1841,10 @@ class MoatUniverseRunner:
                 MoatStrengthContextBuilder.build,
                 build_financial_feature_vector,
                 normalize_contextual_moat_assessment,
-                normalize_contextual_moat_rank_assessment,
+                repair_contextual_moat_structure,
+                calibrate_contextual_moat_ordinals,
                 reconcile_context_and_claims,
-                derive_audited_moat_rank_score,
+                derive_rank_refinement,
                 derive_audited_moat_score,
             )
         )

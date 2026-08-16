@@ -15,6 +15,8 @@ from moatrader.evidence.models import (
     EvidenceCard,
     EvidenceDirection,
     EvidenceType,
+    MoatRankRefinement,
+    MoatRankRefinementStatus,
 )
 from moatrader.financial import FinancialSnapshot, FinancialSnapshotBuilder
 from moatrader.financial.snapshot import DerivedMetric, FinancialPoint, FinancialSeries
@@ -162,7 +164,6 @@ def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():
         "current_price": Decimal("60"),
         "dcf_fair_value": Decimal("100"),
         "moat_score": Decimal("8"),
-        "moat_rank_score": Decimal("8"),
         "model_confidence": Decimal("0.8"),
         "document_coverage": Decimal("0.9"),
         "valuation_as_of": timestamp,
@@ -177,13 +178,12 @@ def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():
                 **common,
                 "current_price": Decimal("50"),
                 "moat_score": Decimal("7"),
-                "moat_rank_score": Decimal("7"),
             },
         ),
         CandidateInput(
             issuer_id="3",
             ticker="LOW",
-            **{**common, "moat_score": Decimal("3"), "moat_rank_score": Decimal("9")},
+            **{**common, "moat_score": Decimal("3")},
         ),
     ]
     ranked = ValueMoatRanker().rank(candidates)
@@ -191,7 +191,7 @@ def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():
     assert all(item.price_to_dcf < 1 for item in ranked)
 
 
-def test_value_moat_ranker_uses_rank_score_but_public_score_for_gate() -> None:
+def test_value_moat_ranker_refines_only_within_equal_public_score() -> None:
     timestamp = datetime(2026, 8, 13, tzinfo=timezone.utc)
     common = {
         "current_price": Decimal("60"),
@@ -202,27 +202,84 @@ def test_value_moat_ranker_uses_rank_score_but_public_score_for_gate() -> None:
         "valuation_as_of": timestamp,
         "price_as_of": timestamp,
     }
+    def refinement(mechanism: float) -> dict[str, object]:
+        return {
+            "rank_refinement": MoatRankRefinement(
+                mechanism_component=mechanism,
+                outcome_component=0,
+                durability_component=1,
+                counter_component=1,
+            ),
+            "rank_refinement_status": MoatRankRefinementStatus.STABLE_COMPONENTS,
+        }
+
     ranked = ValueMoatRanker().rank(
         [
             CandidateInput(
-                issuer_id="1", ticker="RAW_HIGH", moat_rank_score=Decimal("8"), **common
+                issuer_id="1", ticker="REFINE_HIGH", **refinement(4), **common
             ),
             CandidateInput(
-                issuer_id="2", ticker="RAW_LOW", moat_rank_score=Decimal("4"), **common
+                issuer_id="2", ticker="REFINE_LOW", **refinement(2), **common
+            ),
+            CandidateInput(
+                issuer_id="4",
+                ticker="PUBLIC_HIGH",
+                moat_score=Decimal("7"),
+                **refinement(0),
+                **{key: value for key, value in common.items() if key != "moat_score"},
             ),
             CandidateInput(
                 issuer_id="3",
                 ticker="PUBLIC_FAIL",
                 moat_score=Decimal("4"),
-                moat_rank_score=Decimal("10"),
+                **refinement(4),
                 **{key: value for key, value in common.items() if key != "moat_score"},
             ),
         ]
     )
 
-    assert [item.ticker for item in ranked] == ["RAW_HIGH", "RAW_LOW"]
-    assert ranked[0].moat_percentile > ranked[1].moat_percentile
-    assert ranked[0].moat_score == ranked[1].moat_score == Decimal("6")
+    assert [item.ticker for item in ranked] == [
+        "PUBLIC_HIGH",
+        "REFINE_HIGH",
+        "REFINE_LOW",
+    ]
+    assert ranked[0].moat_rank_key[0] > ranked[1].moat_rank_key[0]
+    assert ranked[1].moat_percentile > ranked[2].moat_percentile
+    assert ranked[1].moat_score == ranked[2].moat_score == Decimal("6")
+
+
+def test_value_moat_ranker_preserves_tie_when_refinement_is_incomplete() -> None:
+    timestamp = datetime(2026, 8, 13, tzinfo=timezone.utc)
+    common = {
+        "current_price": Decimal("60"),
+        "dcf_fair_value": Decimal("100"),
+        "moat_score": Decimal("6"),
+        "model_confidence": Decimal("0.8"),
+        "document_coverage": Decimal("0.9"),
+        "valuation_as_of": timestamp,
+        "price_as_of": timestamp,
+    }
+    stable = MoatRankRefinement(
+        mechanism_component=4,
+        outcome_component=0,
+        durability_component=1,
+        counter_component=1,
+    )
+    ranked = ValueMoatRanker().rank(
+        [
+            CandidateInput(
+                issuer_id="1",
+                ticker="HAS_COMPONENTS",
+                rank_refinement=stable,
+                rank_refinement_status=MoatRankRefinementStatus.STABLE_COMPONENTS,
+                **common,
+            ),
+            CandidateInput(issuer_id="2", ticker="PUBLIC_ONLY", **common),
+        ]
+    )
+
+    assert ranked[0].moat_percentile == ranked[1].moat_percentile
+    assert ranked[0].moat_rank_key == ranked[1].moat_rank_key == (Decimal("6"),)
 
 
 def test_allocator_treats_unretrieved_chunks_as_low_relevance() -> None:

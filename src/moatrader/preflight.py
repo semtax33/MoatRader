@@ -9,7 +9,7 @@ from moatrader.runner.models import UniverseRunConfig
 from moatrader.evidence.atomic import ATOMIC_RUBRIC_VERSION, ATOMIC_SEGMENTATION_VERSION
 
 
-PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/4"
+PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/5"
 EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
@@ -47,7 +47,9 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["evidence_ledger_enabled"] = bool(config.evidence_ledger_directory)
     contract["atomic_segmentation_version"] = ATOMIC_SEGMENTATION_VERSION
     contract["atomic_rubric_version"] = ATOMIC_RUBRIC_VERSION
-    contract["scoring_reducer_version"] = "dual-lane-strength-reducer/1"
+    contract["scoring_reducer_version"] = "dual-lane-strength-reducer/2"
+    contract["moat_rank_strategy"] = "PUBLIC_SCORE_THEN_STABLE_COMPONENTS_LEXICOGRAPHIC_V1"
+    contract["raw_ordinal_global_rank_allowed"] = False
     contract["moat_architecture"] = "ATOMIC_AUDIT_PLUS_CONTEXTUAL_STRENGTH"
     contract["contextual_strength_required_for_every_company"] = True
     contract["strength_context_compression_ablation_enabled"] = False

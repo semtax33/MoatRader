@@ -789,14 +789,32 @@ class CoverageMetrics(ContractModel):
     moat_evidence_coverage: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class MoatRankRefinementStatus(StrEnum):
+    """Whether a score may use a stable within-public-bucket refinement."""
+
+    STABLE_COMPONENTS = "STABLE_COMPONENTS"
+    PUBLIC_SCORE_ONLY = "PUBLIC_SCORE_ONLY"
+    INELIGIBLE = "INELIGIBLE"
+
+
+class MoatRankRefinement(ContractModel):
+    """Repeat-stable public reducer components used only after public score."""
+
+    mechanism_component: float = Field(ge=0.0, le=4.0)
+    outcome_component: float = Field(ge=0.0, le=2.0)
+    durability_component: float = Field(ge=0.0, le=2.0)
+    counter_component: float = Field(ge=0.0, le=2.0)
+    method: str = "PUBLIC_COMPONENT_LEXICOGRAPHIC_V1"
+
+
 class MoatScore(ContractModel):
     issuer_id: str | None = None
     as_of: date
     economic_moat_score: float = Field(ge=0.0, le=10.0)
-    # Public/gating score above intentionally uses robust ordinal calibration.
-    # This second score preserves the validated raw 0-4 ordinals for
-    # cross-sectional ranking only.  Legacy checkpoints may omit it.
-    economic_moat_rank_score: float | None = Field(default=None, ge=0.0, le=10.0)
+    # Ranking is lexicographic: economic_moat_score is always primary and the
+    # stable component vector may refine exact public-score ties only.
+    rank_refinement: MoatRankRefinement | None = None
+    rank_refinement_status: MoatRankRefinementStatus | None = None
     mechanisms: list[MoatMechanismScore] = Field(default_factory=list)
     outcome_strengths: list[MoatOutcomeScore] = Field(default_factory=list)
     counterevidence_ids: list[str] = Field(default_factory=list)
@@ -824,12 +842,31 @@ class MoatScore(ContractModel):
     def positive_score_has_evidence(self) -> "MoatScore":
         if self.economic_moat_score > 0 and not self.mechanisms:
             raise ValueError("a positive moat score requires cited mechanisms")
-        if self.economic_moat_rank_score is not None and self.economic_moat_rank_score > 0 and not self.mechanisms:
-            raise ValueError("a positive moat rank score requires cited mechanisms")
         if self.economic_moat_score > 0 and not self.score_eligible:
             raise ValueError("an ineligible MOAT assessment cannot publish a positive score")
-        if self.economic_moat_rank_score is not None and not self.score_eligible:
-            raise ValueError("an ineligible MOAT assessment cannot publish a rank score")
+        if self.rank_refinement is not None and not self.score_eligible:
+            raise ValueError("an ineligible MOAT assessment cannot publish rank refinement")
+        if (
+            self.rank_refinement is not None
+            and self.rank_refinement_status
+            != MoatRankRefinementStatus.STABLE_COMPONENTS
+        ):
+            raise ValueError("rank refinement requires STABLE_COMPONENTS status")
+        if (
+            self.rank_refinement_status == MoatRankRefinementStatus.STABLE_COMPONENTS
+            and self.rank_refinement is None
+        ):
+            raise ValueError("stable rank-refinement status requires component values")
+        if (
+            self.rank_refinement_status == MoatRankRefinementStatus.STABLE_COMPONENTS
+            and not self.mechanisms
+        ):
+            raise ValueError("stable rank refinement requires an accepted mechanism")
+        if (
+            self.rank_refinement_status == MoatRankRefinementStatus.INELIGIBLE
+            and self.score_eligible
+        ):
+            raise ValueError("an eligible MOAT assessment cannot have INELIGIBLE refinement status")
         if self.audit_status == MoatAuditStatus.FAIL and self.score_eligible:
             raise ValueError("a failed MOAT audit cannot be score eligible")
         if self.evidence_confidence is None:
