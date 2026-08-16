@@ -41,10 +41,12 @@ from moatrader.evidence.models import (
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
     build_candidate_manifest,
+    derive_audited_moat_rank_score,
     derive_audited_moat_score,
     reconcile_context_and_claims,
     normalize_candidate_atomic_audit,
     normalize_contextual_moat_assessment,
+    normalize_contextual_moat_rank_assessment,
     validate_contextual_moat_assessment,
     validate_evidence_result,
     validate_moat_score,
@@ -106,7 +108,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.9.1"
+RUNNER_VERSION = "0.9.2"
 
 
 class MoatUniverseRunner:
@@ -480,28 +482,37 @@ class MoatUniverseRunner:
 
             self._checkpoint(checkpoint_path, signature, "ASSESSING_MOAT_STRENGTH")
             strength_assessment_path = company_dir / "contextual-moat-assessment.json"
-            if self.config.resume and strength_assessment_path.is_file():
-                strength_assessment = ContextualMoatAssessment.model_validate(
-                    self.store.read_json(strength_assessment_path)
+            raw_strength_assessment_path = (
+                company_dir / "contextual-moat-assessment-raw.json"
+            )
+            if self.config.resume and raw_strength_assessment_path.is_file():
+                raw_strength_assessment = ContextualMoatAssessment.model_validate(
+                    self.store.read_json(raw_strength_assessment_path)
                 )
             else:
                 # Broad context is read exactly once. All contract repairs below
                 # are deterministic field/item operations and never resend the
                 # 100K-class context because one field was malformed.
-                strength_assessment = self._execute_validated(
+                raw_strength_assessment = self._execute_validated(
                     strength_request,
                     ContextualMoatAssessment,
                     lambda _value: [],
                     audits,
                     company_dir,
                 )
-            self.store.write_json(
-                company_dir / "contextual-moat-assessment-raw.json",
-                strength_assessment,
-            )
+                self.store.write_json(
+                    raw_strength_assessment_path,
+                    raw_strength_assessment,
+                )
             strength_assessment, strength_repair = normalize_contextual_moat_assessment(
-                strength_assessment,
+                raw_strength_assessment,
                 strength_context.references,
+            )
+            rank_strength_assessment, rank_strength_repair = (
+                normalize_contextual_moat_rank_assessment(
+                    raw_strength_assessment,
+                    strength_context.references,
+                )
             )
             strength_errors = validate_contextual_moat_assessment(
                 strength_assessment,
@@ -516,6 +527,10 @@ class MoatUniverseRunner:
             self.store.write_json(
                 company_dir / "contextual-moat-field-repair.json",
                 strength_repair,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-rank-field-repair.json",
+                rank_strength_repair,
             )
             candidate_manifest = build_candidate_manifest(strength_assessment)
             self.store.write_json(
@@ -771,10 +786,13 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "SCORING")
             score_path = company_dir / "moat-score.json"
             reducer_payload = {
-                "schema_version": "dual-lane-strength-reducer/2",
+                "schema_version": "dual-lane-strength-reducer/3",
                 "issuer_id": dossier.issuer_id,
                 "as_of": self.config.as_of.date().isoformat(),
                 "contextual_assessment": strength_assessment.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "raw_rank_assessment": rank_strength_assessment.model_dump(
                     mode="json", exclude_none=True
                 ),
                 "candidate_manifest": [
@@ -821,7 +839,15 @@ class MoatUniverseRunner:
                     as_of=self.config.as_of.date(),
                     document_coverage=score_coverage,
                 )
-                self.store.write_json(score_path, score)
+            rank_score = derive_audited_moat_rank_score(
+                rank_strength_assessment,
+                reconciled,
+                score_eligible=score.score_eligible,
+            )
+            score = score.model_copy(
+                update={"economic_moat_rank_score": rank_score}
+            )
+            self.store.write_json(score_path, score)
 
             expected_claim_ids = {
                 card.claim_id for card in scoring_dossier.evidence if card.claim_id
@@ -1790,7 +1816,10 @@ class MoatUniverseRunner:
                 EvidencePackBuilder.build,
                 MoatStrengthContextBuilder.build,
                 build_financial_feature_vector,
+                normalize_contextual_moat_assessment,
+                normalize_contextual_moat_rank_assessment,
                 reconcile_context_and_claims,
+                derive_audited_moat_rank_score,
                 derive_audited_moat_score,
             )
         )

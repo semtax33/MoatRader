@@ -21,8 +21,10 @@ from moatrader.evidence.models import (
 from moatrader.evidence.atomic import select_context_cited_atomic_units
 from moatrader.evidence.validation import (
     build_candidate_manifest,
+    derive_audited_moat_rank_score,
     derive_audited_moat_score,
     normalize_contextual_moat_assessment,
+    normalize_contextual_moat_rank_assessment,
     reconcile_context_and_claims,
     validate_contextual_moat_assessment,
 )
@@ -224,6 +226,92 @@ def test_contextual_reference_contract_repairs_unknown_ref_number_and_duplicate(
     assert repaired.mechanisms[0].reference_ids == ["R1"]
     assert not any(character.isdigit() for character in repaired.mechanisms[0].rationale)
     assert report["action_count"] >= 3
+
+
+def test_rank_normalization_preserves_raw_ordinals_and_conservative_merge() -> None:
+    chunk = _chunk("C1", "Customers sign five-year contracts.")
+    raw = ContextualMoatAssessment(
+        evidence_sufficiency=4,
+        mechanisms=[
+            ContextualMechanismAssessment(
+                evidence_type=EvidenceType.SWITCHING_COST,
+                strength_bucket=3,
+                scope_materiality_bucket=3,
+                durability_bucket=3,
+                economic_scope=EconomicScope.COMPANY,
+                reference_ids=["R1"],
+                rationale="Persistent contractual switching friction.",
+            ),
+            ContextualMechanismAssessment(
+                evidence_type=EvidenceType.SWITCHING_COST,
+                strength_bucket=2,
+                scope_materiality_bucket=4,
+                durability_bucket=4,
+                economic_scope=EconomicScope.COMPANY,
+                reference_ids=["R1"],
+                rationale="Duplicate switching mechanism.",
+            ),
+        ],
+    )
+
+    public, _ = normalize_contextual_moat_assessment(raw, [_reference(chunk)])
+    rank_input, report = normalize_contextual_moat_rank_assessment(
+        raw, [_reference(chunk)]
+    )
+
+    assert public.mechanisms[0].strength_bucket == 2
+    assert rank_input.mechanisms[0].strength_bucket == 2
+    assert rank_input.mechanisms[0].scope_materiality_bucket == 3
+    assert rank_input.mechanisms[0].durability_bucket == 3
+    assert report["schema_version"] == "contextual-rank-field-repair/1"
+
+
+def test_rank_score_restores_raw_resolution_after_reconciliation() -> None:
+    chunk = _chunk("C1", "Customers sign five-year contracts.")
+    raw = ContextualMoatAssessment(
+        evidence_sufficiency=4,
+        mechanisms=[
+            ContextualMechanismAssessment(
+                evidence_type=EvidenceType.SWITCHING_COST,
+                strength_bucket=3,
+                scope_materiality_bucket=3,
+                durability_bucket=3,
+                economic_scope=EconomicScope.COMPANY,
+                reference_ids=["R1"],
+                rationale="Persistent contractual switching friction.",
+            )
+        ],
+    )
+    public, _ = normalize_contextual_moat_assessment(raw, [_reference(chunk)])
+    rank_input, _ = normalize_contextual_moat_rank_assessment(raw, [_reference(chunk)])
+    reconciled = reconcile_context_and_claims(
+        public,
+        [_positive_card()],
+        contextual_chunks=[chunk],
+        atomic_units=[_atomic_unit(chunk)],
+        references=[_reference(chunk)],
+        candidate_manifest=build_candidate_manifest(public),
+        candidate_audit=_candidate_audit(public, supported=True),
+    )
+    public_score = derive_audited_moat_score(
+        reconciled,
+        [_positive_card()],
+        issuer_id="ISSUER",
+        as_of=date(2026, 5, 31),
+        document_coverage=CoverageMetrics(moat_evidence_coverage=1.0),
+    )
+
+    rank_score = derive_audited_moat_rank_score(
+        rank_input,
+        reconciled,
+        score_eligible=public_score.score_eligible,
+    )
+
+    assert public_score.economic_moat_score == 3.75
+    assert rank_score == 5.625
+    assert derive_audited_moat_rank_score(
+        rank_input, reconciled, score_eligible=False
+    ) is None
 
 
 def test_contextual_mechanism_requires_matching_atomic_claim() -> None:

@@ -539,9 +539,13 @@ def _robust_strength_bucket(value: int) -> int:
     return 2
 
 
-def normalize_contextual_moat_assessment(
+def _normalize_contextual_moat_assessment(
     assessment: ContextualMoatAssessment,
     references: list[ContextEvidenceReference],
+    *,
+    calibrate_ordinals: bool,
+    drop_weak_outcomes: bool,
+    schema_version: str,
 ) -> tuple[ContextualMoatAssessment, dict[str, object]]:
     """Repair fields/items deterministically without repeating broad context.
 
@@ -571,7 +575,7 @@ def normalize_contextual_moat_assessment(
             )
             return None
         updates: dict[str, object] = {"reference_ids": refs, "rationale": rationale}
-        if category == "mechanism":
+        if category == "mechanism" and calibrate_ordinals:
             updates.update(
                 strength_bucket=_robust_strength_bucket(item.strength_bucket),
                 scope_materiality_bucket=_robust_strength_bucket(
@@ -580,20 +584,35 @@ def normalize_contextual_moat_assessment(
                 durability_bucket=_robust_strength_bucket(item.durability_bucket),
             )
         elif category == "outcome":
-            if item.strength_bucket < 2 or item.persistence_bucket < 2:
+            if drop_weak_outcomes and (
+                item.strength_bucket < 2 or item.persistence_bucket < 2
+            ):
                 actions.append(
                     {"category": category, "type": item.evidence_type.value, "action": "DROP_WEAK_OUTCOME"}
                 )
                 return None
-            updates.update(
-                strength_bucket=_robust_strength_bucket(item.strength_bucket),
-                persistence_bucket=_robust_strength_bucket(item.persistence_bucket),
-            )
-        else:
+            if calibrate_ordinals:
+                updates.update(
+                    strength_bucket=_robust_strength_bucket(item.strength_bucket),
+                    persistence_bucket=_robust_strength_bucket(item.persistence_bucket),
+                )
+        elif calibrate_ordinals:
             # Counter presence is material; free-form severity precision was
             # not repeatable enough to justify a different penalty.
             updates["severity_bucket"] = 0 if item.severity_bucket <= 0 else 2
-        if any(updates.get(field) != getattr(item, field) for field in updates if hasattr(item, field)):
+        ordinal_fields = {
+            "strength_bucket",
+            "scope_materiality_bucket",
+            "durability_bucket",
+            "persistence_bucket",
+            "severity_bucket",
+        }
+        if calibrate_ordinals and any(
+            field in ordinal_fields
+            and updates.get(field) != getattr(item, field)
+            for field in updates
+            if hasattr(item, field)
+        ):
             actions.append(
                 {"category": category, "type": item.evidence_type.value, "action": "CALIBRATE_ORDINAL_BUCKETS"}
             )
@@ -668,11 +687,46 @@ def normalize_contextual_moat_assessment(
         }
     )
     return normalized, {
-        "schema_version": "contextual-field-repair/1",
+        "schema_version": schema_version,
         "strategy": "DETERMINISTIC_ITEM_FIELD_REPAIR_NO_BROAD_RETRY",
         "action_count": len(actions),
         "actions": actions,
     }
+
+
+def normalize_contextual_moat_assessment(
+    assessment: ContextualMoatAssessment,
+    references: list[ContextEvidenceReference],
+) -> tuple[ContextualMoatAssessment, dict[str, object]]:
+    """Normalize the public robust-strength path without changing its contract."""
+
+    return _normalize_contextual_moat_assessment(
+        assessment,
+        references,
+        calibrate_ordinals=True,
+        drop_weak_outcomes=True,
+        schema_version="contextual-field-repair/1",
+    )
+
+
+def normalize_contextual_moat_rank_assessment(
+    assessment: ContextualMoatAssessment,
+    references: list[ContextEvidenceReference],
+) -> tuple[ContextualMoatAssessment, dict[str, object]]:
+    """Normalize raw ordinals for ranking while retaining every valid bucket.
+
+    Reference and rationale repairs are identical to the public path. Duplicate
+    types are still merged conservatively, but the model's 0-4 ordinal values
+    are not collapsed into the public 0/2/4 robustness buckets.
+    """
+
+    return _normalize_contextual_moat_assessment(
+        assessment,
+        references,
+        calibrate_ordinals=False,
+        drop_weak_outcomes=False,
+        schema_version="contextual-rank-field-repair/1",
+    )
 
 
 def build_candidate_manifest(
@@ -1059,6 +1113,97 @@ def reconcile_context_and_claims(
     )
 
 
+def _economic_moat_strength_score(
+    *,
+    effective_mechanism_buckets: list[float],
+    outcome_components: list[float],
+    durability_bucket: int,
+    counter_severity_buckets: list[int],
+) -> float:
+    """Apply the frozen dual-lane reducer without presentation rounding."""
+
+    if not effective_mechanism_buckets:
+        return 0.0
+    ranked_buckets = sorted(effective_mechanism_buckets, reverse=True)
+    mechanism_component = min(
+        4.0,
+        ranked_buckets[0]
+        + (0.25 * ranked_buckets[1] if len(ranked_buckets) > 1 else 0.0),
+    )
+    outcome_component = max(outcome_components, default=0.0)
+    durability_component = durability_bucket / 2
+    counter_component = max(
+        (severity / 2 for severity in counter_severity_buckets),
+        default=0.0,
+    )
+    gross_eight = mechanism_component + outcome_component + durability_component
+    return max(0.0, gross_eight - counter_component) / 8 * 10
+
+
+def derive_audited_moat_rank_score(
+    raw_assessment: ContextualMoatAssessment,
+    reconciled: ReconciledMoatAssessment,
+    *,
+    score_eligible: bool,
+) -> float | None:
+    """Derive a rank-only score from accepted candidates and raw ordinals.
+
+    The reconciliation is the authority for which candidates/types may
+    contribute.  Raw contextual output only restores ordinal resolution; it
+    cannot introduce an unvalidated mechanism, outcome, or counterevidence.
+    """
+
+    if not score_eligible:
+        return None
+
+    raw_candidates = {
+        candidate.candidate_id: candidate
+        for candidate in build_candidate_manifest(raw_assessment)
+    }
+    accepted_mechanisms = [
+        raw_candidates[item.candidate_id]
+        for item in reconciled.mechanisms
+        if item.candidate_id in raw_candidates
+    ]
+    if not accepted_mechanisms:
+        return 0.0
+
+    accepted_outcome_types = {item.evidence_type for item in reconciled.outcomes}
+    raw_outcomes = {
+        EvidenceType(item.evidence_type.value): item
+        for item in raw_assessment.outcome_confirmation
+    }
+    outcome_components = [
+        (raw_outcomes[evidence_type].strength_bucket
+         + raw_outcomes[evidence_type].persistence_bucket)
+        / 4
+        for evidence_type in sorted(accepted_outcome_types, key=lambda item: item.value)
+        if evidence_type in raw_outcomes
+    ]
+
+    raw_counters = {
+        EvidenceType(item.evidence_type.value): item.severity_bucket
+        for item in raw_assessment.counterevidence
+    }
+    counter_buckets = [
+        raw_counters.get(item.evidence_type, item.severity_bucket)
+        for item in reconciled.counterevidence
+    ]
+    raw_score = _economic_moat_strength_score(
+        effective_mechanism_buckets=[
+            float(min(item.strength_bucket, item.scope_materiality_bucket))
+            for item in accepted_mechanisms
+        ],
+        outcome_components=outcome_components,
+        durability_bucket=max(
+            (item.durability_bucket for item in accepted_mechanisms),
+            default=0,
+        ),
+        counter_severity_buckets=counter_buckets,
+    )
+    return round(raw_score, 6)
+
+
 def derive_audited_moat_score(
     reconciled: ReconciledMoatAssessment,
     evidence: list[EvidenceCard],
@@ -1110,23 +1255,17 @@ def derive_audited_moat_score(
             )
         )
 
-    if effective_buckets:
-        ranked_buckets = sorted(effective_buckets, reverse=True)
-        mechanism_component = min(
-            4.0,
-            ranked_buckets[0]
-            + (0.25 * ranked_buckets[1] if len(ranked_buckets) > 1 else 0.0),
-        )
-        outcome_component = max((item.score for item in outcome_scores), default=0.0)
-        durability_component = reconciled.durability_bucket / 2
-        gross_eight = mechanism_component + outcome_component + durability_component
-        counter_component = max(
-            (item.severity_bucket / 2 for item in reconciled.counterevidence),
-            default=0.0,
-        )
-        economic_score = round(max(0.0, gross_eight - counter_component) / 8 * 10, 2)
-    else:
-        economic_score = 0.0
+    economic_score = round(
+        _economic_moat_strength_score(
+            effective_mechanism_buckets=effective_buckets,
+            outcome_components=[item.score for item in outcome_scores],
+            durability_bucket=reconciled.durability_bucket,
+            counter_severity_buckets=[
+                item.severity_bucket for item in reconciled.counterevidence
+            ],
+        ),
+        2,
+    )
 
     durability = {
         0: Durability.LOW,

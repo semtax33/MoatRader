@@ -14,6 +14,7 @@ class CandidateInput(ContractModel):
     current_price: Decimal = Field(gt=0)
     dcf_fair_value: Decimal = Field(gt=0)
     moat_score: Decimal = Field(ge=0, le=10)
+    moat_rank_score: Decimal = Field(ge=0, le=10)
     model_confidence: Decimal = Field(ge=0, le=1)
     document_coverage: Decimal = Field(ge=0, le=1)
     valuation_as_of: datetime
@@ -48,11 +49,20 @@ class RankedCandidate(ContractModel):
     price_to_dcf: Decimal
     margin_of_safety: Decimal
     moat_score: Decimal
+    moat_rank_score: Decimal | None = Field(default=None, ge=0, le=10)
     quality_value_score: Decimal
     moat_percentile: Decimal = Decimal(0)
     value_percentile: Decimal = Decimal(0)
     valuation_as_of: datetime
     price_as_of: datetime
+
+    @model_validator(mode="after")
+    def fill_legacy_rank_score(self) -> "RankedCandidate":
+        # Historical backtest checkpoints predate the rank-only score. They
+        # remain readable, while every newly ranked candidate supplies it.
+        if self.moat_rank_score is None:
+            self.moat_rank_score = self.moat_score
+        return self
 
 
 class ValueMoatRanker:
@@ -76,7 +86,9 @@ class ValueMoatRanker:
                 continue
             eligible.append((candidate, price_to_dcf, margin))
 
-        moat_percentiles = self._percentiles([item[0].moat_score for item in eligible])
+        moat_percentiles = self._percentiles(
+            [item[0].moat_rank_score for item in eligible]
+        )
         value_percentiles = self._percentiles([item[2] for item in eligible])
         ranked: list[RankedCandidate] = []
         for (candidate, price_to_dcf, margin), moat_percentile, value_percentile in zip(
@@ -96,6 +108,7 @@ class ValueMoatRanker:
                     price_to_dcf=price_to_dcf,
                     margin_of_safety=margin,
                     moat_score=candidate.moat_score,
+                    moat_rank_score=candidate.moat_rank_score,
                     quality_value_score=score,
                     moat_percentile=moat_percentile,
                     value_percentile=value_percentile,

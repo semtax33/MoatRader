@@ -162,6 +162,7 @@ def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():
         "current_price": Decimal("60"),
         "dcf_fair_value": Decimal("100"),
         "moat_score": Decimal("8"),
+        "moat_rank_score": Decimal("8"),
         "model_confidence": Decimal("0.8"),
         "document_coverage": Decimal("0.9"),
         "valuation_as_of": timestamp,
@@ -172,17 +173,56 @@ def test_value_moat_ranker_filters_and_orders_by_quality_adjusted_discount():
         CandidateInput(
             issuer_id="2",
             ticker="BBB",
-            **{**common, "current_price": Decimal("50"), "moat_score": Decimal("7")},
+            **{
+                **common,
+                "current_price": Decimal("50"),
+                "moat_score": Decimal("7"),
+                "moat_rank_score": Decimal("7"),
+            },
         ),
         CandidateInput(
             issuer_id="3",
             ticker="LOW",
-            **{**common, "moat_score": Decimal("3")},
+            **{**common, "moat_score": Decimal("3"), "moat_rank_score": Decimal("9")},
         ),
     ]
     ranked = ValueMoatRanker().rank(candidates)
     assert [item.ticker for item in ranked] == ["BBB", "AAA"]
     assert all(item.price_to_dcf < 1 for item in ranked)
+
+
+def test_value_moat_ranker_uses_rank_score_but_public_score_for_gate() -> None:
+    timestamp = datetime(2026, 8, 13, tzinfo=timezone.utc)
+    common = {
+        "current_price": Decimal("60"),
+        "dcf_fair_value": Decimal("100"),
+        "moat_score": Decimal("6"),
+        "model_confidence": Decimal("0.8"),
+        "document_coverage": Decimal("0.9"),
+        "valuation_as_of": timestamp,
+        "price_as_of": timestamp,
+    }
+    ranked = ValueMoatRanker().rank(
+        [
+            CandidateInput(
+                issuer_id="1", ticker="RAW_HIGH", moat_rank_score=Decimal("8"), **common
+            ),
+            CandidateInput(
+                issuer_id="2", ticker="RAW_LOW", moat_rank_score=Decimal("4"), **common
+            ),
+            CandidateInput(
+                issuer_id="3",
+                ticker="PUBLIC_FAIL",
+                moat_score=Decimal("4"),
+                moat_rank_score=Decimal("10"),
+                **{key: value for key, value in common.items() if key != "moat_score"},
+            ),
+        ]
+    )
+
+    assert [item.ticker for item in ranked] == ["RAW_HIGH", "RAW_LOW"]
+    assert ranked[0].moat_percentile > ranked[1].moat_percentile
+    assert ranked[0].moat_score == ranked[1].moat_score == Decimal("6")
 
 
 def test_allocator_treats_unretrieved_chunks_as_low_relevance() -> None:

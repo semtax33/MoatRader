@@ -17,6 +17,7 @@ def rank_run_result(
         if (
             not company.moat_score
             or not company.moat_score.score_eligible
+            or company.moat_score.economic_moat_rank_score is None
             or not company.dcf
             or company.dcf.fair_value_per_share <= 0
             or not company.dcf.screening_eligible
@@ -34,6 +35,9 @@ def rank_run_result(
                 current_price=company.current_price,
                 dcf_fair_value=company.dcf.fair_value_per_share,
                 moat_score=Decimal(str(company.moat_score.economic_moat_score)),
+                moat_rank_score=Decimal(
+                    str(company.moat_score.economic_moat_rank_score)
+                ),
                 model_confidence=Decimal(
                     str(
                         company.moat_score.evidence_confidence
@@ -56,6 +60,7 @@ def results_csv(result: UniverseRunResult) -> str:
         "issuer_name",
         "status",
         "moat_score",
+        "moat_rank_score",
         "durability",
         "audit_status",
         "score_eligible",
@@ -89,6 +94,7 @@ def results_csv(result: UniverseRunResult) -> str:
                 "issuer_name": company.issuer_name,
                 "status": company.status.value,
                 "moat_score": score.economic_moat_score if score else None,
+                "moat_rank_score": score.economic_moat_rank_score if score else None,
                 "durability": score.durability.value if score else None,
                 "audit_status": score.audit_status.value if score else None,
                 "score_eligible": score.score_eligible if score else None,
@@ -134,6 +140,7 @@ def ranking_csv(result: UniverseRunResult) -> str:
         "rank",
         "ticker",
         "moat_score",
+        "moat_rank_score",
         "price_to_dcf",
         "margin_of_safety",
         "quality_value_score",
@@ -150,6 +157,7 @@ def ranking_csv(result: UniverseRunResult) -> str:
                 "rank": rank,
                 "ticker": candidate.ticker,
                 "moat_score": candidate.moat_score,
+                "moat_rank_score": candidate.moat_rank_score,
                 "price_to_dcf": candidate.price_to_dcf,
                 "margin_of_safety": candidate.margin_of_safety,
                 "quality_value_score": candidate.quality_value_score,

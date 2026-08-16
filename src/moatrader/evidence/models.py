@@ -793,6 +793,10 @@ class MoatScore(ContractModel):
     issuer_id: str | None = None
     as_of: date
     economic_moat_score: float = Field(ge=0.0, le=10.0)
+    # Public/gating score above intentionally uses robust ordinal calibration.
+    # This second score preserves the validated raw 0-4 ordinals for
+    # cross-sectional ranking only.  Legacy checkpoints may omit it.
+    economic_moat_rank_score: float | None = Field(default=None, ge=0.0, le=10.0)
     mechanisms: list[MoatMechanismScore] = Field(default_factory=list)
     outcome_strengths: list[MoatOutcomeScore] = Field(default_factory=list)
     counterevidence_ids: list[str] = Field(default_factory=list)
@@ -820,8 +824,12 @@ class MoatScore(ContractModel):
     def positive_score_has_evidence(self) -> "MoatScore":
         if self.economic_moat_score > 0 and not self.mechanisms:
             raise ValueError("a positive moat score requires cited mechanisms")
+        if self.economic_moat_rank_score is not None and self.economic_moat_rank_score > 0 and not self.mechanisms:
+            raise ValueError("a positive moat rank score requires cited mechanisms")
         if self.economic_moat_score > 0 and not self.score_eligible:
             raise ValueError("an ineligible MOAT assessment cannot publish a positive score")
+        if self.economic_moat_rank_score is not None and not self.score_eligible:
+            raise ValueError("an ineligible MOAT assessment cannot publish a rank score")
         if self.audit_status == MoatAuditStatus.FAIL and self.score_eligible:
             raise ValueError("a failed MOAT audit cannot be score eligible")
         if self.evidence_confidence is None:

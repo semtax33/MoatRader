@@ -7,6 +7,7 @@ from scripts.evaluate_signal_panel import (
     group_demean,
     nonoverlapping_quantile_spread,
     residualize,
+    signal_tie_diagnostics,
     winsorize,
 )
 
@@ -21,6 +22,34 @@ def test_nonoverlapping_quantile_spread_uses_disjoint_tails() -> None:
     assert spread == pytest.approx(0.8)
     assert top_count == 2
     assert bottom_count == 2
+
+
+def test_quantile_spread_randomizes_cutoff_ties_instead_of_using_ticker_order() -> None:
+    signals = [1.0] * 10
+    returns = [float(value) for value in range(10)]
+    tickers = [f"T{value}" for value in range(10)]
+
+    first = nonoverlapping_quantile_spread(
+        signals, returns, tickers, simulations=2000, seed="fixed"
+    )
+    reordered = nonoverlapping_quantile_spread(
+        list(reversed(signals)),
+        list(reversed(returns)),
+        list(reversed(tickers)),
+        simulations=2000,
+        seed="fixed",
+    )
+    diagnostics = signal_tie_diagnostics(signals)
+
+    assert first == reordered
+    assert abs(first[0]) < 0.25
+    assert first[1:] == (2, 2)
+    assert diagnostics == {
+        "distinct_signal_count": 1,
+        "max_single_signal_share": 1.0,
+        "top_boundary_tie_count": 10,
+        "bottom_boundary_tie_count": 10,
+    }
 
 
 def test_group_neutral_evaluation_removes_between_sector_level_effect() -> None:
@@ -41,6 +70,8 @@ def test_group_neutral_evaluation_removes_between_sector_level_effect() -> None:
 
     assert metrics["raw_spearman_ic"] > 0
     assert metrics["group_neutral_spearman_ic"] < -0.95
+    assert metrics["distinct_signal_count"] == 10
+    assert metrics["top_quantile_count"] == metrics["bottom_quantile_count"]
 
 
 def test_group_demean_rejects_missing_sector() -> None:

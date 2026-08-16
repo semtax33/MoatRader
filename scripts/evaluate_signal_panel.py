@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import statistics
@@ -90,24 +91,98 @@ def nonoverlapping_quantile_spread(
     tickers: list[str],
     *,
     quantiles: int = 5,
+    simulations: int = 1000,
+    seed: str = "moatrader-tie-randomization-v1",
 ) -> tuple[float | None, int, int]:
     if not (len(signals) == len(returns) == len(tickers)):
         raise ValueError("signals, returns, and tickers must have the same length")
     if len(signals) < quantiles:
         return None, 0, 0
-    ordered = sorted(range(len(signals)), key=lambda index: (signals[index], tickers[index]))
-    buckets: list[list[int]] = [[] for _ in range(quantiles)]
-    for position, index in enumerate(ordered):
-        bucket = min(quantiles - 1, position * quantiles // len(ordered))
-        buckets[bucket].append(index)
-    low = buckets[0]
-    high = buckets[-1]
-    if set(low) & set(high):
-        raise RuntimeError("quantile construction produced overlapping tails")
-    spread = statistics.mean(returns[index] for index in high) - statistics.mean(
-        returns[index] for index in low
+    if simulations < 1:
+        raise ValueError("simulations must be positive")
+    tail_count = max(1, len(signals) // quantiles)
+    spreads = _randomized_quantile_spreads(
+        signals,
+        returns,
+        tickers,
+        tail_count=tail_count,
+        simulations=simulations,
+        seed=seed,
     )
-    return spread, len(high), len(low)
+    return statistics.mean(spreads), tail_count, tail_count
+
+
+def _randomized_quantile_spreads(
+    signals: list[float],
+    returns: list[float],
+    tickers: list[str],
+    *,
+    tail_count: int,
+    simulations: int,
+    seed: str,
+) -> list[float]:
+    """Equal-tail spreads with deterministic pseudo-random tie breaking.
+
+    The hash is only a reproducible randomizer. Unlike alphabetical ticker
+    ordering, it cannot impose a persistent economic direction on a cutoff
+    tie; averaging simulations integrates over many valid tie assignments.
+    """
+
+    spreads: list[float] = []
+    for simulation in range(simulations):
+        def tie_key(index: int) -> str:
+            value = f"{seed}|{simulation}|{tickers[index]}".encode("utf-8")
+            return hashlib.sha256(value).hexdigest()
+
+        ordered = sorted(
+            range(len(signals)),
+            key=lambda index: (signals[index], tie_key(index)),
+        )
+        low = ordered[:tail_count]
+        high = ordered[-tail_count:]
+        if set(low) & set(high):
+            raise RuntimeError("quantile construction produced overlapping tails")
+        spreads.append(
+            statistics.mean(returns[index] for index in high)
+            - statistics.mean(returns[index] for index in low)
+        )
+    return spreads
+
+
+def signal_tie_diagnostics(
+    signals: list[float],
+    *,
+    quantiles: int = 5,
+) -> dict[str, int | float | None]:
+    if not signals:
+        return {
+            "distinct_signal_count": 0,
+            "max_single_signal_share": None,
+            "top_boundary_tie_count": 0,
+            "bottom_boundary_tie_count": 0,
+        }
+    counts = {value: signals.count(value) for value in set(signals)}
+    ordered = sorted(signals)
+    tail_count = max(1, len(signals) // quantiles)
+    return {
+        "distinct_signal_count": len(counts),
+        "max_single_signal_share": max(counts.values()) / len(signals),
+        "top_boundary_tie_count": counts[ordered[-tail_count]],
+        "bottom_boundary_tie_count": counts[ordered[tail_count - 1]],
+    }
+
+
+def _sample_percentile(values: list[float], probability: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = probability * (len(ordered) - 1)
+    low = math.floor(position)
+    high = math.ceil(position)
+    if low == high:
+        return ordered[low]
+    fraction = position - low
+    return ordered[low] * (1 - fraction) + ordered[high] * fraction
 
 
 def evaluate_date(
@@ -116,6 +191,7 @@ def evaluate_date(
     date: str,
     minimum_observations: int,
     factor_columns: list[str] | None = None,
+    tie_simulations: int = 1000,
 ) -> dict[str, object]:
     signals = [float(row["signal"]) for row in rows]
     returns = [float(row["forward_return"]) for row in rows]
@@ -143,7 +219,23 @@ def evaluate_date(
         signals,
         clipped_returns,
         tickers,
+        simulations=tie_simulations,
+        seed=date,
     )
+    tail_count = max(1, len(signals) // 5) if len(signals) >= 5 else 0
+    spread_samples = (
+        _randomized_quantile_spreads(
+            signals,
+            clipped_returns,
+            tickers,
+            tail_count=tail_count,
+            simulations=tie_simulations,
+            seed=date,
+        )
+        if tail_count
+        else []
+    )
+    tie_diagnostics = signal_tie_diagnostics(signals)
     return {
         "date": date,
         "observation_count": len(rows),
@@ -153,6 +245,11 @@ def evaluate_date(
         "winsorized_q5_minus_q1": spread if enough else None,
         "top_quantile_count": top_count,
         "bottom_quantile_count": bottom_count,
+        "q5_minus_q1_tie_randomization_p05": _sample_percentile(spread_samples, 0.05) if enough else None,
+        "q5_minus_q1_tie_randomization_p95": _sample_percentile(spread_samples, 0.95) if enough else None,
+        "tie_method": "FIXED_SEED_MONTE_CARLO_EQUAL_TAILS",
+        "tie_simulations": tie_simulations,
+        **tie_diagnostics,
     }
 
 
@@ -177,6 +274,7 @@ def main() -> int:
         help="numeric exposure column to neutralize after sector demeaning; may be repeated",
     )
     parser.add_argument("--minimum-observations", type=int, default=20)
+    parser.add_argument("--tie-simulations", type=int, default=1000)
     args = parser.parse_args()
     if args.minimum_observations < 5:
         raise ValueError("minimum observations must be at least five")
@@ -235,17 +333,20 @@ def main() -> int:
             date=date,
             minimum_observations=args.minimum_observations,
             factor_columns=args.factor_column,
+            tie_simulations=args.tie_simulations,
         )
         for date, rows in sorted(by_date.items())
     ]
     report = {
-        "schema_version": "moatrader-signal-evaluation/1",
+        "schema_version": "moatrader-signal-evaluation/2",
         "signals": str(args.signals.resolve()),
         "returns": str(args.returns.resolve()),
         "return_column": args.return_column,
         "neutral_group_column": args.group_column,
         "factor_columns": args.factor_column,
         "minimum_observations": args.minimum_observations,
+        "tie_method": "FIXED_SEED_MONTE_CARLO_EQUAL_TAILS",
+        "tie_simulations": args.tie_simulations,
         "eligible_signal_count": eligible_count,
         "matched_return_count": eligible_count - missing_return_count,
         "missing_return_count": missing_return_count,
