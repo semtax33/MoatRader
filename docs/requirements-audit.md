@@ -44,4 +44,4 @@
 
 ## 완료로 주장하지 않는 범위
 
-이번 구현으로 공식 HTML/XML 원문 수집부터 기존 MOAT/DCF runner까지 연결되지만, 붙여넣은 장기 제품 구상 전체가 끝난 것은 아닙니다. 특히 실제 golden corpus, parser 비교 viewer, segment-weighted MOAT, renderer ablation, IR PDF/PPT/OCR, taxonomy별 정교한 XBRL mapping, scheduler/database/auth/monitoring은 아직 남아 있습니다.
+초기 요구사항의 MOAT×DCF scalar ranking은 진단 경로로만 남아 있습니다. 주 경로는 `ValuationDriverEvidence → CompetitiveAdvantageProfile/CAP → Economic DCF + 3P → Reverse DCF surface → Expectation Gap`입니다. 공식 원문 수집부터 이 runner까지 연결되지만 장기 제품 구상 전체가 끝난 것은 아닙니다. 특히 실제 golden corpus 확대, parser 비교 viewer, IR visual unseen-document 검증, taxonomy별 정교한 XBRL mapping, 금융회사 excess-return 엔진, scheduler/database/auth/monitoring은 아직 남아 있습니다.

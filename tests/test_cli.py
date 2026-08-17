@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_cli_can_dry_run_one_selected_ticker(tmp_path: Path, capsys: object) -> None:
     exit_code = main(
         [
-            "moat",
+            "analyze",
             "run",
             "--universe",
             str(ROOT / "examples" / "universe.csv"),

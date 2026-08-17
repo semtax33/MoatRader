@@ -1,8 +1,8 @@
-# MoatRader — Evidence-grounded Financial LLM Evaluation & Valuation Pipeline
+# MoatRader — Evidence → Business Economics → Market Expectations
 
 비결정적인 LLM을 금융 의사결정에 사용할 때 생기는 **evidence instability**를 PIT(point-in-time), provenance, metamorphic testing, deterministic scoring으로 통제하는 투자 리서치 파이프라인입니다.
 
-MoatRader의 목표는 “LLM이 추천한 종목”을 만드는 것이 아닙니다. 같은 경제적 사실이 문장 순서, 중복, 요약문, formatting 변화 때문에 다른 점수로 바뀌지 않도록 **LLM은 atomic grounding과 contextual economic-strength attribute extraction을 담당하고, 최종 점수는 감사 가능한 Python reducer가 계산**합니다.
+MoatRader의 목표는 “해자가 높은 회사를 줄 세우는 것”이 아니라 **현재 가격이 요구하는 미래와 PIT 증거가 지지하는 미래의 차이**를 계산하는 것입니다. LLM은 원문에서 경제적 사실과 valuation-driver 의미를 분류하고, Python은 관계·재투자·DCF·3P·Reverse DCF·Expectation Gap을 계산합니다. 과거 MOAT scalar는 Evidence Sensor 회귀/진단용으로만 남습니다.
 
 | 문제 | MoatRader의 통제 방식 |
 | --- | --- |
@@ -11,13 +11,15 @@ MoatRader의 목표는 “LLM이 추천한 종목”을 만드는 것이 아닙�
 | 생성 요약이 원문처럼 다시 채점됨 | generated summary를 scoring candidate에서 제외 |
 | 인용과 숫자를 원문에서 확인하기 어려움 | Evidence ID → node/fact → raw quote provenance |
 | 미래 공시·가격이 과거 평가에 섞임 | timezone-aware `available_at`과 PIT filtering |
-| 모델 출력이 MOAT·가치평가를 직접 결정함 | LLM은 grounded attribute를 추출하고, MOAT와 DCF는 deterministic Python이 계산 |
+| 모델 출력이나 MOAT 점수가 가치평가를 직접 결정함 | LLM은 grounded evidence만 분류하고, Economic DCF·3P·Reverse DCF는 deterministic Python이 계산 |
+| 주가를 본 뒤 intrinsic 가정을 조정함 | price-blind intrinsic lane과 price-aware market lane을 타입·실행 순서로 분리 |
+| 같은 장점을 성장·마진·WACC·terminal growth에 중복 반영 | 한 evidence당 하나의 primary driver만 적용하고 related driver는 진단용으로 제한 |
 | 검증되지 않은 설정으로 대규모 비용이 발생함 | 5종목 초과 실행은 통과한 preflight report 없이는 차단 |
 
 ## 핵심 아이디어
 
 ```text
-DART / SEC EDGAR / IR HTML
+DART / SEC EDGAR / IR text·table·vision
           │
           ▼
 CanonicalDocumentBundle ── AST · StructuredFact · Asset · Provenance
@@ -26,20 +28,20 @@ CanonicalDocumentBundle ── AST · StructuredFact · Asset · Provenance
 Deterministic Atomic Evidence
           │
           ▼
-                 ┌─ Audit Lane: atomic fixed-rubric grounding
+                 ┌─ Frozen Evidence Sensor: MOAT mechanism/outcome/counter
 Canonical chunks┤
-                 └─ Strength Lane: broad contextual attribute extraction
+                 └─ Valuation Lane: revenue·margin·ROIIC·reinvestment·CAP·risk
           │
           ▼
-Validation ── Canonical Claim Set ── Python Reducer
-                                      ├─ reconciliation ─ deterministic MOAT
-PIT Financial Snapshot ───────────────└─ deterministic DCF
-                                                  │
-                                                  ▼
-                                  value · quality · confidence ranking
+Validation ── ValuationDriverEvidence ── Competitive Advantage Profile
+PIT Financial Snapshot ─────────────────┬─ price-blind Economic DCF + 3P
+                                        └─ price-aware Reverse DCF surface
+                                                        │
+                                                        ▼
+                                              Expectation Gap ranking
 ```
 
-LLM에게 구조 복원, 요약 기반 재해석, DCF 산술, 최종 MOAT 채점을 맡기지 않습니다. Atomic lane은 원문 evidence를 고정 rubric으로 검증하고, Strength lane은 모든 기업에서 넓은 canonical chunk 문맥으로 mechanism·outcome·persistence·counterevidence의 ordinal attribute를 추출합니다. Python은 두 lane을 reconciliation한 뒤 `economic_moat_score`와 `evidence_confidence`를 분리해 계산합니다.
+LLM에게 구조 복원, 요약 기반 재해석, DCF 산술, 확률 또는 공정가치 생성을 맡기지 않습니다. 동결된 MOAT Evidence Sensor는 회귀 self-test로 유지하며, 별도 valuation lane은 `MOAT_NONE`인 pipeline·approval·CAPEX·mix·capital-allocation 사실도 보존합니다. 동일 evidence를 여러 DCF lever에 중복 적용하지 않으며, confidence는 가치에 곱하지 않고 scenario range를 넓힙니다.
 
 ## Reliability architecture
 
@@ -95,7 +97,12 @@ LLM 요청은 고정 rubric·schema를 앞에, 기업별 원문 context를 뒤�
 - semantic chunking, cross-filing dedup, 숫자가 바뀐 유사 문서 보존
 - atomic audit evidence 분류, schema validation/repair, evidence-level replay
 - broad canonical-chunk strength retrieval과 contextual grounding/reconciliation
-- economic strength와 evidence confidence를 분리한 deterministic MOAT reducer, unlevered DCF
+- 동결된 Evidence Sensor v1과 MOAT scalar diagnostic
+- ValuationDriverEvidence, CompetitiveAdvantageProfile, CAP range
+- growth–reinvestment–ROIIC–CAP/fade를 연결한 Economic FCFF와 기존 FCFF sanity check
+- Possible/Plausible/Probable validator, Reverse DCF expectation surface, Expectation Gap
+- reported/economic ROIC 병렬 capital-allocation·intangible-capital 분석
+- 일반기업/성숙기업/금융/바이오/플랫폼/distressed valuation model router와 biotech rNPV
 - 회사별 실패 격리, checkpoint/resume, 사용량·input hash·run manifest 기록
 - PIT backtest, 거래비용·슬리피지·거래 가능 여부·보수적 상장폐지 처리
 - raw/sector/factor-neutral IC와 비중첩 Q5–Q1 signal evaluation
@@ -107,9 +114,12 @@ src/moatrader/
 ├─ adapters/     source-specific parsing
 ├─ canonical/    source-neutral document contract
 ├─ evidence/     atomic evidence, validation, claim ledger
+├─ business/     valuation drivers, CAP, lifecycle, capital allocation
+├─ valuation/    Economic DCF, 3P, scenarios, Reverse DCF, model router
+├─ expectations/ intrinsic/market lane merge and expectation gap
 ├─ llm/          constrained transport and replay
 ├─ retrieval/    economic-question retrieval
-├─ financial/    PIT snapshot and deterministic DCF
+├─ financial/    PIT snapshot and legacy deterministic FCFF
 ├─ runner/       execution, isolation, checkpointing
 ├─ preflight.py  full-universe execution gate
 └─ backtest/     point-in-time signal evaluation
@@ -139,7 +149,7 @@ moatrader ingest-html `
 LLM 요청 전까지의 입력·PIT·파싱·DCF 계약은 dry-run으로 확인합니다.
 
 ```powershell
-moatrader moat run `
+moatrader analyze run `
   --universe examples\universe.csv `
   --ticker SAMPLE `
   --as-of 2025-05-16T00:00:00+09:00 `
@@ -153,14 +163,16 @@ moatrader moat run `
 python -m pip install -e ".[llm]"
 $env:OPENAI_API_KEY = "..."
 
-moatrader moat run `
+moatrader analyze run `
   --universe examples\universe.csv `
   --ticker SAMPLE `
   --as-of 2025-05-16T00:00:00+09:00 `
   --run-id sample-live
 ```
 
-실행 결과에는 회사별 evidence와 요청, `RunManifest`, DCF audit, checkpoint가 저장되며 전체 결과는 `results.csv`, `ranking.csv`, `run-result.json`으로 생성됩니다.
+`expectation_assumptions`가 있는 회사는 `valuation-driver-evidence.json`, `intrinsic-valuation.json`, `three-p.json`, `reverse-dcf-surface.json`, `expectation-gap.json`을 추가로 생성합니다. 전체 주 출력은 `opportunities.csv`이며 `ranking.csv`는 `--enable-legacy-moat-ranking`을 명시한 경우에만 과거 진단 결과를 담습니다.
+
+기존 `moatrader moat ...` 명령은 호환 alias로 유지되지만 새 문서와 운영 경로는 `moatrader analyze ...`를 사용합니다. 숫자 가정 예시는 [`examples/sample-expectation-assumptions.json`](examples/sample-expectation-assumptions.json)에 있습니다.
 
 ## 검증 전략
 
@@ -175,12 +187,13 @@ moatrader moat run `
 | timezone-aware PIT와 TTM 구성 | `test_kr_dcf_pit.py` |
 | canonical model과 source-neutral 계약 | `test_model_contract.py` |
 | raw/neutral IC와 Q5–Q1 평가 | `test_signal_evaluation.py` |
+| Economic DCF·3P·Reverse DCF·price isolation·Expectation Gap | `test_expectation_pivot.py` |
 
 핵심 실패 조건은 조용히 보정하지 않습니다. 미래 공시, naive timestamp, stale price, provenance 없는 입력, parser 품질 저하, 불일치한 preflight 계약은 명시적으로 거부하거나 결과에서 제외 사유를 기록합니다.
 
 ## 운영 경계
 
-현재 직접 지원하는 입력은 DART XML/HTML, SEC HTML/iXBRL, IR HTML입니다. PDF/PPT, OCR, chart 해석은 canonical 계약만 준비되어 있고 전용 adapter는 아직 구현되지 않았습니다. 또한 이 저장소는 연구 파이프라인이며 scheduler, queue, database, auth, monitoring을 갖춘 상시 운영 서비스는 아닙니다.
+현재 직접 지원하는 입력은 DART XML/HTML, SEC HTML/iXBRL, IR HTML/PDF입니다. IR PDF text/table parser와 선택적 OCR/vision audit lane은 구현되어 있지만 전체 PDF vision의 자동 production 활성화는 unseen-PDF audit 전까지 보류합니다. 또한 이 저장소는 연구 파이프라인이며 scheduler, queue, database, auth, monitoring을 갖춘 상시 운영 서비스는 아닙니다.
 
 Backtest가 편향을 자동으로 없애 주는 것도 아닙니다. 역사적 investable universe, corporate action이 반영된 수정주가, 상장폐지 가격, 정확한 공개 가능 시각은 외부 데이터가 보장해야 합니다. 출력은 투자 권유나 미래 수익률 보장이 아닙니다.
 
@@ -190,15 +203,15 @@ Backtest가 편향을 자동으로 없애 주는 것도 아닙니다. 역사적 
 - [구현 상태와 외부 데이터 책임](docs/implementation-status.md)
 - [DART / SEC 수집과 Bronze 저장 계약](docs/ingestion.md)
 - [Universe manifest 형식](docs/universe-manifest.md)
+- [Expectation Analysis 계약](docs/expectation-analysis.md)
 - [요구사항별 구현 감사표](docs/requirements-audit.md)
 
-기본 ranking은 다음의 공개된 우선순위 함수입니다.
+기본 screening은 다음의 연구 질문을 구현합니다.
 
 ```text
-(MOAT / 10)
-× max(0, 1 - price / DCF fair value)
-× evidence confidence
-× document coverage
+Evidence-based possible/plausible/probable future
+− Market-implied growth/margin/ROIIC/CAP surface
+= Expectation Gap
 ```
 
-점수식과 임계값은 고정된 진리가 아니라 PIT backtest와 signal evaluation으로 검증해야 할 연구 가설입니다.
+MOAT×DCF scalar ranking은 기본 경로에서 비활성화되었습니다. 새 driver/3P 계약을 수익률로 튜닝하지 않고 먼저 고정한 뒤, 보지 않은 날짜의 fresh holdout에서 Expectation Gap을 검증해야 합니다.

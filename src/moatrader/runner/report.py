@@ -5,7 +5,15 @@ from decimal import Decimal
 from io import StringIO
 
 from moatrader.runner.models import UniverseRunResult
-from moatrader.screening import CandidateInput, RankedCandidate, SelectorConfig, ValueMoatRanker
+from moatrader.screening import (
+    CandidateInput,
+    ExpectationOpportunityRanker,
+    OpportunityCandidate,
+    RankedCandidate,
+    RankedOpportunity,
+    SelectorConfig,
+    ValueMoatRanker,
+)
 
 
 def rank_run_result(
@@ -51,6 +59,57 @@ def rank_run_result(
     return ValueMoatRanker(config).rank(candidates)
 
 
+def rank_expectation_opportunities(result: UniverseRunResult) -> list[RankedOpportunity]:
+    candidates: list[OpportunityCandidate] = []
+    for company in result.companies:
+        if (
+            company.expectation_analysis is None
+            or company.price_as_of is None
+            or company.valuation_as_of is None
+        ):
+            continue
+        candidates.append(
+            OpportunityCandidate(
+                issuer_id=company.issuer_id or company.ticker,
+                ticker=company.ticker,
+                evaluation=company.expectation_analysis.expectation_gap,
+                valuation_as_of=company.valuation_as_of,
+                price_as_of=company.price_as_of,
+            )
+        )
+    return ExpectationOpportunityRanker().rank(candidates)
+
+
+def opportunities_csv(result: UniverseRunResult) -> str:
+    stream = StringIO(newline="")
+    fieldnames = [
+        "rank",
+        "ticker",
+        "direction",
+        "central_value_gap",
+        "downside_value_gap",
+        "valuation_range_width_pct",
+        "valuation_as_of",
+        "price_as_of",
+    ]
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    for rank, candidate in enumerate(result.opportunities, start=1):
+        writer.writerow(
+            {
+                "rank": rank,
+                "ticker": candidate.ticker,
+                "direction": candidate.direction.value,
+                "central_value_gap": candidate.central_value_gap,
+                "downside_value_gap": candidate.downside_value_gap,
+                "valuation_range_width_pct": candidate.valuation_range_width_pct,
+                "valuation_as_of": candidate.valuation_as_of.isoformat(),
+                "price_as_of": candidate.price_as_of.isoformat(),
+            }
+        )
+    return stream.getvalue()
+
+
 def results_csv(result: UniverseRunResult) -> str:
     stream = StringIO(newline="")
     fieldnames = [
@@ -74,6 +133,13 @@ def results_csv(result: UniverseRunResult) -> str:
         "outcome_strengths",
         "document_coverage",
         "dcf_fair_value",
+        "expectation_gap",
+        "probable_value_low",
+        "probable_value_central",
+        "probable_value_high",
+        "market_implied_cap_low",
+        "market_implied_cap_high",
+        "three_p_verdict",
         "current_price",
         "price_to_dcf",
         "evidence_count",
@@ -90,6 +156,9 @@ def results_csv(result: UniverseRunResult) -> str:
         score = company.moat_score
         coverage = score.document_coverage.moat_evidence_coverage if score else None
         fair_value = company.dcf.fair_value_per_share if company.dcf else None
+        expectation = company.expectation_analysis
+        gap = expectation.expectation_gap if expectation else None
+        implied = expectation.implied_expectations if expectation else None
         writer.writerow(
             {
                 "ticker": company.ticker,
@@ -146,6 +215,13 @@ def results_csv(result: UniverseRunResult) -> str:
                 ),
                 "document_coverage": coverage,
                 "dcf_fair_value": fair_value,
+                "expectation_gap": gap.direction.value if gap else None,
+                "probable_value_low": gap.probable_value_low if gap else None,
+                "probable_value_central": gap.probable_value_central if gap else None,
+                "probable_value_high": gap.probable_value_high if gap else None,
+                "market_implied_cap_low": implied.implied_cap_years.low if implied else None,
+                "market_implied_cap_high": implied.implied_cap_years.high if implied else None,
+                "three_p_verdict": gap.three_p_verdict if gap else None,
                 "current_price": company.current_price,
                 "price_to_dcf": company.current_price / fair_value if company.current_price and fair_value else None,
                 "evidence_count": company.evidence_count,

@@ -1,7 +1,6 @@
-"""MoatRader financial document ingestion primitives."""
+"""PIT evidence, economic valuation, and market-expectation analysis."""
 
 from moatrader.canonical.models import CanonicalDocumentBundle
 
 __all__ = ["CanonicalDocumentBundle"]
-__version__ = "0.1.0"
-
+__version__ = "1.0.0"

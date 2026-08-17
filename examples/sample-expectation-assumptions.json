@@ -1,0 +1,135 @@
+{
+  "schema_version": "expectation-analysis-request/1",
+  "evidence_cutoff": "2025-05-15T16:00:00+09:00",
+  "company_type": "GENERAL_NON_FINANCIAL",
+  "life_cycle_stage": "MATURE_GROWTH",
+  "intrinsic_scenarios": {
+    "downside": {
+      "scenario": "DOWNSIDE",
+      "base_period": "2025_TTM",
+      "base_revenue": "1000",
+      "base_nopat_margin": "0.08",
+      "base_invested_capital": "600",
+      "revenue_growth": "0.02",
+      "target_nopat_margin": "0.08",
+      "roiic": "0.10",
+      "competitive_advantage_period_years": 2,
+      "fade_years": 3,
+      "explicit_forecast_years": 10,
+      "stable_growth": "0.02",
+      "stable_nopat_margin": "0.07",
+      "stable_roic": "0.08",
+      "wacc": "0.10",
+      "net_debt": "100",
+      "diluted_shares": "100",
+      "driver_evidence_ids": {},
+      "assumption_sources": {},
+      "assumption_types": {}
+    },
+    "central": {
+      "scenario": "CENTRAL",
+      "base_period": "2025_TTM",
+      "base_revenue": "1000",
+      "base_nopat_margin": "0.08",
+      "base_invested_capital": "600",
+      "revenue_growth": "0.06",
+      "target_nopat_margin": "0.11",
+      "roiic": "0.16",
+      "competitive_advantage_period_years": 5,
+      "fade_years": 5,
+      "explicit_forecast_years": 10,
+      "stable_growth": "0.02",
+      "stable_nopat_margin": "0.08",
+      "stable_roic": "0.08",
+      "wacc": "0.09",
+      "net_debt": "100",
+      "diluted_shares": "100",
+      "driver_evidence_ids": {},
+      "assumption_sources": {},
+      "assumption_types": {}
+    },
+    "upside": {
+      "scenario": "UPSIDE",
+      "base_period": "2025_TTM",
+      "base_revenue": "1000",
+      "base_nopat_margin": "0.08",
+      "base_invested_capital": "600",
+      "revenue_growth": "0.10",
+      "target_nopat_margin": "0.14",
+      "roiic": "0.22",
+      "competitive_advantage_period_years": 8,
+      "fade_years": 5,
+      "explicit_forecast_years": 13,
+      "stable_growth": "0.02",
+      "stable_nopat_margin": "0.09",
+      "stable_roic": "0.09",
+      "wacc": "0.085",
+      "net_debt": "100",
+      "diluted_shares": "100",
+      "driver_evidence_ids": {},
+      "assumption_sources": {},
+      "assumption_types": {}
+    },
+    "evidence_confidence": "0.70",
+    "maximum_range_expansion": "0.50"
+  },
+  "possible_context": {
+    "tam_ceiling": "10000",
+    "gross_margin_ceiling": "0.45",
+    "stable_growth_ceiling": "0.04",
+    "maximum_revenue_growth": "0.50",
+    "source_refs": ["PIT:TAM:2025-05-15"]
+  },
+  "reference_class": {
+    "name": "sample-mature-industrials",
+    "as_of": "2025-05-15T09:00:00+09:00",
+    "source_refs": ["PIT:REFERENCE-CLASS:2025-05-15"],
+    "revenue_growth": {"low": "-0.05", "high": "0.15"},
+    "nopat_margin": {"low": "0.03", "high": "0.18"},
+    "roiic": {"low": "0.06", "high": "0.25"},
+    "cap_years": {"low": 1, "high": 10},
+    "stable_growth": {"low": "0.00", "high": "0.04"}
+  },
+  "cap_prior": {
+    "reference_class": "sample-mature-industrials",
+    "as_of": "2025-05-15T09:00:00+09:00",
+    "low_years": 2,
+    "central_years": 5,
+    "high_years": 8,
+    "maximum_years": 20,
+    "source_refs": ["PIT:REFERENCE-CLASS:2025-05-15"]
+  },
+  "reverse_grid": {
+    "revenue_growth": ["0.00", "0.03", "0.06", "0.09", "0.12"],
+    "target_nopat_margin": ["0.06", "0.09", "0.12", "0.15"],
+    "roiic": ["0.08", "0.12", "0.16", "0.22"],
+    "cap_years": [1, 3, 5, 8, 12],
+    "price_tolerance": "0.05",
+    "nearest_points_when_no_solution": 12
+  },
+  "capital_periods": [
+    {
+      "period": "2024",
+      "revenue": "900",
+      "reported_nopat": "72",
+      "reported_invested_capital": "550",
+      "reinvestment": "60",
+      "rd_expense": "30",
+      "sga_expense": "90"
+    },
+    {
+      "period": "2025_TTM",
+      "revenue": "1000",
+      "reported_nopat": "80",
+      "reported_invested_capital": "600",
+      "reinvestment": "70",
+      "rd_expense": "35",
+      "sga_expense": "100"
+    }
+  ],
+  "intangible_adjustment_policy": {
+    "useful_life_years": 5,
+    "sga_capitalization_pct": "0.20",
+    "tax_rate": "0.25"
+  }
+}

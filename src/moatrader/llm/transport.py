@@ -225,6 +225,7 @@ class OpenAIResponsesTransport:
     def _model_for(self, task: LLMTask) -> str:
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.VALUATION_DRIVER_CLASSIFICATION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
             LLMTask.IR_INCREMENTAL_ASSESSMENT,
             LLMTask.CANDIDATE_ATOMIC_AUDIT,
@@ -412,7 +413,10 @@ class OpenAIResponsesTransport:
                 return repair_json(candidate, return_objects=True)
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.VALUATION_DRIVER_CLASSIFICATION,
+        }:
             return self.atomic_reasoning_effort
         if task in {
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
@@ -426,7 +430,10 @@ class OpenAIResponsesTransport:
         # Atomic classification is one source unit and should never consume a
         # company-level answer budget. Caps prevent malformed verbose outputs
         # while the configured global maximum remains a compatibility ceiling.
-        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.VALUATION_DRIVER_CLASSIFICATION,
+        }:
             return min(self.max_output_tokens, 2_000)
         if task in {
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,

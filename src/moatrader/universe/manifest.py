@@ -29,6 +29,7 @@ class CompanyInput(ContractModel):
     current_price: Decimal | None = Field(default=None, gt=0)
     price_as_of: datetime | None = None
     dcf_assumptions_path: str | None = None
+    expectation_assumptions_path: str | None = None
 
     @model_validator(mode="after")
     def market_data_is_complete(self) -> "CompanyInput":
@@ -135,6 +136,11 @@ def load_universe_manifest(path: str | Path) -> UniverseManifest:
         dcf_path = _resolve(base, consistent("dcf_assumptions"))
         if dcf_path and not Path(dcf_path).is_file():
             raise FileNotFoundError(f"ticker {ticker}: DCF assumptions not found: {dcf_path}")
+        expectation_path = _resolve(base, consistent("expectation_assumptions"))
+        if expectation_path and not Path(expectation_path).is_file():
+            raise FileNotFoundError(
+                f"ticker {ticker}: expectation assumptions not found: {expectation_path}"
+            )
         companies.append(
             CompanyInput(
                 ticker=ticker,
@@ -144,6 +150,7 @@ def load_universe_manifest(path: str | Path) -> UniverseManifest:
                 current_price=Decimal(current_price_text) if current_price_text else None,
                 price_as_of=_parse_datetime(price_as_of_text, "price_as_of", int(first["_row_number"])),
                 dcf_assumptions_path=dcf_path,
+                expectation_assumptions_path=expectation_path,
             )
         )
     return UniverseManifest(path=str(manifest_path), companies=companies)

@@ -66,7 +66,11 @@ class LLMReplayCache:
         )
         atomic_key = (
             str(request.metadata.get("atomic_evidence_key"))
-            if request.task == LLMTask.LOCAL_EVIDENCE_EXTRACTION
+            if request.task
+            in {
+                LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+                LLMTask.VALUATION_DRIVER_CLASSIFICATION,
+            }
             and request.metadata.get("atomic_evidence_key")
             else None
         )
@@ -223,19 +227,25 @@ class LLMReplayCache:
     def _model_for(self, task: LLMTask) -> str:
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.VALUATION_DRIVER_CLASSIFICATION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
             LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
             LLMTask.FINAL_MOAT_SCORING,
         }:
             return self.moat_model
         return self.summary_model
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.VALUATION_DRIVER_CLASSIFICATION,
+        }:
             return self.atomic_reasoning_effort
         if task in {
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
             LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
             LLMTask.FINAL_MOAT_SCORING,
         }:
             return self.moat_reasoning_effort

@@ -1,6 +1,6 @@
 # Universe manifest 계약
 
-`moatrader moat run`은 UTF-8 CSV manifest를 입력으로 받습니다. 한 행은 한 회사가 아니라 한 공시 문서를 뜻합니다. 따라서 같은 ticker에 DART 사업보고서, 분기보고서, IR HTML, SEC 10-K를 여러 행으로 넣을 수 있습니다.
+`moatrader analyze run`은 UTF-8 CSV manifest를 입력으로 받습니다. 한 행은 한 회사가 아니라 한 공시 문서를 뜻합니다. 따라서 같은 ticker에 DART 사업보고서, 분기보고서, IR HTML, SEC 10-K를 여러 행으로 넣을 수 있습니다. `moatrader moat run`은 하위 호환 alias입니다.
 
 ## 열
 
@@ -15,13 +15,14 @@
 | `current_price` | 아니요 | DCF와 결합할 양수 가격 |
 | `price_as_of` | 조건부 | 가격 timestamp. `current_price`와 함께 제공하며 offset 필수 |
 | `dcf_assumptions` | 아니요 | `DcfAssumptions` JSON 경로 |
+| `expectation_assumptions` | 아니요 | price-blind `ExpectationAnalysisRequest` JSON 경로. 제공하면 valuation-only evidence, Economic DCF, 3P, Reverse DCF, Expectation Gap을 실행 |
 
 회사 수준 선택 열은 같은 ticker의 여러 행에서 충돌하면 안 됩니다. 빈 행과 값이 있는 행을 섞는 것은 허용하지만 서로 다른 두 값은 거부합니다.
 
 ```csv
-ticker,source,input,metadata,issuer_id,issuer_name,current_price,price_as_of,dcf_assumptions
-005930,DART,raw/005930-annual.html,meta/005930-annual.json,00126380,삼성전자,80200,2026-08-14T15:30:00+09:00,dcf/005930.json
-005930,IR,raw/005930-ir.html,meta/005930-ir.json,00126380,삼성전자,80200,2026-08-14T15:30:00+09:00,dcf/005930.json
+ticker,source,input,metadata,issuer_id,issuer_name,current_price,price_as_of,dcf_assumptions,expectation_assumptions
+005930,DART,raw/005930-annual.html,meta/005930-annual.json,00126380,삼성전자,80200,2026-08-14T15:30:00+09:00,dcf/005930.json,expectations/005930.json
+005930,IR,raw/005930-ir.pdf,meta/005930-ir.json,00126380,삼성전자,80200,2026-08-14T15:30:00+09:00,dcf/005930.json,expectations/005930.json
 ```
 
 ## PIT 규칙
@@ -30,6 +31,8 @@ ticker,source,input,metadata,issuer_id,issuer_name,current_price,price_as_of,dcf
 - 모든 문서가 제외된 회사는 `NO_PIT_DOCUMENTS`가 됩니다.
 - DCF valuation timestamp는 run의 정확한 `--as-of`를 보존합니다.
 - 가격은 명시적인 `price_as_of`를 보존합니다. 현재 구현은 두 timestamp가 timezone-aware인지 검증하지만 거래 가능성, 휴장일, corporate action 조정 여부는 데이터 공급 단계에서 보장해야 합니다.
+- Expectation Analysis에서는 `--as-of <= price_as_of`를 추가로 강제하고, 둘의 간격이 `--maximum-price-age-days`보다 크면 거부합니다. 가격보다 늦은 evidence cutoff는 Reverse DCF와 결합되지 않습니다.
+- `ExpectationAnalysisRequest`에는 가격 필드가 존재하지 않으며 extra field도 거부됩니다. 요청의 timezone-aware `evidence_cutoff`는 run의 `--as-of`와 정확히 같아야 합니다. 가격은 intrinsic valuation과 3P가 끝난 다음 market lane에만 주입됩니다.
 
 ## 실행 선택
 

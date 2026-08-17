@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moatrader"
-version = "0.3.0"
-description = "Source-neutral canonical financial document model and LLM evidence pipeline"
+version = "1.0.0"
+description = "PIT financial evidence, economic DCF, reverse DCF, and expectation-gap analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

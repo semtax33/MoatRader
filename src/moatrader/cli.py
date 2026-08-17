@@ -42,7 +42,12 @@ from moatrader.preflight import (
 )
 from moatrader.runner import MoatUniverseRunner, UniverseRunConfig, UniverseRunResult
 from moatrader.runner.engine import RUNNER_VERSION
-from moatrader.runner.report import rank_run_result, ranking_csv
+from moatrader.runner.report import (
+    opportunities_csv,
+    rank_expectation_opportunities,
+    rank_run_result,
+    ranking_csv,
+)
 from moatrader.runstore import RunStore
 from moatrader.screening import SelectorConfig
 from moatrader.universe import load_universe_manifest
@@ -388,6 +393,11 @@ def _moat_run(args: argparse.Namespace) -> int:
         maximum_atomic_evidence_units=args.maximum_atomic_evidence_units,
         maximum_ir_atomic_evidence_units=args.maximum_ir_atomic_evidence_units,
         atomic_classification_votes=args.atomic_classification_votes,
+        maximum_valuation_atomic_evidence_units=args.maximum_valuation_atomic_evidence_units,
+        maximum_ir_valuation_atomic_evidence_units=(
+            args.maximum_ir_valuation_atomic_evidence_units
+        ),
+        valuation_classification_votes=args.valuation_classification_votes,
         incremental_ir_mode=args.incremental_ir,
         longitudinal_ir_mode=args.longitudinal_ir,
         minimum_longitudinal_ir_years=args.minimum_longitudinal_ir_years,
@@ -402,6 +412,7 @@ def _moat_run(args: argparse.Namespace) -> int:
         experiment_id=experiment_id,
         llm_replay_cache_directory=str(replay_cache),
         evidence_ledger_directory=str(evidence_ledger),
+        enable_legacy_moat_ranking=args.enable_legacy_moat_ranking,
     )
     is_large_manifest = len(manifest.companies) > 5
     if is_large_manifest and args.preflight_sample:
@@ -469,7 +480,8 @@ def _moat_run(args: argparse.Namespace) -> int:
         print(f"{company.ticker}\t{company.status.value}{suffix}")
     print(f"complete={sum(item.status.value == 'COMPLETE' for item in result.companies)}")
     print(f"failed={result.failed_count}")
-    print(f"ranked={len(result.ranking)}")
+    print(f"expectation_opportunities={len(result.opportunities)}")
+    print(f"legacy_moat_ranked={len(result.ranking)}")
     return 2 if result.failed_count else 0
 
 
@@ -502,11 +514,21 @@ def _moat_status(args: argparse.Namespace) -> int:
     print(f"run_dir={directory}")
     print(f"as_of={result.as_of.isoformat()}")
     for company in result.companies:
-        score = company.moat_score.economic_moat_score if company.moat_score else "-"
-        fair_value = company.dcf.fair_value_per_share if company.dcf else "-"
-        print(f"{company.ticker}\t{company.status.value}\tmoat={score}\tdcf={fair_value}")
+        expectation = company.expectation_analysis
+        gap = expectation.expectation_gap.direction.value if expectation else "-"
+        central = (
+            expectation.intrinsic_valuation.central_value_per_share
+            if expectation
+            else "-"
+        )
+        probable = expectation.three_p["central"].verdict.value if expectation else "-"
+        print(
+            f"{company.ticker}\t{company.status.value}\tgap={gap}"
+            f"\tintrinsic_central={central}\t3p={probable}"
+        )
     print(f"failed={result.failed_count}")
-    print(f"ranked={len(result.ranking)}")
+    print(f"expectation_opportunities={len(result.opportunities)}")
+    print(f"legacy_moat_ranked={len(result.ranking)}")
     return 0
 
 
@@ -529,6 +551,25 @@ def _screen_rank(args: argparse.Namespace) -> int:
             f"\tprice/dcf={candidate.price_to_dcf:.4f}"
             f"\tmargin={candidate.margin_of_safety:.4f}"
             f"\tquality_value={candidate.quality_value_score:.6f}"
+        )
+    print(f"ranked={len(ranked)}")
+    print(f"output={output}")
+    return 0
+
+
+def _screen_expectations(args: argparse.Namespace) -> int:
+    directory, result = _load_run_result(args.run_dir)
+    ranked = rank_expectation_opportunities(result)
+    reranked = result.model_copy(update={"opportunities": ranked})
+    output = Path(args.output).resolve() if args.output else directory / "opportunities.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(opportunities_csv(reranked), encoding="utf-8")
+    for rank, candidate in enumerate(ranked, start=1):
+        print(
+            f"{rank}\t{candidate.ticker}\tdirection={candidate.direction.value}"
+            f"\tcentral_gap={candidate.central_value_gap:.4f}"
+            f"\tdownside_gap={candidate.downside_value_gap:.4f}"
+            f"\trange_width={candidate.valuation_range_width_pct:.4f}"
         )
     print(f"ranked={len(ranked)}")
     print(f"output={output}")
@@ -720,7 +761,11 @@ def build_parser() -> argparse.ArgumentParser:
     schema = subparsers.add_parser("schema", help="print CanonicalDocumentBundle JSON Schema")
     schema.set_defaults(handler=_schema)
 
-    moat = subparsers.add_parser("moat", help="run or inspect MOAT analysis")
+    moat = subparsers.add_parser(
+        "analyze",
+        aliases=["moat"],
+        help="run or inspect evidence, intrinsic valuation, and expectation-gap analysis",
+    )
     moat_subparsers = moat.add_subparsers(dest="moat_command", required=True)
     moat_run = moat_subparsers.add_parser("run", help="analyze one, several, or all manifest tickers")
     moat_run.add_argument("--universe", required=True, help="universe CSV manifest")
@@ -855,6 +900,30 @@ def build_parser() -> argparse.ArgumentParser:
     moat_run.add_argument("--ir-ocr-cpu-threads", type=int, default=6)
     moat_run.add_argument("--workers", type=int, default=1)
     moat_run.add_argument("--validation-attempts", type=int, default=2)
+    moat_run.add_argument(
+        "--enable-legacy-moat-ranking",
+        action="store_true",
+        help="emit the deprecated MOAT×DCF ranking for diagnostics only",
+    )
+    moat_run.add_argument(
+        "--maximum-valuation-atomic-evidence-units",
+        type=int,
+        default=24,
+        help="valuation-only atomic units selected independently from the frozen MOAT sensor",
+    )
+    moat_run.add_argument(
+        "--maximum-ir-valuation-atomic-evidence-units",
+        type=int,
+        default=12,
+        help="IR valuation-only units; enabled only when expectation_assumptions is supplied",
+    )
+    moat_run.add_argument(
+        "--valuation-classification-votes",
+        type=int,
+        choices=[1, 3, 5, 7, 9],
+        default=3,
+        help="strict-majority votes for the valuation-driver lane",
+    )
     moat_run.add_argument("--api-retries", type=int, default=4)
     moat_run.add_argument("--api-timeout", type=float, default=180.0)
     moat_run.set_defaults(handler=_moat_run)
@@ -863,9 +932,20 @@ def build_parser() -> argparse.ArgumentParser:
     moat_status.add_argument("--run-dir", required=True)
     moat_status.set_defaults(handler=_moat_status)
 
-    screen = subparsers.add_parser("screen", help="rank completed MOAT + DCF results")
+    screen = subparsers.add_parser("screen", help="rank completed expectation-gap results")
     screen_subparsers = screen.add_subparsers(dest="screen_command", required=True)
-    rank = screen_subparsers.add_parser("rank", help="re-rank a run with explicit thresholds")
+    expectations = screen_subparsers.add_parser(
+        "expectations",
+        help="rank the primary Reverse-DCF/3P expectation-gap output",
+    )
+    expectations.add_argument("--run-dir", required=True)
+    expectations.add_argument("--output")
+    expectations.set_defaults(handler=_screen_expectations)
+
+    rank = screen_subparsers.add_parser(
+        "rank",
+        help="deprecated diagnostic: re-rank legacy MOAT×DCF output",
+    )
     rank.add_argument("--run-dir", required=True)
     rank.add_argument("--minimum-moat-score", type=Decimal, default=Decimal("5"))
     rank.add_argument("--minimum-margin-of-safety", type=Decimal, default=Decimal("0.20"))

@@ -5,6 +5,7 @@ from moatrader.evidence.atomic import (
     build_atomic_evidence_units,
     select_context_cited_atomic_units,
     select_atomic_evidence_units,
+    select_valuation_evidence_units,
 )
 from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
@@ -61,6 +62,14 @@ from moatrader.evidence.validation import (
     validate_evidence_result,
     validate_moat_score,
 )
+from moatrader.evidence.sensor_contract import (
+    EVIDENCE_SENSOR_VERSION,
+    FROZEN_BOSS_GATES,
+    FROZEN_FULL_GATES,
+    IR_VISUAL_EXTRACTOR_CONTRACT_VERSION,
+    ExtractionSetReproducibility,
+    extraction_set_reproducibility,
+)
 
 __all__ = [
     "AtomicEvidenceJudgment",
@@ -106,6 +115,7 @@ __all__ = [
     "atomic_moat_role",
     "build_atomic_classification_consensus",
     "select_atomic_evidence_units",
+    "select_valuation_evidence_units",
     "derive_audited_moat_score",
     "derive_rank_refinement",
     "derive_raw_ordinal_shadow_score",
@@ -118,4 +128,10 @@ __all__ = [
     "validate_contextual_moat_assessment",
     "validate_evidence_result",
     "validate_moat_score",
+    "EVIDENCE_SENSOR_VERSION",
+    "FROZEN_BOSS_GATES",
+    "FROZEN_FULL_GATES",
+    "IR_VISUAL_EXTRACTOR_CONTRACT_VERSION",
+    "ExtractionSetReproducibility",
+    "extraction_set_reproducibility",
 ]

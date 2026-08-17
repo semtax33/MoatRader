@@ -13,6 +13,12 @@ from pydantic import BaseModel
 
 from moatrader.adapters import RawDocument, enrich_ir_table_semantics
 from moatrader.audit import RunManifest
+from moatrader.business import (
+    ValuationDriverEvidenceBundle,
+    ValuationDriverExtraction,
+    ValuationDriverMapper,
+    build_valuation_driver_consensus,
+)
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import (
     CanonicalDocumentBundle,
@@ -44,6 +50,12 @@ from moatrader.evidence.models import (
     OUTCOME_CORROBORATION_TYPES,
     STRUCTURAL_MOAT_TYPES,
     SectionSummary,
+)
+from moatrader.evidence.sensor_contract import (
+    EVIDENCE_SENSOR_VERSION,
+    FROZEN_BOSS_GATES,
+    FROZEN_FULL_GATES,
+    IR_VISUAL_EXTRACTOR_CONTRACT_VERSION,
 )
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
@@ -82,8 +94,14 @@ from moatrader.evidence.atomic import (
     map_context_references_to_atomic_units,
     select_atomic_evidence_units,
     select_context_cited_atomic_units,
+    select_valuation_evidence_units,
 )
 from moatrader.evidence.metamorphic import audit_company_metamorphs
+from moatrader.expectations import (
+    ExpectationAnalysis,
+    ExpectationAnalysisEngine,
+    ExpectationAnalysisRequest,
+)
 from moatrader.financial import (
     DcfAssumptions,
     DcfAssumptionType,
@@ -100,6 +118,7 @@ from moatrader.llm import (
     build_contextual_moat_strength_request,
     build_ir_incremental_assessment_request,
     build_section_summary_request,
+    build_valuation_driver_request,
 )
 from moatrader.llm.transport import TransportResult, TransportUsage
 from moatrader.pipeline import CanonicalFinancialDocumentPipeline
@@ -113,13 +132,19 @@ from moatrader.runner.models import (
     UniverseRunConfig,
     UniverseRunResult,
 )
-from moatrader.runner.report import rank_run_result, ranking_csv, results_csv
+from moatrader.runner.report import (
+    opportunities_csv,
+    rank_expectation_opportunities,
+    rank_run_result,
+    ranking_csv,
+    results_csv,
+)
 from moatrader.semantic import HeuristicTokenCounter, SemanticChunk, deduplicate_chunks
 from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.9.5"
+RUNNER_VERSION = "1.0.0"
 
 
 class MoatUniverseRunner:
@@ -140,6 +165,7 @@ class MoatUniverseRunner:
         self.snapshots = FinancialSnapshotBuilder()
         self.retriever = EvidenceRetriever()
         self.pack_builder = EvidencePackBuilder()
+        self.expectation_engine = ExpectationAnalysisEngine()
         self.strength_context_builder = MoatStrengthContextBuilder(
             model_context_tokens=config.strength_context_tokens,
             prompt_reserve_tokens=config.strength_prompt_reserve_tokens,
@@ -195,10 +221,22 @@ class MoatUniverseRunner:
             completed_at=datetime.now(timezone.utc),
             companies=results,
         )
-        final = unranked.model_copy(update={"ranking": rank_run_result(unranked)})
+        legacy_ranking = (
+            rank_run_result(unranked) if self.config.enable_legacy_moat_ranking else []
+        )
+        with_legacy = unranked.model_copy(
+            update={
+                "ranking": legacy_ranking,
+                "legacy_moat_ranking_enabled": self.config.enable_legacy_moat_ranking,
+            }
+        )
+        final = with_legacy.model_copy(
+            update={"opportunities": rank_expectation_opportunities(with_legacy)}
+        )
         self.store.write_json(self.store.root / "run-result.json", final)
         self.store.write_text(self.store.root / "results.csv", results_csv(final))
         self.store.write_text(self.store.root / "ranking.csv", ranking_csv(final))
+        self.store.write_text(self.store.root / "opportunities.csv", opportunities_csv(final))
         return final
 
     def _safe_run_company(self, company: CompanyInput) -> CompanyRunResult:
@@ -239,18 +277,33 @@ class MoatUniverseRunner:
             ]
         source_document_ids: list[str] = []
         try:
-            if company.price_as_of is not None and company.price_as_of > self.config.as_of:
-                raise ValueError(
-                    f"price_as_of {company.price_as_of.isoformat()} is after run as_of "
-                    f"{self.config.as_of.isoformat()}"
-                )
-            if company.price_as_of is not None and (
-                self.config.as_of - company.price_as_of
-            ) > timedelta(days=self.config.maximum_price_age_days):
-                raise ValueError(
-                    f"price_as_of {company.price_as_of.isoformat()} is older than the configured "
-                    f"{self.config.maximum_price_age_days}-day limit"
-                )
+            if company.price_as_of is not None:
+                if company.expectation_assumptions_path:
+                    if company.price_as_of < self.config.as_of:
+                        raise ValueError(
+                            f"expectation price_as_of {company.price_as_of.isoformat()} is before "
+                            f"the evidence cutoff {self.config.as_of.isoformat()}"
+                        )
+                    if (company.price_as_of - self.config.as_of) > timedelta(
+                        days=self.config.maximum_price_age_days
+                    ):
+                        raise ValueError(
+                            f"expectation price_as_of is more than the configured "
+                            f"{self.config.maximum_price_age_days} days after the evidence cutoff"
+                        )
+                else:
+                    if company.price_as_of > self.config.as_of:
+                        raise ValueError(
+                            f"price_as_of {company.price_as_of.isoformat()} is after run as_of "
+                            f"{self.config.as_of.isoformat()}"
+                        )
+                    if (self.config.as_of - company.price_as_of) > timedelta(
+                        days=self.config.maximum_price_age_days
+                    ):
+                        raise ValueError(
+                            f"price_as_of {company.price_as_of.isoformat()} is older than the "
+                            f"configured {self.config.maximum_price_age_days}-day limit"
+                        )
             self._checkpoint(checkpoint_path, signature, "INGESTING")
             bundles, chunks = self._ingest_company(company, company_dir)
             if not bundles:
@@ -475,6 +528,36 @@ class MoatUniverseRunner:
                 else []
             )
             evidence_chunks = [*base_evidence_chunks, *ir_evidence_chunks]
+            valuation_evidence_chunks: list[SemanticChunk] = []
+            if company.expectation_assumptions_path:
+                valuation_base_units = select_valuation_evidence_units(
+                    base_atomic_units,
+                    self.config.maximum_valuation_atomic_evidence_units,
+                )
+                valuation_ir_units = (
+                    select_valuation_evidence_units(
+                        ir_atomic_units,
+                        self.config.maximum_ir_valuation_atomic_evidence_units,
+                        preserve_document_coverage=self.config.longitudinal_ir_mode,
+                    )
+                    if self.config.incremental_ir_mode
+                    else []
+                )
+                valuation_evidence_chunks = sorted(
+                    {
+                        unit.chunk_id: unit
+                        for unit in [*valuation_base_units, *valuation_ir_units]
+                    }.values(),
+                    key=lambda unit: (
+                        str(unit.metadata.get("atomic_evidence_key")),
+                        unit.document_id,
+                        unit.chunk_id,
+                    ),
+                )
+                self.store.write_jsonl(
+                    company_dir / "valuation-atomic-evidence-units.jsonl",
+                    valuation_evidence_chunks,
+                )
             self.store.write_jsonl(company_dir / "atomic-evidence-units.jsonl", evidence_chunks)
             self.store.write_json(
                 company_dir / "evidence-chunk-selection.json",
@@ -500,6 +583,27 @@ class MoatUniverseRunner:
                     "ir_selected_atomic_unit_count": len(ir_evidence_chunks),
                     "ir_cannot_displace_base": self.config.incremental_ir_mode,
                     "selected_chunk_ids": [chunk.chunk_id for chunk in evidence_chunks],
+                    "valuation_lane_enabled": bool(company.expectation_assumptions_path),
+                    "valuation_selected_atomic_unit_count": len(valuation_evidence_chunks),
+                    "valuation_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                        valuation_evidence_chunks
+                    ),
+                },
+            )
+            self.store.write_json(
+                company_dir / "evidence-sensor-manifest.json",
+                {
+                    "schema_version": "evidence-sensor-manifest/1",
+                    "evidence_sensor_version": EVIDENCE_SENSOR_VERSION,
+                    "atomic_segmentation_version": ATOMIC_SEGMENTATION_VERSION,
+                    "atomic_rubric_version": ATOMIC_RUBRIC_VERSION,
+                    "ir_visual_extractor_contract_version": (
+                        IR_VISUAL_EXTRACTOR_CONTRACT_VERSION
+                    ),
+                    "boss_regression_gates": FROZEN_BOSS_GATES,
+                    "full_regression_gates": FROZEN_FULL_GATES,
+                    "scalar_moat_role": "DIAGNOSTIC_ONLY",
+                    "return_data_used_for_sensor_tuning": False,
                 },
             )
 
@@ -512,6 +616,18 @@ class MoatUniverseRunner:
                 for chunk in evidence_chunks
             ]
             self.store.write_jsonl(company_dir / "evidence-requests.jsonl", evidence_requests)
+            valuation_requests = [
+                build_valuation_driver_request(
+                    chunk,
+                    issuer_id=issuer_id,
+                    issuer_name=company.issuer_name,
+                )
+                for chunk in valuation_evidence_chunks
+            ]
+            self.store.write_jsonl(
+                company_dir / "valuation-driver-requests.jsonl",
+                valuation_requests,
+            )
             token_counter = HeuristicTokenCounter()
             minimal_schema_json = json.dumps(
                 AtomicEvidenceExtraction.model_json_schema(),
@@ -541,6 +657,28 @@ class MoatUniverseRunner:
             estimated_atomic_input_tokens = (
                 static_prefix_tokens * len(evidence_requests) + dynamic_suffix_tokens
             )
+            valuation_schema_json = json.dumps(
+                ValuationDriverExtraction.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            valuation_schema_tokens = token_counter.count(valuation_schema_json)
+            valuation_static_prefix_tokens = (
+                token_counter.count(valuation_requests[0].system + valuation_schema_json)
+                if valuation_requests
+                else 0
+            )
+            valuation_dynamic_suffix_tokens = sum(
+                token_counter.count(request.user) for request in valuation_requests
+            )
+            valuation_source_evidence_tokens = sum(
+                token_counter.count(chunk.markdown) for chunk in valuation_evidence_chunks
+            )
+            estimated_valuation_input_tokens = (
+                valuation_static_prefix_tokens * len(valuation_requests)
+                + valuation_dynamic_suffix_tokens
+            )
             strength_schema_json = json.dumps(
                 ContextualMoatAssessment.model_json_schema(),
                 ensure_ascii=False,
@@ -557,16 +695,24 @@ class MoatUniverseRunner:
             estimated_cacheable_prefix_tokens = (
                 (static_prefix_tokens * len(evidence_requests) if static_prefix_tokens >= 1_024 else 0)
                 + (
+                    valuation_static_prefix_tokens * len(valuation_requests)
+                    if valuation_static_prefix_tokens >= 1_024
+                    else 0
+                )
+                + (
                     strength_static_prefix_tokens
                     if strength_static_prefix_tokens >= 1_024
                     else 0
                 )
             )
             estimated_dynamic_suffix_tokens = (
-                dynamic_suffix_tokens + strength_dynamic_suffix_tokens
+                dynamic_suffix_tokens
+                + valuation_dynamic_suffix_tokens
+                + strength_dynamic_suffix_tokens
             )
             expected_output_token_cap = (
                 len(evidence_requests) * min(self.config.max_output_tokens, 2_000)
+                + len(valuation_requests) * min(self.config.max_output_tokens, 2_000)
                 + min(self.config.max_output_tokens, 8_000)
             )
             token_budget_audit = {
@@ -580,6 +726,18 @@ class MoatUniverseRunner:
                 "estimated_dynamic_suffix_tokens_all_tasks": estimated_dynamic_suffix_tokens,
                 "expected_output_token_cap_total": expected_output_token_cap,
                 "atomic_request_count": len(evidence_requests),
+                "valuation_driver_request_count": len(valuation_requests),
+                "estimated_valuation_driver_input_tokens": estimated_valuation_input_tokens,
+                "estimated_valuation_driver_static_prefix_tokens_per_request": (
+                    valuation_static_prefix_tokens
+                ),
+                "estimated_valuation_driver_dynamic_suffix_tokens_total": (
+                    valuation_dynamic_suffix_tokens
+                ),
+                "estimated_valuation_driver_source_tokens_total": (
+                    valuation_source_evidence_tokens
+                ),
+                "valuation_driver_schema_tokens": valuation_schema_tokens,
                 "estimated_atomic_input_tokens": estimated_atomic_input_tokens,
                 "estimated_static_prefix_tokens_per_request": static_prefix_tokens,
                 "estimated_dynamic_suffix_tokens_total": dynamic_suffix_tokens,
@@ -618,7 +776,9 @@ class MoatUniverseRunner:
                 "prompt_cache_ttl": "30m",
                 "prompt_cache_breakpoint_count": sum(
                     request.prompt_cache_breakpoint for request in evidence_requests
-                ) + int(strength_request.prompt_cache_breakpoint),
+                )
+                + sum(request.prompt_cache_breakpoint for request in valuation_requests)
+                + int(strength_request.prompt_cache_breakpoint),
                 "prompt_cache_minimum_prefix_tokens": 1_024,
                 "estimated_prefix_cache_eligible": static_prefix_tokens >= 1_024,
                 "cache_eligibility_note": (
@@ -910,6 +1070,8 @@ class MoatUniverseRunner:
                 company_dir,
                 evidence_requests,
                 evidence_chunks,
+                valuation_requests,
+                valuation_evidence_chunks,
             )
 
             self._checkpoint(checkpoint_path, signature, "EXTRACTING_EVIDENCE")
@@ -922,6 +1084,13 @@ class MoatUniverseRunner:
                 issuer_name=company.issuer_name,
             )
             self.store.write_jsonl(company_dir / "current-evidence.jsonl", current_cards)
+            valuation_only_evidence = self._load_or_extract_valuation_driver_evidence(
+                company_dir=company_dir,
+                chunks=valuation_evidence_chunks,
+                audits=audits,
+                issuer_id=issuer_id,
+                issuer_name=company.issuer_name,
+            )
             ledger_merge = None
             active_ledger_document_ids: list[str] = []
             cards = current_cards
@@ -1558,6 +1727,21 @@ class MoatUniverseRunner:
                 ),
             )
 
+            card_driver_evidence = ValuationDriverMapper().map_cards(
+                issuer_id=issuer_id,
+                as_of=self.config.as_of,
+                cards=cards,
+            )
+            valuation_driver_evidence = ValuationDriverMapper.merge_bundles(
+                card_driver_evidence,
+                valuation_only_evidence,
+            )
+            expectation_analysis = self._calculate_expectation_analysis(
+                company=company,
+                company_dir=company_dir,
+                cards=cards,
+                driver_evidence=valuation_driver_evidence,
+            )
             usage = self._sum_usage(audits)
             self.store.write_jsonl(company_dir / "llm-calls.jsonl", audits)
             result = CompanyRunResult(
@@ -1573,6 +1757,7 @@ class MoatUniverseRunner:
                 strength_context_chunk_count=len(strength_context.selected_chunk_ids),
                 moat_score=score,
                 dcf=dcf,
+                expectation_analysis=expectation_analysis,
                 current_price=company.current_price,
                 price_as_of=company.price_as_of,
                 valuation_as_of=self.config.as_of,
@@ -2082,6 +2267,125 @@ class MoatUniverseRunner:
         self.store.write_json(company_dir / "dcf.json", dcf)
         return dcf
 
+    def _calculate_expectation_analysis(
+        self,
+        *,
+        company: CompanyInput,
+        company_dir: Path,
+        cards: list[EvidenceCard],
+        driver_evidence: ValuationDriverEvidenceBundle,
+    ) -> ExpectationAnalysis | None:
+        if not company.expectation_assumptions_path:
+            return None
+        if company.current_price is None or company.price_as_of is None:
+            raise ValueError(
+                "expectation analysis requires PIT current_price and price_as_of market inputs"
+            )
+        request_text = Path(company.expectation_assumptions_path).read_text(encoding="utf-8-sig")
+        request = ExpectationAnalysisRequest.model_validate_json(request_text)
+        analysis = self.expectation_engine.analyze(
+            issuer_id=company.issuer_id or company.ticker,
+            as_of=self.config.as_of,
+            cards=cards,
+            request=request,
+            current_price=company.current_price,
+            price_as_of=company.price_as_of,
+            driver_evidence=driver_evidence,
+        )
+        self.store.write_json(company_dir / "valuation-driver-evidence.json", analysis.driver_evidence)
+        self.store.write_json(
+            company_dir / "competitive-advantage-profile.json",
+            analysis.competitive_advantage_profile,
+        )
+        self.store.write_json(company_dir / "cap-assessment.json", analysis.cap_assessment)
+        if analysis.capital_allocation_profile is not None:
+            self.store.write_json(
+                company_dir / "capital-allocation-profile.json",
+                analysis.capital_allocation_profile,
+            )
+        self.store.write_json(company_dir / "intrinsic-valuation.json", analysis.intrinsic_valuation)
+        self.store.write_json(company_dir / "three-p.json", analysis.three_p)
+        self.store.write_json(
+            company_dir / "reverse-dcf-surface.json",
+            analysis.implied_expectations,
+        )
+        self.store.write_json(company_dir / "expectation-gap.json", analysis.expectation_gap)
+        self.store.write_json(company_dir / "expectation-analysis.json", analysis)
+        self.store.write_json(
+            company_dir / "expectation-analysis-manifest.json",
+            {
+                "schema_version": analysis.schema_version,
+                "as_of": self.config.as_of.isoformat(),
+                "request_evidence_cutoff": request.evidence_cutoff.isoformat(),
+                "price_as_of": company.price_as_of.isoformat(),
+                "input_sha256": hashlib.sha256(request_text.encode("utf-8")).hexdigest(),
+                "engine_version": "expectation-analysis/1",
+                "calculation_mode": "deterministic_python",
+                "old_moat_score_used_for_valuation": False,
+                "intrinsic_price_inputs_used": analysis.intrinsic_valuation.price_inputs_used,
+                "market_lane_started_after_intrinsic_lane": True,
+            },
+        )
+        return analysis
+
+    def _load_or_extract_valuation_driver_evidence(
+        self,
+        *,
+        company_dir: Path,
+        chunks: list[SemanticChunk],
+        audits: list[LLMCallAudit],
+        issuer_id: str,
+        issuer_name: str | None,
+    ) -> ValuationDriverEvidenceBundle:
+        extracted: list[tuple[ValuationDriverExtraction, SemanticChunk]] = []
+        for chunk in chunks:
+            atomic_key = str(chunk.metadata["atomic_evidence_key"])
+            votes: list[ValuationDriverExtraction] = []
+            for vote in range(1, self.config.valuation_classification_votes + 1):
+                checkpoint = (
+                    company_dir
+                    / "valuation-driver-by-key"
+                    / atomic_key
+                    / f"vote-{vote:02d}.json"
+                )
+                if self.config.resume and checkpoint.is_file():
+                    extraction = ValuationDriverExtraction.model_validate(
+                        self.store.read_json(checkpoint)
+                    )
+                else:
+                    request = build_valuation_driver_request(
+                        chunk,
+                        issuer_id=issuer_id,
+                        issuer_name=issuer_name,
+                        classification_vote=vote,
+                    )
+                    extraction = self._execute_validated(
+                        request,
+                        ValuationDriverExtraction,
+                        lambda value: (
+                            ["valuation request unexpectedly contains price input"]
+                            if request.metadata.get("price_inputs_present") is not False
+                            else []
+                        ),
+                        audits,
+                        company_dir,
+                    )
+                    self.store.write_json(checkpoint, extraction)
+                votes.append(extraction)
+            consensus, diagnostics = build_valuation_driver_consensus(votes)
+            self.store.write_json(
+                company_dir / "valuation-driver-consensus-by-key" / f"{atomic_key}.json",
+                diagnostics,
+            )
+            extracted.append((consensus, chunk))
+        bundle = ValuationDriverMapper().map_atomic_extractions(
+            issuer_id=issuer_id,
+            as_of=self.config.as_of,
+            extractions=extracted,
+        )
+        self.store.write_json(company_dir / "valuation-driver-evidence-only.json", bundle)
+        return bundle
+
     def _execute_validated(
         self,
         request: LLMRequest,
@@ -2502,6 +2806,7 @@ class MoatUniverseRunner:
                 build_contextual_moat_strength_request,
                 build_ir_incremental_assessment_request,
                 build_section_summary_request,
+                build_valuation_driver_request,
                 build_evidence_preserving_summaries,
                 EvidencePackBuilder.build,
                 MoatStrengthContextBuilder.build,
@@ -2519,6 +2824,7 @@ class MoatUniverseRunner:
             {
                 "atomic_extraction": AtomicEvidenceExtraction.model_json_schema(),
                 "atomic_judgment": AtomicEvidenceJudgment.model_json_schema(),
+                "valuation_driver_extraction": ValuationDriverExtraction.model_json_schema(),
                 "contextual_moat_assessment": ContextualMoatAssessment.model_json_schema(),
                 "ir_incremental_assessment": IrIncrementalAssessment.model_json_schema(),
                 "reconciled_moat_assessment": ReconciledMoatAssessment.model_json_schema(),
@@ -2559,6 +2865,13 @@ class MoatUniverseRunner:
                     "maximum_price_age_days": self.config.maximum_price_age_days,
                     "maximum_atomic_evidence_units": self.config.maximum_atomic_evidence_units,
                     "maximum_ir_atomic_evidence_units": self.config.maximum_ir_atomic_evidence_units,
+                    "maximum_valuation_atomic_evidence_units": (
+                        self.config.maximum_valuation_atomic_evidence_units
+                    ),
+                    "maximum_ir_valuation_atomic_evidence_units": (
+                        self.config.maximum_ir_valuation_atomic_evidence_units
+                    ),
+                    "valuation_classification_votes": self.config.valuation_classification_votes,
                     "incremental_ir_mode": self.config.incremental_ir_mode,
                     "longitudinal_ir_mode": self.config.longitudinal_ir_mode,
                     "minimum_longitudinal_ir_years": (
@@ -2569,6 +2882,7 @@ class MoatUniverseRunner:
                     "experiment_id": self.config.experiment_id,
                     "llm_replay_enabled": bool(self.config.llm_replay_cache_directory),
                     "evidence_ledger_enabled": bool(self.config.evidence_ledger_directory),
+                    "enable_legacy_moat_ranking": self.config.enable_legacy_moat_ranking,
                     "runner_version": RUNNER_VERSION,
                     "prompt_contract_sha256": hashlib.sha256(prompt_contract.encode("utf-8")).hexdigest(),
                     "response_schema_sha256": hashlib.sha256(schema_contract.encode("utf-8")).hexdigest(),
@@ -2581,6 +2895,8 @@ class MoatUniverseRunner:
             digest.update(Path(document.metadata_path).read_bytes())
         if company.dcf_assumptions_path:
             digest.update(Path(company.dcf_assumptions_path).read_bytes())
+        if company.expectation_assumptions_path:
+            digest.update(Path(company.expectation_assumptions_path).read_bytes())
         return digest.hexdigest()
 
     def _checkpoint(self, path: Path, signature: str, stage: str, error: str | None = None) -> None:
@@ -2599,6 +2915,8 @@ class MoatUniverseRunner:
         company_dir: Path,
         requests: list[LLMRequest],
         units: list[SemanticChunk],
+        valuation_requests: list[LLMRequest],
+        valuation_units: list[SemanticChunk],
     ) -> None:
         path = company_dir / "llm-token-budget.json"
         payload = self.store.read_json(path)
@@ -2615,6 +2933,27 @@ class MoatUniverseRunner:
         dynamic_tokens = sum(counter.count(request.user) for request in requests)
         source_tokens = sum(counter.count(unit.markdown) for unit in units)
         total_tokens = static_tokens * len(requests) + dynamic_tokens
+        valuation_schema_json = json.dumps(
+            ValuationDriverExtraction.model_json_schema(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        valuation_static_tokens = (
+            counter.count(valuation_requests[0].system + valuation_schema_json)
+            if valuation_requests
+            else 0
+        )
+        valuation_dynamic_tokens = sum(
+            counter.count(request.user) for request in valuation_requests
+        )
+        valuation_source_tokens = sum(
+            counter.count(unit.markdown) for unit in valuation_units
+        )
+        valuation_total_tokens = (
+            valuation_static_tokens * len(valuation_requests)
+            + valuation_dynamic_tokens
+        )
         strength_static_tokens = int(
             payload.get("estimated_strength_static_prefix_tokens", 0)
         )
@@ -2625,6 +2964,7 @@ class MoatUniverseRunner:
         payload.update(
             {
                 "atomic_request_count": len(requests),
+                "valuation_driver_request_count": len(valuation_requests),
                 "estimated_atomic_input_tokens": total_tokens,
                 "estimated_static_prefix_tokens_per_request": static_tokens,
                 "estimated_dynamic_suffix_tokens_total": dynamic_tokens,
@@ -2632,19 +2972,35 @@ class MoatUniverseRunner:
                 "estimated_useful_source_token_ratio": (
                     source_tokens / total_tokens if total_tokens else 0.0
                 ),
+                "estimated_valuation_driver_input_tokens": valuation_total_tokens,
+                "estimated_valuation_driver_static_prefix_tokens_per_request": (
+                    valuation_static_tokens
+                ),
+                "estimated_valuation_driver_dynamic_suffix_tokens_total": (
+                    valuation_dynamic_tokens
+                ),
+                "estimated_valuation_driver_source_tokens_total": valuation_source_tokens,
                 "prompt_cache_breakpoint_count": sum(
                     request.prompt_cache_breakpoint for request in requests
-                ) + strength_breakpoints,
+                )
+                + sum(request.prompt_cache_breakpoint for request in valuation_requests)
+                + strength_breakpoints,
                 "estimated_prefix_cache_eligible": static_tokens >= 1_024,
                 "estimated_cacheable_prefix_tokens_total": (
                     static_tokens * len(requests) if static_tokens >= 1_024 else 0
                 )
+                + (
+                    valuation_static_tokens * len(valuation_requests)
+                    if valuation_static_tokens >= 1_024
+                    else 0
+                )
                 + (strength_static_tokens if strength_static_tokens >= 1_024 else 0),
                 "estimated_dynamic_suffix_tokens_all_tasks": (
-                    dynamic_tokens + strength_dynamic_tokens
+                    dynamic_tokens + valuation_dynamic_tokens + strength_dynamic_tokens
                 ),
                 "expected_output_token_cap_total": (
                     len(requests) * min(self.config.max_output_tokens, 2_000)
+                    + len(valuation_requests) * min(self.config.max_output_tokens, 2_000)
                     + min(self.config.max_output_tokens, 8_000)
                 ),
                 "atomic_selection_policy": "BASELINE_PLUS_CONTEXT_CITATION_AUDIT",

@@ -37,6 +37,13 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     EvidenceType,
 )
+from moatrader.evidence.sensor_contract import (
+    EVIDENCE_SENSOR_VERSION,
+    FROZEN_BOSS_GATES,
+    FROZEN_FULL_GATES,
+    IR_VISUAL_EXTRACTOR_CONTRACT_VERSION,
+    extraction_set_reproducibility,
+)
 from moatrader.evidence.processing import (
     atomic_routing_signature,
     build_atomic_classification_consensus,
@@ -50,9 +57,9 @@ from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 LANES = ("control", "vision")
 DIMENSIONS = ("axis_legend", "series_identity", "numeric_recovery", "trend_relation")
-EXTRACTOR_PROMPT_VERSION = "ir-page-claim-extractor/6"
+EXTRACTOR_PROMPT_VERSION = IR_VISUAL_EXTRACTOR_CONTRACT_VERSION
 JUDGE_PROMPT_VERSION = "ir-visual-coverage-judge/6"
-REPORT_SCHEMA_VERSION = "moatrader-ir-visual-ablation/2"
+REPORT_SCHEMA_VERSION = "moatrader-ir-visual-ablation/3"
 EXTRACTION_PASSES = ("inventory", "numeric_series", "anchor_audit")
 JUDGE_MAX_OUTPUT_TOKENS = 3_000
 
@@ -1765,6 +1772,73 @@ def _usage(output: Path) -> dict[str, int]:
     return totals
 
 
+def _signature_text(value: str) -> str:
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip().casefold()
+
+
+def _extraction_claim_key(claim: ExtractedPageClaim) -> str:
+    observations = sorted(
+        (
+            _signature_text(item.metric),
+            _signature_text(item.series),
+            _signature_text(item.period),
+            format(item.value, ".12g"),
+            _signature_text(item.unit),
+        )
+        for item in claim.observations
+    )
+    if observations:
+        payload: object = {"observations": observations}
+    else:
+        payload = {
+            "series": sorted(_signature_text(item) for item in claim.series_identity),
+            "numbers": sorted(_signature_text(item) for item in claim.numeric_anchors),
+            "relations": sorted(_signature_text(item) for item in claim.trend_relations),
+            "fallback_claim": _signature_text(claim.claim),
+        }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _extraction_set_and_score_presence(
+    *,
+    output: Path,
+    gold: dict[str, Any],
+    lane: str = "vision",
+) -> tuple[set[str], dict[str, bool]]:
+    claim_keys: set[str] = set()
+    pages = sorted({(str(item["ticker"]), int(item["page"])) for item in gold["claims"]})
+    for ticker, page in pages:
+        path = output / "checkpoints" / "extraction" / lane / f"{ticker}-p{page:03d}.json"
+        if not path.is_file():
+            continue
+        payload = _read_json(path)
+        if payload.get("status") != "SUCCESS":
+            continue
+        extraction = PageClaimExtraction.model_validate(payload["parsed"])
+        claim_keys.update(_extraction_claim_key(item) for item in extraction.claims)
+
+    presence: dict[str, bool] = {}
+    for claim in gold["claims"]:
+        if not _score_bearing(_gold_route(claim)):
+            continue
+        path = output / "checkpoints" / "judgment" / lane / f"{claim['claim_id']}.json"
+        if not path.is_file():
+            presence[str(claim["claim_id"])] = False
+            continue
+        payload = _read_json(path)
+        judgment = (
+            CoverageJudgment.model_validate(payload["parsed"])
+            if payload.get("status") == "SUCCESS"
+            else CoverageJudgment(reason="missing or failed judgment")
+        )
+        presence[str(claim["claim_id"])] = bool(judgment.minimum_component_recovered)
+    return claim_keys, presence
+
+
 def build_report(
     *,
     repo_root: Path,
@@ -1774,6 +1848,7 @@ def build_report(
     votes: int,
     extractor_model: str,
     classifier_model: str,
+    repeat_output: Path | None = None,
 ) -> dict[str, Any]:
     lanes = {lane: _lane_report(lane=lane, gold=gold, output=output, votes=votes) for lane in LANES}
     control = lanes["control"]["metrics"]
@@ -1786,19 +1861,24 @@ def build_report(
     if boss_fight:
         gates = {
             "vision_score_bearing_minimum_component_recall_is_1_00": (
-                rate(vision, "score_bearing_minimum_component_recall") == 1.0
+                rate(vision, "score_bearing_minimum_component_recall")
+                >= FROZEN_BOSS_GATES["score_bearing_minimum_component_recall"]
             ),
             "vision_score_bearing_gold_route_recall_is_1_00": (
-                rate(vision, "score_bearing_gold_route_recall") == 1.0
+                rate(vision, "score_bearing_gold_route_recall")
+                >= FROZEN_BOSS_GATES["score_bearing_gold_route_recall"]
             ),
             "vision_BC_rejection_is_1_00": (
-                rate(vision, "non_score_bearing_rejection_on_recovered_claims") == 1.0
+                rate(vision, "non_score_bearing_rejection_on_recovered_claims")
+                >= FROZEN_BOSS_GATES["non_score_bearing_rejection"]
             ),
             "vision_repeatability_at_least_0_90": (
-                rate(vision, "independent_three_vote_route_match") >= 0.90
+                rate(vision, "independent_three_vote_route_match")
+                >= FROZEN_BOSS_GATES["route_repeatability"]
             ),
-            "vision_score_route_conflict_below_0_10": (
-                rate(vision, "score_bearing_route_conflict") < 0.10
+            "vision_score_route_conflict_is_0_00": (
+                rate(vision, "score_bearing_route_conflict")
+                <= FROZEN_BOSS_GATES["maximum_score_route_conflict"]
             ),
         }
     else:
@@ -1812,22 +1892,27 @@ def build_report(
                 > control["dimension_recall"]["trend_relation"]["rate"]
             ),
             "vision_full_semantics_at_least_0_80": (
-                rate(vision, "full_semantic_preservation") >= 0.80
+                rate(vision, "full_semantic_preservation")
+                >= FROZEN_FULL_GATES["full_semantic_preservation"]
             ),
-            "vision_atomic_recall_at_least_0_70": (
-                rate(vision, "atomic_graphical_claim_recall") >= 0.70
+            "vision_atomic_recall_at_least_0_90": (
+                rate(vision, "atomic_graphical_claim_recall")
+                >= FROZEN_FULL_GATES["atomic_graphical_claim_recall"]
             ),
-            "vision_gold_role_agreement_at_least_0_90": (
-                rate(vision, "gold_role_agreement_on_recovered_claims") >= 0.90
+            "vision_gold_role_agreement_at_least_0_95": (
+                rate(vision, "gold_role_agreement_on_recovered_claims")
+                >= FROZEN_FULL_GATES["gold_role_agreement_on_recovered_claims"]
             ),
             "vision_score_bearing_minimum_component_recall_at_least_0_70": (
                 rate(vision, "score_bearing_minimum_component_recall") >= 0.70
             ),
             "vision_score_bearing_gold_route_recall_at_least_0_70": (
-                rate(vision, "score_bearing_gold_route_recall") >= 0.70
+                rate(vision, "score_bearing_gold_route_recall")
+                >= FROZEN_FULL_GATES["score_bearing_gold_route_recall"]
             ),
             "vision_repeatability_at_least_0_90": (
-                rate(vision, "independent_three_vote_route_match") >= 0.90
+                rate(vision, "independent_three_vote_route_match")
+                >= FROZEN_FULL_GATES["route_repeatability"]
             ),
             "vision_score_route_conflict_below_0_10": (
                 rate(vision, "score_bearing_route_conflict") < 0.10
@@ -1838,12 +1923,29 @@ def build_report(
         for path in (output / "checkpoints").rglob("*.json")
         if _read_json(path).get("status") == "ERROR"
     ]
+    reproducibility = None
+    if repeat_output is not None:
+        current_claims, current_presence = _extraction_set_and_score_presence(
+            output=output,
+            gold=gold,
+        )
+        repeat_claims, repeat_presence = _extraction_set_and_score_presence(
+            output=repeat_output,
+            gold=gold,
+        )
+        reproducibility = extraction_set_reproducibility(
+            current_claims,
+            repeat_claims,
+            score_bearing_presence_a=current_presence,
+            score_bearing_presence_b=repeat_presence,
+        ).model_dump(mode="json")
     report = {
         "schema_version": REPORT_SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "selection_uses_return_data": False,
         "gold_schema_version": gold["schema_version"],
         "boss_fight": boss_fight,
+        "evidence_sensor_version": EVIDENCE_SENSOR_VERSION,
         "gold_path": str(
             (gold_path or repo_root / "docs" / "ir-visual-coverage-gold-v1.json").resolve()
         ),
@@ -1866,6 +1968,12 @@ def build_report(
         },
         "success_gates": gates,
         "visual_lane_supported": all(gates.values()) and not failures,
+        "extraction_set_reproducibility": reproducibility,
+        "extraction_set_reproducibility_scope": (
+            "diagnostic production-rollout metric; it does not retroactively tune frozen development gold"
+            if reproducibility is not None
+            else "not run; provide --repeat-output to compare an independent extraction run"
+        ),
         "usage_current_checkpoints": _usage(output),
         "usage_scope": "Retained successful checkpoints only; superseded development iterations are not included.",
         "failures": failures,
@@ -1921,6 +2029,18 @@ def _render_markdown(report: dict[str, Any]) -> str:
         "| --- | ---: | ---: |",
     ]
     lines.extend(f"| {label} | {_metric_text(a)} | {_metric_text(b)} |" for label, a, b in rows)
+    reproducibility = report.get("extraction_set_reproducibility")
+    lines.extend(["", "## Extraction-set reproducibility", ""])
+    if reproducibility is None:
+        lines.append("- Not run. Compare an independent run with `--repeat-output`.")
+    else:
+        lines.extend(
+            [
+                f"- Claim-set Jaccard: {_percent(reproducibility['extraction_set_jaccard'])}",
+                f"- Score-bearing presence repeat: {_percent(reproducibility['score_bearing_presence_repeat_rate'])}",
+                f"- Score-bearing presence agreement: {_percent(reproducibility['score_bearing_presence_agreement_rate'])}",
+            ]
+        )
     lines.extend(["", "## Frozen success gates", ""])
     for name, passed in report["success_gates"].items():
         lines.append(f"- {'PASS' if passed else 'FAIL'}: `{name}`")
@@ -1974,6 +2094,11 @@ def main() -> int:
             "evaluation/ir-visual-ablation-v2"
         ),
     )
+    parser.add_argument(
+        "--repeat-output",
+        type=Path,
+        help="independent completed audit output used only for extraction-set reproducibility",
+    )
     parser.add_argument("--extractor-model", default="gpt-5-nano")
     parser.add_argument("--classifier-model", default="gpt-5.6-luna")
     parser.add_argument("--extractor-effort", choices=("none", "low", "medium", "high"), default="low")
@@ -1993,6 +2118,13 @@ def main() -> int:
     gold_path = args.gold if args.gold.is_absolute() else repo_root / args.gold
     render_root = args.render_root if args.render_root.is_absolute() else repo_root / args.render_root
     output = args.output if args.output.is_absolute() else repo_root / args.output
+    repeat_output = None
+    if args.repeat_output is not None:
+        repeat_output = (
+            args.repeat_output
+            if args.repeat_output.is_absolute()
+            else repo_root / args.repeat_output
+        ).resolve()
     output.mkdir(parents=True, exist_ok=True)
     gold = _read_json(gold_path)
     required = {"gold_role", "gold_subtype", "gold_rationale"}
@@ -2049,6 +2181,7 @@ def main() -> int:
             votes=args.classification_votes,
             extractor_model=args.extractor_model,
             classifier_model=args.classifier_model,
+            repeat_output=repeat_output,
         )
         print(json.dumps({"success_gates": report["success_gates"], "visual_lane_supported": report["visual_lane_supported"], "usage_current_checkpoints": report["usage_current_checkpoints"], "failures": len(report["failures"])}, ensure_ascii=False, indent=2))
         print(f"wrote: {output / 'ir-visual-ablation.json'}")

@@ -2,57 +2,65 @@
 
 ## 연결 완료
 
-- OpenDART `list.json`/`corpCode.xml`/`document.xml` 자동 수집
-- SEC `data.sec.gov/submissions` discovery와 `Archives/edgar/data` primary HTML/complete submission 자동 수집
-- source별 rate limit, HTTP/DART transient retry, 응답·ZIP size limit, ZIP path traversal 방어
-- immutable Bronze version, 원문·metadata·파일별 SHA-256, revision/latest pointer, runner universe CSV 생성
-- DART `SECTION-n` XML hierarchy 복원과 원문 ZIP 내 모든 첨부문서 보존
-- DART, SEC EDGAR, IR HTML/iXBRL → source-neutral `CanonicalDocumentBundle`
-- section/paragraph/list/note/figure/table AST, rowspan/colspan, multi-header, 단위/기간/주석, provenance
-- inline XBRL `StructuredFact`와 PIT financial snapshot
-- cross-filing chunk exact/near dedup 및 숫자 변경 보존
-- deterministic atomic segmentation → 항목별 LLM classification → validation/repair → reliability calibration
-- 원문용 evidence ID와 의미 dedupe용 canonical claim ID/set
-- SUPPORTS/WEAKENS/CONTRADICTS/UPDATES/DUPLICATES evidence relation
-- canonical fact와 Evidence ID만 재조합하는 deterministic section summary → company dossier → 경제적 질문 BM25 retrieval
-- generated summary가 완전히 제외된 scoring dossier, factor별 compact claim pack, on-demand raw provenance, coverage 기록
-- OpenAI Responses API/Pydantic Structured Outputs transport, retry, usage audit, `store=false`
-- compact Structured Outputs와 task별 cap을 쓰는 atomic evidence 분류: pinned `gpt-5.6-luna` (`gpt-5-nano`는 선택적 문장 요약용 예약 설정)
-- `MARKET_SHARE`/`CUSTOMER_RETENTION`/`MARGIN_STABILITY`/`COST_ADVANTAGE`/`COUNTER` observable-anchor gate와 issuer-owned product scope guard
-- IR visual score-bearing 9건 A/B/C 수동 골드, 독립 3표 재판정, production classifier 6표 재현성 audit
-- final-score LLM 호출이 없는 canonical claim Python reducer
-- LLM 비의존 Python unlevered DCF, assumptions hash/as-of manifest
-- 한 종목/복수 종목/전체 universe 실행, 병렬 처리, 회사별 실패 격리, chunk/section resume
-- MOAT/DCF/신뢰도/coverage screening과 재랭킹
-- PIT backtest, 종목별 거래 가능 여부·보유 잠금, mark-to-market, turnover/거래비용/슬리피지/용량, 보수적 상장폐지 청산, benchmark 초과수익
-- raw/sector/factor-neutral IC, 비중첩 Q5-Q1 평가와 반복·입력순서 변경 MOAT 재현성 gate
-- fresh experiment 범위 atomic-evidence replay와 원문 기반 stable evidence identity
-- LLM 제안값과 독립적인 deterministic mechanism score/durability/counterevidence penalty
-- 구조적 증거 생략을 삭제로 취급하지 않는 PIT evidence ledger와 supersede/retract 이력
-- shuffle/duplicate/summary/format/boilerplate/node-order metamorphic zero-tolerance gate
-- claim/factor score 불변 및 counterevidence recall 100%를 강제하는 compression-invariance gate
-- Python financial feature vector, provenance 포함 valuation summary, cached/cache-write token audit
-- evidence·claim Jaccard를 포함한 3~5종목 반복·인접시점 preflight 강제
+### Source/PIT/parser
 
-## 외부 데이터가 반드시 보장해야 하는 것
+- OpenDART와 SEC EDGAR 공식 원문 수집, rate limit/retry/size/path-traversal 방어, immutable Bronze SHA-256와 revision pointer
+- DART XML/HTML, SEC HTML/iXBRL, IR HTML/PDF를 source-neutral `CanonicalDocumentBundle`로 변환
+- section/paragraph/list/note/figure/table AST, rowspan/colspan, multi-header, 단위·기간·주석, inline XBRL `StructuredFact`, 원문 provenance
+- IR PDF text/table parser, 선택적 OCR, figure crop/vision 후보와 visual ablation audit
+- timezone-aware 공개시각 filtering, scope-safe FY/YTD/TTM financial snapshot, 숫자 provenance와 hard-fail quality gate
 
-- 각 공시의 시장 공개 가능 시각인 timezone-aware `available_at`
+### Frozen Evidence Sensor v1
+
+- deterministic atomic segmentation과 독립 다수결 classification
+- 원문용 evidence ID, 의미 dedupe용 claim ID, relation과 evidence ledger
+- shuffle/duplicate/summary/format/boilerplate/node-order metamorphic gate
+- 생성 요약의 score-bearing 재진입 차단과 canonical fact 기반 deterministic summary
+- Evidence Sensor version/gate 상수, boss 9/full 30 회귀 fixture, claim-set Jaccard와 score-bearing presence extraction-set reproducibility
+- scalar MOAT와 contextual strength는 주 랭킹이 아니라 회귀·진단 경로로 동결
+
+### Expectation Analysis v1
+
+- frozen sensor와 독립적인 valuation-only atomic selector/classifier
+- `MOAT_NONE` forward fact를 포함하는 `ValuationDriverEvidence`; evidence 하나당 primary driver 하나, related driver는 diagnostic only
+- scalar가 아닌 `CompetitiveAdvantageProfile`과 reference-class 기반 CAP range
+- 보고/무형자산 조정 ROIC·ROIIC·재투자율을 병렬 계산하는 capital-allocation profile
+- 성장–재투자–ROIIC를 연결하고 CAP/fade/stable state를 명시한 deterministic Economic FCFF
+- assets-in-place, PVGO, CAP contribution, failure-adjusted value 분해
+- downside/central/upside price-blind scenario와 confidence 기반 range widening
+- Possible/Plausible/Probable assumption validation; numeric probability를 가장하지 않음
+- 현재 가격에 맞는 성장·마진·ROIIC·CAP 조합 전체를 보존하는 Reverse DCF surface
+- intrinsic lane 이후에만 price를 주입하는 타입·PIT invariant와 Expectation Gap 기본 screening
+- 일반/성숙/플랫폼/distressed/금융/바이오 model router와 standalone biotech rNPV
+- 기존 MOAT×DCF ranker는 명시적인 `--enable-legacy-moat-ranking` 진단 옵션으로만 실행
+
+### Runner/audit
+
+- 한 종목/복수/전체 universe 실행, 병렬 처리, 회사별 실패 격리, checkpoint/resume
+- OpenAI structured output, task별 pinned model/effort/cap, atomic replay cache, raw response와 usage audit
+- evidence와 valuation lane을 포함한 static-prefix/dynamic/source/output token budget 기록
+- 5종목 초과 실행을 막는 계약-고정 preflight
+- PIT backtest와 IC/Q5–Q1 도구는 존재하지만 새 Expectation Analysis 규칙을 과거 수익률에 맞춰 튜닝하지 않음
+
+## 외부 데이터가 보장해야 하는 것
+
+- 각 공시와 IR 자료의 실제 시장 공개 가능 시각인 timezone-aware `available_at`
 - corporate action이 반영된 수정주가와 정확한 `price_as_of`
-- 과거 각 시점의 전체 investable universe 구성
-- 상장폐지일까지의 가격 또는 명시적인 청산 가격
-- DCF 가정의 출처·승인·시점 정책
+- 과거 각 시점의 investable universe와 상장폐지/거래정지 처리 데이터
+- PIT reference class, TAM, WACC 구성요소, 업종별 회계/경제구조 분류
+- downside/central/upside 숫자 가정의 출처·승인·버전 정책
 
-이 조건이 빠지면 코드가 PIT 필터를 수행해도 survivorship bias, stale-price bias 또는 corporate-action 오류를 제거할 수 없습니다.
+이 조건이 빠지면 코드의 PIT 필터만으로 survivorship, stale-price, look-ahead 또는 corporate-action bias를 없앨 수 없습니다.
 
-## 아직 별도 adapter/서비스가 필요한 범위
+## Fail-closed 또는 아직 필요한 범위
 
-- DART 명시적 XML taxonomy와 SEC taxonomy/version별 정교한 concept mapping
-- IR PDF/PPT production adapter, chart/figure semantic extraction, page/slide bbox viewer (`ir-visual-ablation-v1`의 vision full semantics 15/30, 실제 score-bearing route 3/7로 아직 gate 미통과)
-- 실제 모델 tokenizer와 대표 corpus 기반 prompt/model calibration
-- parser 원문/AST/Markdown 동시 비교 viewer와 15~30개 실제 공시 golden corpus
-- segment별 MOAT 산출 및 revenue/EBIT 가중 company score
-- plain/generic/full-context renderer와 체계적인 ablation harness
-- 역사적 universe 재구성과 기업행동·상장폐지 golden corpus, 다요인 노출 열 공급
-- scheduler, queue, database, auth, monitoring을 갖춘 상시 운영 API/UI
+- IR visual extractor는 기존 gold set에서 개선됐지만 unseen-document production gate와 정기 extraction-set 반복 감사가 더 필요
+- DART/SEC taxonomy와 버전별 더 정교한 concept mapping 및 segment economics
+- 금융회사 excess-return equity 엔진은 router만 있고 구현되지 않아 분석을 거부
+- biotech rNPV는 standalone 엔진이며 universe expectation runner 자동 통합은 아직 없음
+- Economic DCF 숫자 가정의 완전 자동 생성은 의도적으로 없음; evidence는 숫자를 직접 bump하지 않음
+- Reverse DCF grid는 민감도 표면이며 연속 최적화나 유일한 implied solution을 주장하지 않음
+- parser 원문/AST/Markdown 동시 비교 viewer와 더 큰 실제 공시 golden corpus
+- scheduler, queue, database, auth, monitoring, 승인 workflow를 갖춘 상시 운영 API/UI
 
-현재 runner의 입력 경계는 DART XML/HTML, SEC HTML/iXBRL, IR HTML과 metadata JSON입니다. PDF/PPT를 `source=IR`로 넣으면 안 되며, 먼저 전용 adapter를 구현해야 합니다.
+현재 결과는 연구·감사용이며 투자 권유나 미래 수익률 보장이 아닙니다.

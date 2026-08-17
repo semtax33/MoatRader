@@ -8,9 +8,11 @@ from pydantic import Field, model_validator
 
 from moatrader.canonical.models import ContractModel
 from moatrader.evidence.models import MoatScore
+from moatrader.expectations import ExpectationAnalysis
 from moatrader.financial.dcf import DcfValuation
 from moatrader.llm.transport import TransportUsage
 from moatrader.screening.ranker import RankedCandidate
+from moatrader.screening.opportunity import RankedOpportunity
 
 
 class CompanyRunStatus(StrEnum):
@@ -43,6 +45,9 @@ class UniverseRunConfig(ContractModel):
     maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
     maximum_ir_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
     atomic_classification_votes: int = Field(default=3, ge=1, le=9)
+    maximum_valuation_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
+    maximum_ir_valuation_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
+    valuation_classification_votes: int = Field(default=3, ge=1, le=9)
     incremental_ir_mode: bool = False
     longitudinal_ir_mode: bool = False
     minimum_longitudinal_ir_years: int = Field(default=3, ge=2, le=10)
@@ -60,6 +65,7 @@ class UniverseRunConfig(ContractModel):
     )
     llm_replay_cache_directory: str | None = None
     evidence_ledger_directory: str | None = None
+    enable_legacy_moat_ranking: bool = False
 
     @model_validator(mode="after")
     def config_is_valid(self) -> "UniverseRunConfig":
@@ -83,6 +89,8 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("longitudinal_ir_mode requires incremental_ir_mode")
         if self.atomic_classification_votes % 2 == 0:
             raise ValueError("atomic_classification_votes must be odd")
+        if self.valuation_classification_votes % 2 == 0:
+            raise ValueError("valuation_classification_votes must be odd")
         return self
 
 
@@ -115,6 +123,7 @@ class CompanyRunResult(ContractModel):
     strength_context_chunk_count: int = Field(default=0, ge=0)
     moat_score: MoatScore | None = None
     dcf: DcfValuation | None = None
+    expectation_analysis: ExpectationAnalysis | None = None
     current_price: Decimal | None = None
     price_as_of: datetime | None = None
     valuation_as_of: datetime | None = None
@@ -131,6 +140,9 @@ class UniverseRunResult(ContractModel):
     completed_at: datetime
     companies: list[CompanyRunResult]
     ranking: list[RankedCandidate] = Field(default_factory=list)
+    opportunities: list[RankedOpportunity] = Field(default_factory=list)
+    primary_screening_method: str = "EXPECTATION_GAP"
+    legacy_moat_ranking_enabled: bool = False
 
     @property
     def failed_count(self) -> int:

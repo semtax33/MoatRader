@@ -12,18 +12,76 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     EvidenceType,
 )
+from moatrader.evidence.sensor_contract import (
+    EVIDENCE_SENSOR_VERSION,
+    FROZEN_BOSS_GATES,
+    FROZEN_FULL_GATES,
+    IR_VISUAL_EXTRACTOR_CONTRACT_VERSION,
+    extraction_set_reproducibility,
+)
 from scripts.audit_ir_visual_ablation import (
     CoverageJudgment,
+    ExtractedObservation,
+    ExtractedPageClaim,
     PageClaimExtraction,
     _candidate_relations,
     _candidate_source_text,
     _deterministic_minimum_judgment,
     _extractor_user,
+    _extraction_claim_key,
     _gold_route,
     _lane_report,
     _merge_page_extractions,
     _preferred_minimum_candidate_index,
 )
+
+
+def test_extraction_set_reproducibility_separates_claim_presence_from_route_repeat() -> None:
+    metric = extraction_set_reproducibility(
+        {"A", "B"},
+        {"B", "C"},
+        score_bearing_presence_a={"G1": True, "G2": True},
+        score_bearing_presence_b={"G1": True, "G2": False},
+    )
+    assert metric.extraction_set_jaccard == pytest.approx(1 / 3)
+    assert metric.score_bearing_presence_repeat_rate == pytest.approx(1 / 2)
+    assert metric.score_bearing_presence_agreement_rate == pytest.approx(1 / 2)
+
+
+def test_evidence_sensor_contract_freezes_boss_and_full_regression_boundaries() -> None:
+    assert EVIDENCE_SENSOR_VERSION == "evidence-sensor/1"
+    assert IR_VISUAL_EXTRACTOR_CONTRACT_VERSION == "ir-page-claim-extractor/6"
+    assert FROZEN_BOSS_GATES == {
+        "score_bearing_minimum_component_recall": 1.0,
+        "score_bearing_gold_route_recall": 1.0,
+        "non_score_bearing_rejection": 1.0,
+        "route_repeatability": 0.9,
+        "maximum_score_route_conflict": 0.0,
+    }
+    assert FROZEN_FULL_GATES == {
+        "full_semantic_preservation": 0.8,
+        "atomic_graphical_claim_recall": 0.9,
+        "gold_role_agreement_on_recovered_claims": 0.95,
+        "score_bearing_gold_route_recall": 0.7,
+        "route_repeatability": 0.9,
+    }
+
+
+def test_extraction_claim_key_uses_structured_observation_not_llm_paraphrase() -> None:
+    observation = ExtractedObservation(
+        metric="market share",
+        series="company",
+        period="2025",
+        value=51.0,
+        unit="%",
+    )
+    first = ExtractedPageClaim(
+        claim="Company share reached 51%.",
+        source_kind="CHART",
+        observations=[observation],
+    )
+    second = first.model_copy(update={"claim": "In 2025, the issuer held a 51 percent share."})
+    assert _extraction_claim_key(first) == _extraction_claim_key(second)
 
 
 def _write(path: Path, value: object) -> None:

@@ -39,6 +39,16 @@ _MOAT_TERMS_RE = re.compile(
     r"competition|dependen|concentrat|substitut|regulat",
     re.IGNORECASE,
 )
+_VALUATION_TERMS_RE = re.compile(
+    r"매출|성장|판매량|출하량|단가|ASP|점유율|수주|백로그|pipeline|파이프라인|임상|승인|출시|"
+    r"시장\s*규모|TAM|생산능력|CAPA|가동률|제품\s*믹스|마진|이익률|원가|수율|"
+    r"CAPEX|설비\s*투자|운전\s*자본|재투자|투하\s*자본|ROIC|ROIIC|R&D|연구개발|"
+    r"인수|합병|M&A|자사주|배당|경쟁|대체|규제|집중|실패|"
+    r"revenue|growth|volume|shipments?|price|market\s*share|backlog|clinical|approval|launch|"
+    r"capacity|utili[sz]ation|product\s*mix|margin|cost|yield|capital\s*expenditure|"
+    r"working\s*capital|reinvest|invested\s*capital|buyback|dividend|competition|substitut|risk",
+    re.IGNORECASE,
+)
 _ROLE_WEIGHT = {
     SectionRole.COMPETITION: 16,
     SectionRole.RISK: 15,
@@ -318,6 +328,87 @@ def select_atomic_evidence_units(
             raise ValueError(
                 "maximum atomic evidence units cannot preserve document coverage"
             )
+        anchor_ids = {unit.chunk_id for unit in anchors}
+        remaining = [unit for unit in ranked if unit.chunk_id not in anchor_ids]
+        selected = [*anchors, *remaining[: maximum - len(anchors)]]
+    return sorted(
+        selected,
+        key=lambda unit: (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id,
+            unit.chunk_id,
+        ),
+    )
+
+
+def select_valuation_evidence_units(
+    units: list[SemanticChunk],
+    maximum: int | None,
+    *,
+    preserve_document_coverage: bool = False,
+) -> list[SemanticChunk]:
+    """Independent valuation selector; leaves the frozen MOAT selector untouched."""
+
+    unique: dict[tuple[str, str | None], SemanticChunk] = {}
+    for unit in units:
+        key = (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id if preserve_document_coverage else None,
+        )
+        current = unique.get(key)
+        if current is None or (unit.document_id, unit.chunk_id) < (
+            current.document_id,
+            current.chunk_id,
+        ):
+            unique[key] = unit
+
+    role_weight = {
+        SectionRole.GUIDANCE: 18,
+        SectionRole.MDA: 17,
+        SectionRole.FINANCIALS: 16,
+        SectionRole.BUSINESS: 15,
+        SectionRole.PRODUCTS: 14,
+        SectionRole.RISK: 13,
+        SectionRole.COMPETITION: 12,
+        SectionRole.CUSTOMERS: 11,
+        SectionRole.SUPPLIERS: 10,
+        SectionRole.NOTES: 9,
+        SectionRole.COMPANY_OVERVIEW: 6,
+        SectionRole.GOVERNANCE: 4,
+        SectionRole.OTHER: 1,
+    }
+
+    def relevance(unit: SemanticChunk) -> tuple[int, int]:
+        keyword_count = min(30, len(_VALUATION_TERMS_RE.findall(unit.markdown)))
+        return role_weight.get(unit.section_role or SectionRole.OTHER, 1) + keyword_count, keyword_count
+
+    ranked = sorted(
+        (unit for unit in unique.values() if relevance(unit)[1] > 0),
+        key=lambda unit: (
+            -relevance(unit)[0],
+            -relevance(unit)[1],
+            unit.token_count,
+            str(unit.metadata["atomic_evidence_key"]),
+        ),
+    )
+    if maximum is None or not preserve_document_coverage:
+        selected = ranked if maximum is None else ranked[:maximum]
+    else:
+        anchors_by_document: dict[str, SemanticChunk] = {}
+        for unit in ranked:
+            anchors_by_document.setdefault(unit.document_id, unit)
+        anchors = sorted(
+            anchors_by_document.values(),
+            key=lambda unit: (
+                -relevance(unit)[0],
+                -relevance(unit)[1],
+                unit.token_count,
+                unit.document_id,
+                str(unit.metadata["atomic_evidence_key"]),
+            ),
+        )
+        if len(anchors) > maximum:
+            raise ValueError("maximum valuation units cannot preserve document coverage")
         anchor_ids = {unit.chunk_id for unit in anchors}
         remaining = [unit for unit in ranked if unit.chunk_id not in anchor_ids]
         selected = [*anchors, *remaining[: maximum - len(anchors)]]

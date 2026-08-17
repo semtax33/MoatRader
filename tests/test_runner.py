@@ -3,12 +3,20 @@ from __future__ import annotations
 import csv
 import json
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from moatrader.canonical.models import SourceType, StatementType
+from moatrader.business import (
+    CapitalPeriod,
+    CapPrior,
+    ValuationDriver,
+    ValuationDriverExtraction,
+    ValuationEvidenceRole,
+)
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
     CandidateAtomicAuditDecision,
@@ -33,14 +41,29 @@ from moatrader.evidence.models import (
     SectionSummary,
 )
 from moatrader.llm import FunctionTransport, LLMRequest, LLMTask
+from moatrader.expectations import ExpectationAnalysisRequest
 from moatrader.runner import CompanyRunStatus, MoatUniverseRunner, UniverseRunConfig
 from moatrader.universe import load_universe_manifest
+from moatrader.valuation import (
+    EconomicDcfAssumptions,
+    IntrinsicScenarioSet,
+    PossibleContext,
+    ReverseDcfGrid,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
+    if request.task == LLMTask.VALUATION_DRIVER_CLASSIFICATION:
+        return ValuationDriverExtraction(
+            relevant=True,
+            primary_driver=ValuationDriver.REINVESTMENT_EFFICIENCY,
+            related_drivers=[ValuationDriver.REVENUE_GROWTH],
+            role=ValuationEvidenceRole.SCENARIO_INPUT,
+            fact="The disclosed operating fact constrains reinvestment and growth scenarios.",
+        )
     if request.task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
         return AtomicEvidenceExtraction(
             is_investment_relevant=True,
@@ -197,6 +220,11 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert (company_dir / "contextual-moat-ordinal-calibration.json").is_file()
     assert (company_dir / "section-summary-manifest.json").is_file()
     assert (company_dir / "llm-token-budget.json").is_file()
+    sensor_manifest = json.loads(
+        (company_dir / "evidence-sensor-manifest.json").read_text(encoding="utf-8")
+    )
+    assert sensor_manifest["evidence_sensor_version"] == "evidence-sensor/1"
+    assert sensor_manifest["scalar_moat_role"] == "DIAGNOSTIC_ONLY"
     assert (company_dir / "run-manifest.json").is_file()
     assert (company_dir / "dcf-assumptions.json").is_file()
     assert (company_dir / "dcf-manifest.json").is_file()
@@ -265,6 +293,158 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert (company_dir / "contextual-moat-assessment.json").is_file()
     assert (company_dir / "moat-reconciliation.json").is_file()
     assert all(item["task"] != "FINAL_MOAT_SCORING" for item in call_audit)
+
+
+def test_runner_emits_price_separated_expectation_analysis_and_primary_opportunities(
+    tmp_path: Path,
+) -> None:
+    def assumptions(
+        scenario: str,
+        growth: str,
+        margin: str,
+        roiic: str,
+        cap: int,
+    ) -> EconomicDcfAssumptions:
+        return EconomicDcfAssumptions(
+            scenario=scenario,
+            base_period="2024_TTM",
+            base_revenue=Decimal("1000"),
+            base_nopat_margin=Decimal("0.10"),
+            base_invested_capital=Decimal("500"),
+            revenue_growth=Decimal(growth),
+            target_nopat_margin=Decimal(margin),
+            roiic=Decimal(roiic),
+            competitive_advantage_period_years=cap,
+            fade_years=3,
+            explicit_forecast_years=max(10, cap + 3),
+            stable_growth=Decimal("0.02"),
+            stable_nopat_margin=Decimal("0.08"),
+            stable_roic=Decimal("0.08"),
+            wacc=Decimal("0.09"),
+            net_debt=Decimal("100"),
+            diluted_shares=Decimal("100"),
+        )
+
+    expectation_path = tmp_path / "sample-expectations.json"
+    request = ExpectationAnalysisRequest(
+        evidence_cutoff=datetime.fromisoformat("2025-05-15T15:30:00+09:00"),
+        intrinsic_scenarios=IntrinsicScenarioSet(
+            downside=assumptions("DOWNSIDE", "0.02", "0.08", "0.10", 2),
+            central=assumptions("CENTRAL", "0.06", "0.12", "0.16", 5),
+            upside=assumptions("UPSIDE", "0.10", "0.15", "0.22", 8),
+            evidence_confidence=Decimal("0.75"),
+        ),
+        possible_context=PossibleContext(tam_ceiling=Decimal("10000")),
+        cap_prior=CapPrior(
+            reference_class="sample-industry",
+            as_of=datetime.fromisoformat("2025-05-15T09:00:00+09:00"),
+            low_years=2,
+            central_years=5,
+            high_years=8,
+            source_refs=["PIT:INDUSTRY:2025-05-15"],
+        ),
+        reverse_grid=ReverseDcfGrid(
+            revenue_growth=[Decimal("0.01"), Decimal("0.04"), Decimal("0.08")],
+            target_nopat_margin=[Decimal("0.06"), Decimal("0.10"), Decimal("0.14")],
+            roiic=[Decimal("0.08"), Decimal("0.14"), Decimal("0.20")],
+            cap_years=[1, 4, 8],
+            price_tolerance=Decimal("0.05"),
+        ),
+        capital_periods=[
+            CapitalPeriod(
+                period="2023",
+                revenue=Decimal("900"),
+                reported_nopat=Decimal("80"),
+                reported_invested_capital=Decimal("500"),
+                reinvestment=Decimal("100"),
+            ),
+            CapitalPeriod(
+                period="2024",
+                revenue=Decimal("1000"),
+                reported_nopat=Decimal("96"),
+                reported_invested_capital=Decimal("600"),
+                reinvestment=Decimal("100"),
+            ),
+        ],
+    )
+    expectation_path.write_text(request.model_dump_json(indent=2), encoding="utf-8")
+
+    source = load_universe_manifest(ROOT / "examples" / "universe.csv").companies[0]
+    manifest_path = tmp_path / "expectation-universe.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=[
+                "ticker",
+                "source",
+                "input",
+                "metadata",
+                "issuer_id",
+                "issuer_name",
+                "current_price",
+                "price_as_of",
+                "dcf_assumptions",
+                "expectation_assumptions",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "ticker": source.ticker,
+                "source": source.documents[0].source.value,
+                "input": source.documents[0].input_path,
+                "metadata": source.documents[0].metadata_path,
+                "issuer_id": source.issuer_id,
+                "issuer_name": source.issuer_name,
+                "current_price": "10",
+                "price_as_of": "2025-05-15T16:00:00+09:00",
+                "dcf_assumptions": source.dcf_assumptions_path,
+                "expectation_assumptions": str(expectation_path),
+            }
+        )
+    universe = load_universe_manifest(manifest_path)
+    runner = MoatUniverseRunner(
+        config=UniverseRunConfig(
+            run_id="expectation-integration",
+            as_of=datetime.fromisoformat("2025-05-15T15:30:00+09:00"),
+        ),
+        output_directory=tmp_path,
+        transport=FunctionTransport(_fixture_handler),
+    )
+
+    result = runner.run(universe, universe.companies)
+
+    company = result.companies[0]
+    assert company.status == CompanyRunStatus.COMPLETE
+    assert company.expectation_analysis is not None
+    assert company.expectation_analysis.old_moat_score_used_for_valuation is False
+    assert company.expectation_analysis.intrinsic_valuation.price_inputs_used is False
+    assert company.expectation_analysis.implied_expectations.market.current_price == Decimal("10")
+    assert result.primary_screening_method == "EXPECTATION_GAP"
+    assert result.legacy_moat_ranking_enabled is False
+    assert result.ranking == []
+    company_dir = tmp_path / "expectation-integration" / "companies" / "SAMPLE"
+    for name in (
+        "valuation-driver-evidence.json",
+        "capital-allocation-profile.json",
+        "intrinsic-valuation.json",
+        "three-p.json",
+        "reverse-dcf-surface.json",
+        "expectation-gap.json",
+        "expectation-analysis-manifest.json",
+    ):
+        assert (company_dir / name).is_file()
+    manifest = json.loads(
+        (company_dir / "expectation-analysis-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["old_moat_score_used_for_valuation"] is False
+    assert manifest["intrinsic_price_inputs_used"] is False
+    calls = [
+        json.loads(line)
+        for line in (company_dir / "llm-calls.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert "VALUATION_DRIVER_CLASSIFICATION" in {item["task"] for item in calls}
+    assert (tmp_path / "expectation-integration" / "opportunities.csv").is_file()
 
 
 def test_incremental_ir_keeps_dart_base_identical_and_requires_accepted_ir(
