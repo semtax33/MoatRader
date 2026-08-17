@@ -8,6 +8,7 @@ from moatrader.evidence.atomic import (
 )
 from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
+    AtomicMoatRole,
     CanonicalClaimSignature,
     CitedSummaryClaim,
     ClaimCluster,
@@ -40,6 +41,10 @@ from moatrader.evidence.processing import (
     cluster_duplicate_evidence,
     normalize_card_semantics,
     normalize_atomic_extraction,
+    atomic_classification_signature,
+    atomic_routing_signature,
+    atomic_moat_role,
+    build_atomic_classification_consensus,
 )
 from moatrader.evidence.validation import (
     build_candidate_manifest,
@@ -58,6 +63,7 @@ from moatrader.evidence.validation import (
 
 __all__ = [
     "AtomicEvidenceJudgment",
+    "AtomicMoatRole",
     "CanonicalClaimSignature",
     "CitedSummaryClaim",
     "ClaimCluster",
@@ -93,6 +99,10 @@ __all__ = [
     "cluster_duplicate_evidence",
     "normalize_card_semantics",
     "normalize_atomic_extraction",
+    "atomic_classification_signature",
+    "atomic_routing_signature",
+    "atomic_moat_role",
+    "build_atomic_classification_consensus",
     "select_atomic_evidence_units",
     "derive_audited_moat_score",
     "derive_rank_refinement",

@@ -75,6 +75,20 @@ class IrDeltaAction(StrEnum):
     NO_EFFECT = "NO_EFFECT"
 
 
+class AtomicMoatRole(StrEnum):
+    """Mutually exclusive economic role of one atomic source unit.
+
+    The role is intentionally narrower than ``EvidenceType``.  It separates
+    a causal barrier from a realized outcome and adverse counterevidence
+    before a subtype is allowed to influence the MOAT scoring lane.
+    """
+
+    MECHANISM = "MECHANISM"
+    OUTCOME = "OUTCOME"
+    COUNTER = "COUNTER"
+    NONE = "NONE"
+
+
 # Only these categories describe a causal, company-specific barrier that can
 # be scored as an economic-moat mechanism.  The remaining EvidenceType values
 # are outcomes, context, operating drivers, or risks and may corroborate or
@@ -217,6 +231,7 @@ class AtomicEvidenceExtraction(ContractModel):
     # Keep API names explicit. This lane is the audit/grounding authority, so
     # label clarity takes priority over a small schema-token saving.
     is_investment_relevant: bool = Field(default=False, alias="relevant")
+    moat_role: AtomicMoatRole | None = Field(default=None, alias="role")
     evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
     direction: EvidenceDirection = EvidenceDirection.NEUTRAL
     fact: str = "No investment-relevant evidence"
@@ -235,6 +250,7 @@ class AtomicEvidenceJudgment(ContractModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     is_investment_relevant: bool = Field(default=False, alias="relevant")
+    moat_role: AtomicMoatRole = Field(default=AtomicMoatRole.NONE, alias="role")
     evidence_type: EvidenceType = Field(default=EvidenceType.OTHER, alias="type")
     statement_type: StatementType = Field(default=StatementType.MANAGEMENT_CLAIM, alias="stmt")
     fact: str = "No investment-relevant evidence"
@@ -261,6 +277,7 @@ class EvidenceCard(ContractModel):
     evidence_id: str
     source_chunk_id: str
     node_ids: list[str] = Field(min_length=1)
+    moat_role: AtomicMoatRole = AtomicMoatRole.NONE
     evidence_type: EvidenceType = EvidenceType.OTHER
     statement_type: StatementType = StatementType.MANAGEMENT_CLAIM
     fact: str = Field(min_length=1)

@@ -718,7 +718,9 @@ def test_partial_evidence_checkpoints_resume_per_chunk(tmp_path: Path) -> None:
     ).run(universe, universe.companies)
 
     assert resumed.companies[0].status == CompanyRunStatus.COMPLETE
-    assert successful_chunk[0] not in resumed_local_chunks
+    # The completed vote is reused; only the two unfinished consensus votes
+    # for that atomic unit are executed after resume.
+    assert resumed_local_chunks.count(successful_chunk[0]) == 2
     assert resumed_local_chunks
 
 

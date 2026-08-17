@@ -387,6 +387,7 @@ def _moat_run(args: argparse.Namespace) -> int:
         maximum_price_age_days=args.maximum_price_age_days,
         maximum_atomic_evidence_units=args.maximum_atomic_evidence_units,
         maximum_ir_atomic_evidence_units=args.maximum_ir_atomic_evidence_units,
+        atomic_classification_votes=args.atomic_classification_votes,
         incremental_ir_mode=args.incremental_ir,
         longitudinal_ir_mode=args.longitudinal_ir,
         minimum_longitudinal_ir_years=args.minimum_longitudinal_ir_years,
@@ -808,6 +809,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
         help="classify IR atomic evidence in a separate slot so it cannot displace DART evidence",
+    )
+    moat_run.add_argument(
+        "--atomic-classification-votes",
+        type=int,
+        choices=[1, 3, 5, 7, 9],
+        default=3,
+        help="independent votes per frozen atomic unit; strict majority or fail closed (default: 3)",
     )
     moat_run.add_argument(
         "--incremental-ir",

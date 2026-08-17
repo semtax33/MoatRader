@@ -80,6 +80,9 @@ class LLMReplayCache:
             "input_sha256": atomic_key or request.input_sha256,
             "prompt_version": request.metadata.get("prompt_version"),
             "rubric_version": request.metadata.get("rubric_version"),
+            "classification_vote": (
+                request.metadata.get("classification_vote") if atomic_key else None
+            ),
             "model": self._model_for(request.task),
             "reasoning_effort": self._effort_for(request.task),
             "temperature": request.temperature,

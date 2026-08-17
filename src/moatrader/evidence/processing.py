@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 
 from moatrader.canonical.ids import stable_id
@@ -10,6 +10,7 @@ from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
     AtomicEvidenceJudgment,
+    AtomicMoatRole,
     DcfLink,
     CanonicalClaimSignature,
     ClaimCluster,
@@ -24,6 +25,7 @@ from moatrader.evidence.models import (
     EvidenceType,
     ForwardDriverCard,
     ForwardDriverType,
+    OUTCOME_CORROBORATION_TYPES,
     SectionSummary,
     STRUCTURAL_MOAT_TYPES,
 )
@@ -49,6 +51,203 @@ _FORWARD_LANGUAGE_RE = re.compile(
     re.IGNORECASE,
 )
 _LLM_NUMERIC_FRAGMENT_RE = re.compile(r"\d[\d,.:/%+\-~–—?]*")
+
+_MOAT_COUNTER_TYPES: frozenset[EvidenceType] = (
+    STRUCTURAL_MOAT_TYPES
+    | OUTCOME_CORROBORATION_TYPES
+    | {
+        EvidenceType.COMPETITIVE_THREAT,
+        EvidenceType.CUSTOMER_CONCENTRATION,
+        EvidenceType.SUBSTITUTION_RISK,
+        EvidenceType.TECHNOLOGY_RISK,
+        EvidenceType.CAPITAL_INTENSITY,
+    }
+)
+_NON_MOAT_RELEVANT_TYPES: frozenset[EvidenceType] = frozenset(
+    {
+        EvidenceType.MARKET_DEMAND,
+        EvidenceType.CATEGORY_RECURRING_DEMAND,
+        EvidenceType.CAPACITY_UTILIZATION,
+        EvidenceType.EXPORT_MIX,
+        EvidenceType.OPERATING_DRIVER,
+    }
+)
+_CANONICAL_MECHANISM_PHRASE: dict[EvidenceType, str] = {
+    EvidenceType.SWITCHING_COST: "observable switching friction",
+    EvidenceType.NETWORK_EFFECT: "observable network-effect barrier",
+    EvidenceType.COST_ADVANTAGE: "observable persistent cost barrier",
+    EvidenceType.INTANGIBLE_ASSET: "observable protected intangible barrier",
+    EvidenceType.SCALE_ADVANTAGE: "observable scale-based entry barrier",
+    EvidenceType.REGULATORY_BARRIER: "observable regulatory entry barrier",
+}
+
+
+def atomic_moat_role(extraction: AtomicEvidenceExtraction) -> AtomicMoatRole:
+    """Return a role only when role, subtype, direction, and scope agree.
+
+    Legacy callers may omit ``role``; those values are inferred from the old
+    type/direction contract.  New model output must explicitly select a
+    mutually compatible role.  Invalid combinations fail closed to ``NONE``.
+    """
+
+    if not extraction.is_investment_relevant:
+        return AtomicMoatRole.NONE
+    if extraction.economic_scope not in {EconomicScope.COMPANY, EconomicScope.SEGMENT}:
+        return AtomicMoatRole.NONE
+    explicit = extraction.moat_role
+    inferred = AtomicMoatRole.NONE
+    if (
+        extraction.evidence_type in STRUCTURAL_MOAT_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_POSITIVE
+    ):
+        inferred = AtomicMoatRole.MECHANISM
+    elif (
+        extraction.evidence_type in OUTCOME_CORROBORATION_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_POSITIVE
+    ):
+        inferred = AtomicMoatRole.OUTCOME
+    elif (
+        extraction.evidence_type in _MOAT_COUNTER_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_NEGATIVE
+    ):
+        inferred = AtomicMoatRole.COUNTER
+    if explicit is None:
+        return inferred
+    return explicit if explicit == inferred else AtomicMoatRole.NONE
+
+
+def _canonical_atomic_fact(source_text: str) -> str:
+    fact = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", source_text)).strip()
+    if not fact:
+        return "No stable investment-relevant evidence"
+    return fact[:1_200].rstrip()
+
+
+def atomic_classification_signature(
+    extraction: AtomicEvidenceExtraction,
+) -> tuple[str, bool, str, str, str]:
+    """Fields that can change MOAT routing or score eligibility."""
+
+    return (
+        atomic_moat_role(extraction).value,
+        extraction.is_investment_relevant,
+        extraction.evidence_type.value,
+        extraction.direction.value,
+        extraction.economic_scope.value,
+    )
+
+
+def atomic_routing_signature(
+    extraction: AtomicEvidenceExtraction,
+) -> tuple[str, bool, str, str]:
+    """Economic route fields; scope is calibrated after route consensus."""
+
+    signature = atomic_classification_signature(extraction)
+    return signature[:4]
+
+
+def build_atomic_classification_consensus(
+    votes: list[AtomicEvidenceExtraction],
+    *,
+    source_text: str,
+) -> tuple[AtomicEvidenceExtraction, dict[str, object]]:
+    """Reduce independent atomic votes with a strict majority.
+
+    No majority means no score-bearing evidence.  Free-form model wording is
+    never selected by the vote: the final fact and claim identity are derived
+    from the frozen source plus the winning closed-set label.
+    """
+
+    if not votes:
+        raise ValueError("atomic classification consensus requires votes")
+    signatures = [atomic_classification_signature(vote) for vote in votes]
+    routing_signatures = [atomic_routing_signature(vote) for vote in votes]
+    route_counts = Counter(routing_signatures)
+    winning_route, winning_count = min(
+        route_counts.items(), key=lambda item: (-item[1], item[0])
+    )
+    quorum = len(votes) // 2 + 1
+    agreed = winning_count >= quorum
+    if agreed:
+        role_value, relevant, type_value, direction_value = winning_route
+        winning_votes = [
+            vote
+            for vote, route in zip(votes, routing_signatures, strict=True)
+            if route == winning_route
+        ]
+        scope_counts = Counter(vote.economic_scope for vote in winning_votes)
+        scope, _scope_count = min(
+            scope_counts.items(),
+            key=lambda item: (-item[1], item[0].value),
+        )
+        role = AtomicMoatRole(role_value)
+        evidence_type = EvidenceType(type_value)
+        direction = EvidenceDirection(direction_value)
+        fact = (
+            _canonical_atomic_fact(source_text)
+            if relevant
+            else "No stable investment-relevant evidence"
+        )
+        selected = AtomicEvidenceExtraction(
+            is_investment_relevant=relevant,
+            moat_role=role,
+            evidence_type=evidence_type,
+            direction=direction,
+            fact=fact,
+            mechanism=(
+                [_CANONICAL_MECHANISM_PHRASE[evidence_type]]
+                if role == AtomicMoatRole.MECHANISM
+                else []
+            ),
+            economic_scope=scope,
+            claim_subject=(
+                "company"
+                if scope == EconomicScope.COMPANY
+                else "segment"
+                if scope == EconomicScope.SEGMENT
+                else scope.value.casefold()
+            ),
+            claim_predicate=evidence_type.value.casefold(),
+        )
+        status = "CONSENSUS"
+    else:
+        scope_counts = Counter()
+        selected = AtomicEvidenceExtraction(
+            is_investment_relevant=False,
+            moat_role=AtomicMoatRole.NONE,
+            evidence_type=EvidenceType.OTHER,
+            direction=EvidenceDirection.NEUTRAL,
+            fact="No stable investment-relevant evidence",
+            economic_scope=EconomicScope.COMPANY,
+        )
+        status = "NO_CONSENSUS_FAIL_CLOSED"
+    diagnostics: dict[str, object] = {
+        "schema_version": "atomic-classification-consensus/1",
+        "vote_count": len(votes),
+        "quorum": quorum,
+        "status": status,
+        "winning_vote_count": winning_count,
+        "agreement_rate": winning_count / len(votes),
+        "winning_route": list(winning_route) if agreed else None,
+        "winning_signature": (
+            list(atomic_classification_signature(selected)) if agreed else None
+        ),
+        "vote_signatures": [list(signature) for signature in signatures],
+        "vote_routing_signatures": [list(signature) for signature in routing_signatures],
+        "signature_counts": [
+            {"signature": list(signature), "count": count}
+            for signature, count in sorted(Counter(signatures).items())
+        ],
+        "routing_signature_counts": [
+            {"signature": list(signature), "count": count}
+            for signature, count in sorted(route_counts.items())
+        ],
+        "winning_scope_counts": [
+            {"scope": scope.value, "count": count}
+            for scope, count in sorted(scope_counts.items(), key=lambda item: item[0].value)
+        ],
+    }
+    return selected, diagnostics
 
 
 def normalize_atomic_extraction(
@@ -79,9 +278,47 @@ def normalize_atomic_extraction(
         for index, value in enumerate(extraction.mechanism)
         if (cleaned := qualitative(value, f"mechanism[{index}]") or "")
     ]
+    role = atomic_moat_role(extraction)
+    relevant = extraction.is_investment_relevant
+    evidence_type = extraction.evidence_type
+    direction = extraction.direction
+    scope = extraction.economic_scope
+    if not relevant:
+        role = AtomicMoatRole.NONE
+        evidence_type = EvidenceType.OTHER
+        direction = EvidenceDirection.NEUTRAL
+        scope = EconomicScope.COMPANY
+        mechanisms = []
+        actions.append("CANONICALIZE_IRRELEVANT_LABEL")
+    elif role == AtomicMoatRole.NONE:
+        if evidence_type not in _NON_MOAT_RELEVANT_TYPES:
+            relevant = False
+            evidence_type = EvidenceType.OTHER
+            scope = EconomicScope.COMPANY
+            actions.append("FAIL_CLOSED_INVALID_OR_NONE_MOAT_ROLE")
+        else:
+            actions.append("PRESERVE_EXPLICIT_NON_MOAT_DCF_DRIVER")
+        direction = EvidenceDirection.NEUTRAL
+        mechanisms = []
+    else:
+        expected_direction = (
+            EvidenceDirection.MOAT_NEGATIVE
+            if role == AtomicMoatRole.COUNTER
+            else EvidenceDirection.MOAT_POSITIVE
+        )
+        if direction != expected_direction:
+            actions.append(f"CANONICALIZE_DIRECTION:{direction.value}->{expected_direction.value}")
+            direction = expected_direction
+        if role != AtomicMoatRole.MECHANISM:
+            mechanisms = []
     normalized = extraction.model_copy(
         update={
-            "fact": fact,
+            "is_investment_relevant": relevant,
+            "moat_role": role if relevant else AtomicMoatRole.NONE,
+            "evidence_type": evidence_type,
+            "direction": direction,
+            "economic_scope": scope,
+            "fact": fact if relevant else "No investment-relevant evidence",
             "mechanism": mechanisms,
             "claim_subject": qualitative(extraction.claim_subject, "subject") or "company",
             "claim_predicate": qualitative(extraction.claim_predicate, "predicate")
@@ -224,6 +461,7 @@ def atomic_extraction_to_judgment(
     )
     return AtomicEvidenceJudgment(
         is_investment_relevant=extraction.is_investment_relevant,
+        moat_role=atomic_moat_role(extraction),
         evidence_type=extraction.evidence_type,
         statement_type=statement_type,
         fact=extraction.fact,
@@ -268,6 +506,7 @@ def atomic_judgment_to_card(
         evidence_id="PENDING",
         source_chunk_id=chunk.chunk_id,
         node_ids=sorted(set(chunk.node_ids)),
+        moat_role=judgment.moat_role,
         evidence_type=judgment.evidence_type,
         statement_type=judgment.statement_type,
         fact=judgment.fact,

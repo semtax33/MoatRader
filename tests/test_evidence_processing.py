@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
+    AtomicEvidenceExtraction,
+    AtomicMoatRole,
     DcfLink,
     EconomicScope,
     EvidenceBatchExtractionResult,
@@ -19,12 +21,15 @@ from moatrader.evidence.models import (
 )
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.processing import (
+    atomic_moat_role,
+    build_atomic_classification_consensus,
     build_forward_driver_cards,
     build_evidence_relations,
     calibrate_card_reliability,
     cluster_duplicate_evidence,
     grounded_evidence_id,
     normalize_card_semantics,
+    normalize_atomic_extraction,
 )
 from moatrader.evidence.validation import validate_evidence_batch_result, validate_evidence_result
 from moatrader.semantic.chunker import SemanticChunk
@@ -72,6 +77,151 @@ def test_grounded_evidence_id_ignores_model_wording_and_classification() -> None
     )
 
     assert grounded_evidence_id(first, chunk) == grounded_evidence_id(second, chunk)
+
+
+def _atomic_vote(
+    role: AtomicMoatRole,
+    evidence_type: EvidenceType,
+    direction: EvidenceDirection,
+    *,
+    scope: EconomicScope = EconomicScope.COMPANY,
+) -> AtomicEvidenceExtraction:
+    return AtomicEvidenceExtraction(
+        is_investment_relevant=True,
+        moat_role=role,
+        evidence_type=evidence_type,
+        direction=direction,
+        economic_scope=scope,
+        fact="model wording that must not become consensus identity",
+        mechanism=["model phrase"],
+    )
+
+
+def test_atomic_consensus_uses_strict_majority_and_source_owned_text() -> None:
+    mechanism = _atomic_vote(
+        AtomicMoatRole.MECHANISM,
+        EvidenceType.COST_ADVANTAGE,
+        EvidenceDirection.MOAT_POSITIVE,
+    )
+    outcome = _atomic_vote(
+        AtomicMoatRole.OUTCOME,
+        EvidenceType.MARKET_SHARE,
+        EvidenceDirection.MOAT_POSITIVE,
+    )
+
+    selected, audit = build_atomic_classification_consensus(
+        [mechanism, outcome, mechanism],
+        source_text="생산 수율이 10배 개선되어 제조비용이 낮아졌다.",
+    )
+
+    assert audit["status"] == "CONSENSUS"
+    assert audit["winning_vote_count"] == 2
+    assert selected.moat_role == AtomicMoatRole.MECHANISM
+    assert selected.evidence_type == EvidenceType.COST_ADVANTAGE
+    assert selected.fact == "생산 수율이 10배 개선되어 제조비용이 낮아졌다."
+    assert selected.claim_predicate == "cost_advantage"
+    assert selected.mechanism == ["observable persistent cost barrier"]
+
+
+def test_atomic_consensus_fails_closed_without_exact_label_majority() -> None:
+    votes = [
+        _atomic_vote(
+            AtomicMoatRole.MECHANISM,
+            EvidenceType.COST_ADVANTAGE,
+            EvidenceDirection.MOAT_POSITIVE,
+        ),
+        _atomic_vote(
+            AtomicMoatRole.OUTCOME,
+            EvidenceType.MARKET_SHARE,
+            EvidenceDirection.MOAT_POSITIVE,
+        ),
+        _atomic_vote(
+            AtomicMoatRole.COUNTER,
+            EvidenceType.COMPETITIVE_THREAT,
+            EvidenceDirection.MOAT_NEGATIVE,
+        ),
+    ]
+
+    selected, audit = build_atomic_classification_consensus(votes, source_text="ambiguous")
+
+    assert audit["status"] == "NO_CONSENSUS_FAIL_CLOSED"
+    assert selected.is_investment_relevant is False
+    assert selected.moat_role == AtomicMoatRole.NONE
+    assert selected.evidence_type == EvidenceType.OTHER
+
+
+def test_atomic_consensus_votes_on_route_before_scope() -> None:
+    company = _atomic_vote(
+        AtomicMoatRole.OUTCOME,
+        EvidenceType.CUSTOMER_RETENTION,
+        EvidenceDirection.MOAT_POSITIVE,
+        scope=EconomicScope.COMPANY,
+    )
+    segment = _atomic_vote(
+        AtomicMoatRole.OUTCOME,
+        EvidenceType.CUSTOMER_RETENTION,
+        EvidenceDirection.MOAT_POSITIVE,
+        scope=EconomicScope.SEGMENT,
+    )
+    irrelevant = AtomicEvidenceExtraction()
+
+    selected, audit = build_atomic_classification_consensus(
+        [company, company, segment, segment, irrelevant],
+        source_text="장기 렌탈 재계약률은 90% 이상이다.",
+    )
+
+    assert audit["status"] == "CONSENSUS"
+    assert audit["winning_vote_count"] == 4
+    assert audit["winning_route"] == [
+        "OUTCOME",
+        True,
+        "CUSTOMER_RETENTION",
+        "MOAT_POSITIVE",
+    ]
+    assert selected.moat_role == AtomicMoatRole.OUTCOME
+    assert selected.evidence_type == EvidenceType.CUSTOMER_RETENTION
+    assert selected.economic_scope == EconomicScope.COMPANY
+
+
+def test_atomic_role_requires_compatible_type_direction_and_company_scope() -> None:
+    invalid_type = _atomic_vote(
+        AtomicMoatRole.MECHANISM,
+        EvidenceType.MARKET_SHARE,
+        EvidenceDirection.MOAT_POSITIVE,
+    )
+    category_scope = _atomic_vote(
+        AtomicMoatRole.MECHANISM,
+        EvidenceType.COST_ADVANTAGE,
+        EvidenceDirection.MOAT_POSITIVE,
+        scope=EconomicScope.PRODUCT_CATEGORY,
+    )
+
+    assert atomic_moat_role(invalid_type) == AtomicMoatRole.NONE
+    assert atomic_moat_role(category_scope) == AtomicMoatRole.NONE
+    normalized, actions = normalize_atomic_extraction(invalid_type)
+    assert normalized.is_investment_relevant is False
+    assert normalized.evidence_type == EvidenceType.OTHER
+    assert "FAIL_CLOSED_INVALID_OR_NONE_MOAT_ROLE" in actions
+
+
+def test_atomic_none_role_preserves_explicit_forward_dcf_driver() -> None:
+    driver = AtomicEvidenceExtraction(
+        is_investment_relevant=True,
+        moat_role=AtomicMoatRole.NONE,
+        evidence_type=EvidenceType.CAPACITY_UTILIZATION,
+        direction=EvidenceDirection.NEUTRAL,
+        economic_scope=EconomicScope.INDUSTRY,
+        fact="Industry utilization is expected to recover next year.",
+    )
+
+    normalized, actions = normalize_atomic_extraction(driver)
+
+    assert normalized.is_investment_relevant is True
+    assert normalized.moat_role == AtomicMoatRole.NONE
+    assert normalized.evidence_type == EvidenceType.CAPACITY_UTILIZATION
+    assert normalized.direction == EvidenceDirection.NEUTRAL
+    assert normalized.economic_scope == EconomicScope.INDUSTRY
+    assert "PRESERVE_EXPLICIT_NON_MOAT_DCF_DRIVER" in actions
 
 
 def test_evidence_ledger_carries_omitted_structural_evidence_without_future_leak(tmp_path: Path) -> None:

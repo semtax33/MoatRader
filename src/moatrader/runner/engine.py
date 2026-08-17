@@ -64,6 +64,7 @@ from moatrader.evidence.processing import (
     assign_canonical_claim_identity,
     atomic_extraction_to_judgment,
     atomic_judgment_to_card,
+    build_atomic_classification_consensus,
     build_canonical_claim_set,
     build_evidence_relations,
     build_evidence_preserving_summaries,
@@ -503,7 +504,11 @@ class MoatUniverseRunner:
             )
 
             evidence_requests = [
-                build_atomic_evidence_request(chunk, issuer_id=issuer_id)
+                build_atomic_evidence_request(
+                    chunk,
+                    issuer_id=issuer_id,
+                    issuer_name=company.issuer_name,
+                )
                 for chunk in evidence_chunks
             ]
             self.store.write_jsonl(company_dir / "evidence-requests.jsonl", evidence_requests)
@@ -890,7 +895,11 @@ class MoatUniverseRunner:
                 },
             )
             evidence_requests = [
-                build_atomic_evidence_request(chunk, issuer_id=issuer_id)
+                build_atomic_evidence_request(
+                    chunk,
+                    issuer_id=issuer_id,
+                    issuer_name=company.issuer_name,
+                )
                 for chunk in evidence_chunks
             ]
             self.store.write_jsonl(
@@ -910,6 +919,7 @@ class MoatUniverseRunner:
                 bundles,
                 audits,
                 issuer_id=issuer_id,
+                issuer_name=company.issuer_name,
             )
             self.store.write_jsonl(company_dir / "current-evidence.jsonl", current_cards)
             ledger_merge = None
@@ -1717,6 +1727,7 @@ class MoatUniverseRunner:
         audits: list[LLMCallAudit],
         *,
         issuer_id: str | None,
+        issuer_name: str | None,
     ) -> list[EvidenceCard]:
         path = company_dir / "evidence.jsonl"
         checkpoint_dir = company_dir / "atomic-judgment-by-key"
@@ -1737,15 +1748,49 @@ class MoatUniverseRunner:
                 if not validation_errors:
                     judgment = candidate
             if judgment is None:
-                request = build_atomic_evidence_request(chunk, issuer_id=issuer_id)
-                extraction = self._execute_validated(
-                    request,
-                    AtomicEvidenceExtraction,
-                    lambda _value: [],
-                    audits,
-                    company_dir,
+                votes: list[AtomicEvidenceExtraction] = []
+                vote_repairs: list[dict[str, object]] = []
+                vote_checkpoint_dir = company_dir / "atomic-classification-votes-by-key" / atomic_key
+                for vote_index in range(1, self.config.atomic_classification_votes + 1):
+                    vote_checkpoint = vote_checkpoint_dir / f"vote-{vote_index:02d}.json"
+                    extraction: AtomicEvidenceExtraction | None = None
+                    if self.config.resume and vote_checkpoint.is_file():
+                        extraction = AtomicEvidenceExtraction.model_validate(
+                            self.store.read_json(vote_checkpoint)
+                        )
+                    if extraction is None:
+                        request = build_atomic_evidence_request(
+                            chunk,
+                            issuer_id=issuer_id,
+                            issuer_name=issuer_name,
+                            classification_vote=vote_index,
+                        )
+                        extraction = self._execute_validated(
+                            request,
+                            AtomicEvidenceExtraction,
+                            lambda _value: [],
+                            audits,
+                            company_dir,
+                        )
+                    extraction, repair_actions = normalize_atomic_extraction(extraction)
+                    self.store.write_json(vote_checkpoint, extraction)
+                    votes.append(extraction)
+                    vote_repairs.append(
+                        {
+                            "vote": vote_index,
+                            "actions": repair_actions,
+                        }
+                    )
+                extraction, consensus = build_atomic_classification_consensus(
+                    votes,
+                    source_text=chunk.markdown,
                 )
-                extraction, repair_actions = normalize_atomic_extraction(extraction)
+                consensus["atomic_evidence_key"] = atomic_key
+                consensus["vote_repairs"] = vote_repairs
+                self.store.write_json(
+                    company_dir / "atomic-classification-consensus-by-key" / f"{atomic_key}.json",
+                    consensus,
+                )
                 judgment = atomic_extraction_to_judgment(extraction, chunk)
                 validation_errors = self._validate_atomic_judgment(
                     judgment,
@@ -1754,10 +1799,11 @@ class MoatUniverseRunner:
                     issuer_id=issuer_id,
                 )
                 repair_payload: dict[str, object] = {
-                    "schema_version": "atomic-field-repair/1",
+                    "schema_version": "atomic-field-repair/2",
                     "atomic_evidence_key": atomic_key,
-                    "strategy": "DETERMINISTIC_FIELD_REPAIR_NO_COMPANY_RETRY",
-                    "actions": repair_actions,
+                    "strategy": "CLOSED_ONTOLOGY_MAJORITY_CONSENSUS_FAIL_CLOSED",
+                    "vote_repairs": vote_repairs,
+                    "consensus_status": consensus["status"],
                     "validation_errors": validation_errors,
                     "item_accepted": not validation_errors,
                 }
@@ -1767,7 +1813,7 @@ class MoatUniverseRunner:
                         fact="Atomic item excluded after deterministic validation.",
                     )
                     repair_payload["fallback"] = "EXCLUDE_INVALID_ATOMIC_ITEM"
-                if repair_actions or validation_errors:
+                if any(item["actions"] for item in vote_repairs) or validation_errors:
                     self.store.write_json(
                         company_dir / "atomic-repair-by-key" / f"{atomic_key}.json",
                         repair_payload,

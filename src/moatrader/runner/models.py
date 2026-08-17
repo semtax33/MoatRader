@@ -42,6 +42,7 @@ class UniverseRunConfig(ContractModel):
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)
     maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
     maximum_ir_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
+    atomic_classification_votes: int = Field(default=3, ge=1, le=9)
     incremental_ir_mode: bool = False
     longitudinal_ir_mode: bool = False
     minimum_longitudinal_ir_years: int = Field(default=3, ge=2, le=10)
@@ -80,6 +81,8 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("moat_model must be an exact pinned model ID, not a -latest alias")
         if self.longitudinal_ir_mode and not self.incremental_ir_mode:
             raise ValueError("longitudinal_ir_mode requires incremental_ir_mode")
+        if self.atomic_classification_votes % 2 == 0:
+            raise ValueError("atomic_classification_votes must be odd")
         return self
 
 
