@@ -18,6 +18,7 @@ from scripts.audit_ir_visual_ablation import (
     _candidate_relations,
     _candidate_source_text,
     _deterministic_minimum_judgment,
+    _extractor_user,
     _gold_route,
     _lane_report,
     _merge_page_extractions,
@@ -153,6 +154,61 @@ def test_deterministic_relation_builder_computes_margin_sequence_without_llm_inf
     assert "largest adjacent change is 18.7 percentage points" in derived["claim"]
     assert "direction reverses 3 times" in derived["claim"]
     assert len(derived["observations"]) == 5
+
+
+def test_deterministic_relation_builder_supports_non_percent_time_series() -> None:
+    parsed = {
+        "claims": [
+            {
+                "claim": "Cold-chain revenue by year.",
+                "source_kind": "CHART",
+                "observations": [
+                    {
+                        "metric": "Revenue",
+                        "series": "Cold chain",
+                        "period": period,
+                        "value": value,
+                        "unit": "KRW 100m",
+                    }
+                    for period, value in [
+                        ("FY2020", 317.7),
+                        ("FY2021", 320.8),
+                        ("FY2022", 140.1),
+                        ("FY2023", 403.9),
+                        ("FY2024", 459.3),
+                    ]
+                ],
+            }
+        ],
+        "anchor_candidates": [],
+    }
+
+    candidates = _candidate_relations(parsed, issuer_name="Issuer")
+    derived = next(row for row in candidates if row["candidate_origin"] == "DETERMINISTIC_RELATION")
+
+    assert derived["anchor_type"] is None
+    assert "minimum of 140.1KRW 100m in 2022" in derived["claim"]
+    assert "maximum of 459.3KRW 100m in 2024" in derived["claim"]
+    assert derived["axis_legend"][-1] == "KRW 100m"
+    assert len(derived["numeric_anchors"]) == 5
+
+
+def test_extractor_user_keeps_ocr_bounding_boxes_in_vision_context() -> None:
+    item = {
+        "issuer_id": "ISSUER",
+        "issuer_name": "Issuer",
+        "ticker": "000001",
+        "source_document_id": "DOC",
+        "page": 4,
+        "page_text": "parser text",
+        "ocr_text": "[OCR bbox=10.0,20.0,30.0,40.0 confidence=0.990] Phase II",
+    }
+
+    control = _extractor_user(item, include_ocr=False)
+    vision = _extractor_user(item, include_ocr=True)
+
+    assert "PAGE OCR" not in control
+    assert "bbox=10.0,20.0,30.0,40.0" in vision
 
 
 def test_deterministic_process_builder_joins_explicit_ecml_comparison_sides() -> None:
