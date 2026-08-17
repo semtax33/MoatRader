@@ -25,6 +25,9 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceType,
+    IrDeltaAction,
+    IrIncrementalAssessment,
+    IrMechanismDelta,
     MoatMechanismScore,
     MoatScore,
     SectionSummary,
@@ -61,6 +64,22 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
                     economic_scope=EconomicScope.COMPANY,
                     reference_ids=[str(request.metadata["reference_ids"][0])],
                     rationale="Grounded context indicates switching friction.",
+                )
+            ],
+        )
+    if request.task == LLMTask.IR_INCREMENTAL_ASSESSMENT:
+        return IrIncrementalAssessment(
+            evidence_sufficiency_delta=1,
+            mechanisms=[
+                IrMechanismDelta(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    action=IrDeltaAction.STRENGTHEN,
+                    strength_bucket=4,
+                    scope_materiality_bucket=4,
+                    durability_bucket=4,
+                    economic_scope=EconomicScope.COMPANY,
+                    reference_ids=[str(request.metadata["reference_ids"][0])],
+                    rationale="Additional company evidence strengthens switching friction.",
                 )
             ],
         )
@@ -246,6 +265,121 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert (company_dir / "contextual-moat-assessment.json").is_file()
     assert (company_dir / "moat-reconciliation.json").is_file()
     assert all(item["task"] != "FINAL_MOAT_SCORING" for item in call_audit)
+
+
+def test_incremental_ir_keeps_dart_base_identical_and_requires_accepted_ir(
+    tmp_path: Path,
+) -> None:
+    source_manifest = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    sample = source_manifest.companies[0]
+    dart_input = Path(sample.documents[0].input_path)
+    dart_metadata = Path(sample.documents[0].metadata_path)
+    dcf = Path(sample.dcf_assumptions_path or "")
+    ir_input = tmp_path / "ir.html"
+    ir_input.write_text(
+        "<html><body><h1>Customer platform</h1><p>Customers integrate the platform "
+        "into recurring workflows and face a lengthy qualification process.</p></body></html>",
+        encoding="utf-8",
+    )
+    ir_metadata = tmp_path / "ir-metadata.json"
+    ir_metadata.write_text(
+        json.dumps(
+            {
+                "source_type": "IR",
+                "source_document_id": "IR-SAMPLE-1",
+                "available_at": "2025-05-15T12:00:00+09:00",
+                "document_type": "IR_PRESENTATION",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_manifest(path: Path, *, include_ir: bool) -> None:
+        rows = [
+            {
+                "ticker": "SAMPLE",
+                "source": "DART",
+                "input": str(dart_input),
+                "metadata": str(dart_metadata),
+                "issuer_id": "00126380",
+                "issuer_name": "Sample Company",
+                "current_price": "10",
+                "price_as_of": "2025-05-15T16:00:00+09:00",
+                "dcf_assumptions": str(dcf),
+            }
+        ]
+        if include_ir:
+            rows.append(
+                {
+                    "ticker": "SAMPLE",
+                    "source": "IR",
+                    "input": str(ir_input),
+                    "metadata": str(ir_metadata),
+                    "issuer_id": "00126380",
+                    "issuer_name": "Sample Company",
+                    "current_price": "10",
+                    "price_as_of": "2025-05-15T16:00:00+09:00",
+                    "dcf_assumptions": str(dcf),
+                }
+            )
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    dart_manifest_path = tmp_path / "dart-only.csv"
+    ir_manifest_path = tmp_path / "dart-ir.csv"
+    write_manifest(dart_manifest_path, include_ir=False)
+    write_manifest(ir_manifest_path, include_ir=True)
+    cache = tmp_path / "replay"
+    common = {
+        "as_of": datetime.fromisoformat("2025-05-16T00:00:00+09:00"),
+        "incremental_ir_mode": True,
+        "experiment_id": "paired-ir-test",
+        "llm_replay_cache_directory": str(cache),
+    }
+    for run_id, manifest_path in (
+        ("paired-dart", dart_manifest_path),
+        ("paired-ir", ir_manifest_path),
+    ):
+        manifest = load_universe_manifest(manifest_path)
+        result = MoatUniverseRunner(
+            config=UniverseRunConfig(run_id=run_id, **common),
+            output_directory=tmp_path / "runs",
+            transport=FunctionTransport(_fixture_handler),
+        ).run(manifest, manifest.companies)
+        assert result.companies[0].status == CompanyRunStatus.COMPLETE
+
+    dart_dir = tmp_path / "runs" / "paired-dart" / "companies" / "SAMPLE"
+    ir_dir = tmp_path / "runs" / "paired-ir" / "companies" / "SAMPLE"
+    dart_request = json.loads(
+        (dart_dir / "moat-strength-request-base.json").read_text(encoding="utf-8")
+    )
+    ir_request = json.loads(
+        (ir_dir / "moat-strength-request-base.json").read_text(encoding="utf-8")
+    )
+    assert dart_request["input_sha256"] == ir_request["input_sha256"]
+    dart_selection = json.loads(
+        (dart_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    ir_selection = json.loads(
+        (ir_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    assert (
+        dart_selection["baseline_base_atomic_unit_set_sha256"]
+        == ir_selection["baseline_base_atomic_unit_set_sha256"]
+    )
+    dart_audit = json.loads(
+        (dart_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    ir_audit = json.loads(
+        (ir_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    assert dart_audit["treatment_compliant"] is False
+    assert dart_audit["final_score"] == dart_audit["frozen_base_score"]
+    assert ir_audit["IR_AVAILABLE"] is True
+    assert ir_audit["IR_USABLE"] is True
+    assert ir_audit["treatment_compliant"] is True
 
 
 def test_runner_preserves_official_primary_document_url_in_provenance(tmp_path: Path) -> None:

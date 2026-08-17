@@ -221,6 +221,7 @@ class LLMReplayCache:
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
             LLMTask.FINAL_MOAT_SCORING,
         }:
             return self.moat_model
@@ -229,6 +230,10 @@ class LLMReplayCache:
     def _effort_for(self, task: LLMTask) -> str:
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
             return self.atomic_reasoning_effort
-        if task in {LLMTask.CONTEXTUAL_MOAT_STRENGTH, LLMTask.FINAL_MOAT_SCORING}:
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort

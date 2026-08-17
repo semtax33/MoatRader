@@ -143,10 +143,17 @@ def audit_company_metamorphs(
     *,
     issuer_id: str | None,
     maximum_atomic_units: int | None,
+    maximum_ir_atomic_units: int | None = None,
 ) -> dict[str, object]:
     directory = Path(company_directory)
     chunks = list(_read_jsonl(directory / "chunks.jsonl", SemanticChunk))
     selected = list(_read_jsonl(directory / "atomic-evidence-units.jsonl", SemanticChunk))
+    selection_manifest = json.loads(
+        (directory / "evidence-chunk-selection.json").read_text(encoding="utf-8-sig")
+    )
+    source_partitioned = selection_manifest.get("method") == "dual_lane_citation_audit/1" and (
+        "baseline_base_atomic_unit_set_sha256" in selection_manifest
+    )
     contextual_assessment = ContextualMoatAssessment.model_validate_json(
         (directory / "contextual-moat-assessment.json").read_text(encoding="utf-8-sig")
     )
@@ -215,10 +222,32 @@ def audit_company_metamorphs(
             transformed_chunks,
             issuer_id=issuer_id,
         )
-        baseline_transformed_units = select_atomic_evidence_units(
-            all_transformed_units,
-            maximum_atomic_units,
-        )
+        if source_partitioned:
+            transformed_base_units = [
+                unit
+                for unit in all_transformed_units
+                if not any(ref.source_type == SourceType.IR for ref in unit.source_refs)
+            ]
+            transformed_ir_units = [
+                unit
+                for unit in all_transformed_units
+                if any(ref.source_type == SourceType.IR for ref in unit.source_refs)
+            ]
+            baseline_transformed_units = [
+                *select_atomic_evidence_units(
+                    transformed_base_units,
+                    maximum_atomic_units,
+                ),
+                *select_atomic_evidence_units(
+                    transformed_ir_units,
+                    maximum_ir_atomic_units,
+                ),
+            ]
+        else:
+            baseline_transformed_units = select_atomic_evidence_units(
+                all_transformed_units,
+                maximum_atomic_units,
+            )
         cited_transformed_units = select_context_cited_atomic_units(
             all_transformed_units,
             contextual_assessment,

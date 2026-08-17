@@ -41,7 +41,12 @@ class UniverseRunConfig(ContractModel):
     allow_low_quality: bool = False
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)
     maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
+    maximum_ir_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
+    incremental_ir_mode: bool = False
     consolidate_section_summaries: bool = True
+    ir_ocr_engine: str = Field(default="none", pattern=r"^(none|paddle)$")
+    ir_ocr_device: str = Field(default="cpu", min_length=1)
+    ir_ocr_cpu_threads: int = Field(default=6, ge=1, le=64)
     workers: int = Field(default=1, ge=1, le=32)
     resume: bool = False
     dry_run: bool = False

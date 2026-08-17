@@ -16,6 +16,14 @@ from moatrader.ingestion.http import (
     ResilientHttpClient,
 )
 from moatrader.ingestion.manifest import write_collected_universe_manifest, write_universe_manifest
+from moatrader.ingestion.kind import (
+    KIND_IR_URL,
+    KindCompanyIdentity,
+    KindIrClient,
+    KindIrCollector,
+    KindIrMaterial,
+    normalize_company_name,
+)
 from moatrader.ingestion.models import (
     COLLECTOR_VERSION,
     CollectedFiling,
@@ -70,4 +78,10 @@ __all__ = [
     "validate_sec_user_agent",
     "write_collected_universe_manifest",
     "write_universe_manifest",
+    "KIND_IR_URL",
+    "KindCompanyIdentity",
+    "KindIrClient",
+    "KindIrCollector",
+    "KindIrMaterial",
+    "normalize_company_name",
 ]

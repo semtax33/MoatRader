@@ -84,6 +84,14 @@ def assess_parser_quality(
             )
             and "주석" not in section_text
         )
+        ownership_or_structure_table = bool(
+            re.search(
+                r"지분구조|계열회사|주주\s*현황|ownership\s+structure|affiliates?",
+                node.raw_text,
+                re.IGNORECASE,
+            )
+        )
+        financial_context = financial_context and not ownership_or_structure_table
         table_width = max((len(row.cells) for row in node.rows), default=0)
         is_data_table = table_width >= 2 and len(node.rows) >= 2 and len(numeric_cells) >= 2
         nonempty_headers = [header for header in node.column_headers if any(item.strip() for item in header.path)]

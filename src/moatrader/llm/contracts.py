@@ -21,6 +21,7 @@ from moatrader.evidence.models import (
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
+    IrIncrementalAssessment,
     MoatScore,
     SectionSummary,
 )
@@ -31,6 +32,7 @@ from moatrader.semantic.chunker import SemanticChunk
 class LLMTask(StrEnum):
     LOCAL_EVIDENCE_EXTRACTION = "LOCAL_EVIDENCE_EXTRACTION"
     CONTEXTUAL_MOAT_STRENGTH = "CONTEXTUAL_MOAT_STRENGTH"
+    IR_INCREMENTAL_ASSESSMENT = "IR_INCREMENTAL_ASSESSMENT"
     CANDIDATE_ATOMIC_AUDIT = "CANDIDATE_ATOMIC_AUDIT"
     SECTION_SUMMARY = "SECTION_SUMMARY"
     FINAL_MOAT_SCORING = "FINAL_MOAT_SCORING"
@@ -187,6 +189,71 @@ Context token estimate: {context.token_count}
             "as_of": as_of.isoformat(),
             "selected_chunk_ids": context.selected_chunk_ids,
             "reference_ids": [reference.ref_id for reference in context.references],
+        },
+    )
+
+
+def build_ir_incremental_assessment_request(
+    base: ContextualMoatAssessment,
+    ir_context: MoatStrengthContext,
+    *,
+    issuer_id: str | None,
+    as_of: date,
+) -> LLMRequest:
+    """Assess only the delta contributed by IR against a frozen DART base."""
+
+    system = """Evaluate only the incremental economic-moat information in the supplied IR context against the frozen DART assessment.
+The DART assessment is immutable. Do not reassess the company from scratch and do not use outside knowledge.
+Treat IR as management claims, not audited facts. Every material delta must cite one or more opaque IR Reference IDs.
+Classify each material delta as ADD, STRENGTHEN, WEAKEN, CONTRADICT, or NO_EFFECT.
+Only causal company-specific barriers may be mechanism deltas. Growth, guidance, demand, margins, or market size alone are not mechanisms.
+Outcomes may only corroborate a mechanism. Do not infer persistence from one period or from a forecast.
+Use conservative zero-to-four ordinal buckets. Keep rationales qualitative and omit digits.
+Return only IR deltas. Never repeat unchanged DART items merely to restate them, and never return a final MOAT score.
+Python validates references, extracts atomic IR evidence, determines whether a delta is score-producing, and merges accepted changes deterministically."""
+    base_json = json.dumps(
+        base.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    user = f"""Issuer: {issuer_id or 'UNKNOWN_ISSUER'}
+As of: {as_of.isoformat()}
+
+--- FROZEN DART ASSESSMENT ---
+{base_json}
+--- END FROZEN DART ASSESSMENT ---
+
+--- BEGIN IR-ONLY CONTEXT ---
+{ir_context.markdown}
+--- END IR-ONLY CONTEXT ---"""
+    response_schema = IrIncrementalAssessment.model_json_schema()
+    canonical_schema = json.dumps(
+        response_schema,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return LLMRequest(
+        task=LLMTask.IR_INCREMENTAL_ASSESSMENT,
+        system=system,
+        user=user,
+        response_schema=response_schema,
+        input_sha256=_hash_input(system, user),
+        prompt_cache_key=_prompt_cache_key(
+            "ir-incremental-v1",
+            static_prefix=system + "\n" + canonical_schema,
+            routing_identity=issuer_id,
+        ),
+        prompt_cache_breakpoint=True,
+        metadata={
+            "prompt_version": "ir-incremental-assessment/1",
+            "rubric_version": "dual-lane-moat/2",
+            "issuer_id": issuer_id,
+            "as_of": as_of.isoformat(),
+            "base_assessment_sha256": hashlib.sha256(base_json.encode("utf-8")).hexdigest(),
+            "selected_chunk_ids": ir_context.selected_chunk_ids,
+            "reference_ids": [reference.ref_id for reference in ir_context.references],
         },
     )
 

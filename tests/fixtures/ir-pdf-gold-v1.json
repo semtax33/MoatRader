@@ -1,0 +1,24 @@
+{
+  "schema_version": "ir-pdf-gold/1",
+  "thresholds": {
+    "text_snippet_recall": 0.95,
+    "numeric_token_recall": 0.95,
+    "numeric_label_association_accuracy": 0.95,
+    "table_row_reconstruction_accuracy": 0.95,
+    "reading_order_accuracy": 0.99,
+    "page_bbox_provenance_accuracy": 1.0,
+    "maximum_severe_table_corruptions": 0
+  },
+  "documents": [
+    {"ticker": "038390", "document_id": "KINDIR_17233_1", "page": 27, "text": ["출장 관리 자동화", "BTMS"], "numbers": ["24"], "associations": [["24", "시간"]], "rows": [["Web", "App"]]},
+    {"ticker": "083930", "document_id": "KINDIR_17296_1", "page": 15, "text": ["독일 우량기업과 JV 설립", "EDR 장비"], "numbers": ["2018", "2020", "2025"], "associations": [["2020", "장비 개발"]], "rows": [["중국", "대만", "유럽"]]},
+    {"ticker": "365340", "document_id": "KINDIR_16918_1", "page": 8, "text": ["Circular", "완전 순환형 리사이클 실현"], "numbers": [], "associations": [], "rows": [["소비자", "전기차", "이차전지"]]},
+    {"ticker": "445090", "document_id": "KINDIR_16426_1", "page": 1, "text": ["ASICLAND"], "numbers": ["2025"], "associations": [], "rows": []},
+    {"ticker": "170920", "document_id": "KINDIR_17238_1", "page": 1, "text": ["LTC"], "numbers": ["2025"], "associations": [], "rows": []},
+    {"ticker": "356680", "document_id": "KINDIR_16961_1", "page": 1, "text": ["XGATE"], "numbers": ["2025"], "associations": [], "rows": []},
+    {"ticker": "195940", "document_id": "KINDIR_17075_1", "page": 1, "text": ["inno.N"], "numbers": ["2025"], "associations": [], "rows": []},
+    {"ticker": "115450", "document_id": "KINDIR_16456_1", "page": 1, "text": ["HLB"], "numbers": ["2025"], "associations": [], "rows": []},
+    {"ticker": "041440", "document_id": "KINDIR_17291_1", "page": 1, "text": ["EVERDIGM"], "numbers": [], "associations": [], "rows": []},
+    {"ticker": "084110", "document_id": "KINDIR_16172_2", "page": 1, "text": ["휴온스글로벌"], "numbers": ["2025"], "associations": [], "rows": []}
+  ]
+}

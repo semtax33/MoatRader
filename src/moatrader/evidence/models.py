@@ -67,6 +67,14 @@ class MoatRiskType(StrEnum):
     CAPITAL_INTENSITY = "CAPITAL_INTENSITY"
 
 
+class IrDeltaAction(StrEnum):
+    ADD = "ADD"
+    STRENGTHEN = "STRENGTHEN"
+    WEAKEN = "WEAKEN"
+    CONTRADICT = "CONTRADICT"
+    NO_EFFECT = "NO_EFFECT"
+
+
 # Only these categories describe a causal, company-specific barrier that can
 # be scored as an economic-moat mechanism.  The remaining EvidenceType values
 # are outcomes, context, operating drivers, or risks and may corroborate or
@@ -654,6 +662,43 @@ class ContextualMoatAssessment(ContractModel):
     outcome_confirmation: list[ContextualOutcomeAssessment] = Field(default_factory=list)
     counterevidence: list[ContextualCounterevidenceAssessment] = Field(default_factory=list)
     llm_proposed_score: float | None = Field(default=None, ge=0.0, le=10.0)
+
+
+class IrMechanismDelta(ContractModel):
+    evidence_type: StructuralMoatType
+    action: IrDeltaAction
+    strength_bucket: int = Field(ge=0, le=4)
+    scope_materiality_bucket: int = Field(ge=0, le=4)
+    durability_bucket: int = Field(ge=0, le=4)
+    economic_scope: CompanyMoatScope
+    reference_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class IrOutcomeDelta(ContractModel):
+    evidence_type: OutcomeEvidenceType
+    action: IrDeltaAction
+    strength_bucket: int = Field(ge=0, le=4)
+    persistence_bucket: int = Field(ge=0, le=4)
+    reference_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class IrCounterevidenceDelta(ContractModel):
+    evidence_type: MoatRiskType
+    action: IrDeltaAction
+    severity_bucket: int = Field(ge=0, le=4)
+    reference_ids: list[str] = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+
+
+class IrIncrementalAssessment(ContractModel):
+    """IR-only changes proposed against a frozen DART assessment."""
+
+    evidence_sufficiency_delta: int = Field(default=0, ge=-4, le=4)
+    mechanisms: list[IrMechanismDelta] = Field(default_factory=list)
+    outcomes: list[IrOutcomeDelta] = Field(default_factory=list)
+    counterevidence: list[IrCounterevidenceDelta] = Field(default_factory=list)
 
 
 class CandidateMechanism(ContractModel):

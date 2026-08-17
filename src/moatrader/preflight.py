@@ -29,7 +29,12 @@ EXECUTION_CONTRACT_FIELDS = (
     "allow_low_quality",
     "maximum_price_age_days",
     "maximum_atomic_evidence_units",
+    "maximum_ir_atomic_evidence_units",
+    "incremental_ir_mode",
     "consolidate_section_summaries",
+    "ir_ocr_engine",
+    "ir_ocr_device",
+    "ir_ocr_cpu_threads",
     "validation_attempts",
     "experiment_id",
 )
@@ -47,10 +52,14 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["evidence_ledger_enabled"] = bool(config.evidence_ledger_directory)
     contract["atomic_segmentation_version"] = ATOMIC_SEGMENTATION_VERSION
     contract["atomic_rubric_version"] = ATOMIC_RUBRIC_VERSION
-    contract["scoring_reducer_version"] = "dual-lane-strength-reducer/2"
+    contract["scoring_reducer_version"] = "dual-lane-strength-reducer/4"
     contract["moat_rank_strategy"] = "PUBLIC_SCORE_THEN_STABLE_COMPONENTS_LEXICOGRAPHIC_V1"
     contract["raw_ordinal_global_rank_allowed"] = False
-    contract["moat_architecture"] = "ATOMIC_AUDIT_PLUS_CONTEXTUAL_STRENGTH"
+    contract["moat_architecture"] = (
+        "FROZEN_BASE_PLUS_IR_INCREMENTAL_ATOMIC_AUDIT"
+        if config.incremental_ir_mode
+        else "ATOMIC_AUDIT_PLUS_CONTEXTUAL_STRENGTH"
+    )
     contract["contextual_strength_required_for_every_company"] = True
     contract["strength_context_compression_ablation_enabled"] = False
     contract["economic_strength_separate_from_evidence_confidence"] = True
@@ -63,7 +72,8 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["atomic_prompt_version"] = "atomic-evidence-classifier/4"
     contract["atomic_api_schema"] = "explicit-audit-fields/1"
     contract["atomic_output_token_cap"] = min(config.max_output_tokens, 2_000)
-    contract["contextual_prompt_version"] = "contextual-moat-strength/1"
+    contract["contextual_prompt_version"] = "contextual-moat-strength/2"
+    contract["ir_incremental_prompt_version"] = "ir-incremental-assessment/1"
     contract["contextual_output_token_cap"] = min(config.max_output_tokens, 8_000)
     contract["prompt_cache_mode"] = "explicit"
     contract["prompt_cache_ttl"] = "30m"

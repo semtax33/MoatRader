@@ -23,6 +23,11 @@ from moatrader.evidence.models import (
     EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceType,
+    IrDeltaAction,
+    IrIncrementalAssessment,
+    ContextualMechanismAssessment,
+    ContextualOutcomeAssessment,
+    ContextualCounterevidenceAssessment,
     MoatMechanismScore,
     MoatOutcomeScore,
     MoatRankRefinement,
@@ -726,6 +731,237 @@ def calibrate_contextual_moat_ordinals(
         "schema_version": "contextual-ordinal-calibration/1",
         "strategy": "PUBLIC_SCORE_ONLY_ROBUST_0_2_4_CALIBRATION",
         "action_count": len(actions),
+        "actions": actions,
+    }
+
+
+def apply_ir_incremental_assessment(
+    base: ContextualMoatAssessment,
+    delta: IrIncrementalAssessment,
+    ir_references: list[ContextEvidenceReference],
+) -> tuple[ContextualMoatAssessment, dict[str, object]]:
+    """Apply an IR-only delta to a frozen DART assessment deterministically.
+
+    Unknown references and NO_EFFECT items are discarded. DART ordinals remain
+    unchanged unless the delta explicitly strengthens, weakens, or contradicts
+    that type. This function does not decide whether a delta is score-producing;
+    the atomic/canonical reconciliation gate remains authoritative for that.
+    """
+
+    known_ir_refs = {reference.ref_id for reference in ir_references}
+    actions: list[dict[str, object]] = []
+
+    def refs(item: object, category: str) -> list[str]:
+        supplied = set(item.reference_ids)
+        valid = sorted(supplied & known_ir_refs)
+        unknown = sorted(supplied - known_ir_refs)
+        if unknown:
+            actions.append(
+                {
+                    "category": category,
+                    "type": item.evidence_type.value,
+                    "action": "DROP_UNKNOWN_IR_REFS",
+                    "values": unknown,
+                }
+            )
+        return valid
+
+    mechanisms = {item.evidence_type.value: item for item in base.mechanisms}
+    material_delta_count = 0
+    for item in delta.mechanisms:
+        valid_refs = refs(item, "mechanism")
+        if item.action == IrDeltaAction.NO_EFFECT or not valid_refs:
+            continue
+        key = item.evidence_type.value
+        current = mechanisms.get(key)
+        if current is None and item.action not in {
+            IrDeltaAction.ADD,
+            IrDeltaAction.STRENGTHEN,
+        }:
+            actions.append(
+                {
+                    "category": "mechanism",
+                    "type": key,
+                    "action": "IGNORE_DELTA_WITHOUT_BASE_TARGET",
+                    "delta_action": item.action.value,
+                }
+            )
+            continue
+        if current is None:
+            mechanisms[key] = ContextualMechanismAssessment(
+                evidence_type=item.evidence_type,
+                strength_bucket=item.strength_bucket,
+                scope_materiality_bucket=item.scope_materiality_bucket,
+                durability_bucket=item.durability_bucket,
+                economic_scope=item.economic_scope,
+                reference_ids=valid_refs,
+                rationale=_qualitative_rationale(item.rationale),
+            )
+        else:
+            strengthening = item.action in {
+                IrDeltaAction.ADD,
+                IrDeltaAction.STRENGTHEN,
+            }
+            contradiction = item.action == IrDeltaAction.CONTRADICT
+            mechanisms[key] = current.model_copy(
+                update={
+                    "strength_bucket": (
+                        max(current.strength_bucket, item.strength_bucket)
+                        if strengthening
+                        else 0
+                        if contradiction
+                        else min(current.strength_bucket, item.strength_bucket)
+                    ),
+                    "scope_materiality_bucket": (
+                        max(current.scope_materiality_bucket, item.scope_materiality_bucket)
+                        if strengthening
+                        else 0
+                        if contradiction
+                        else min(
+                            current.scope_materiality_bucket,
+                            item.scope_materiality_bucket,
+                        )
+                    ),
+                    "durability_bucket": (
+                        max(current.durability_bucket, item.durability_bucket)
+                        if strengthening
+                        else 0
+                        if contradiction
+                        else min(current.durability_bucket, item.durability_bucket)
+                    ),
+                    "economic_scope": (
+                        current.economic_scope
+                        if current.economic_scope == item.economic_scope
+                        else type(current.economic_scope).SEGMENT
+                    ),
+                    "reference_ids": sorted(set(current.reference_ids) | set(valid_refs)),
+                }
+            )
+        material_delta_count += 1
+        actions.append(
+            {
+                "category": "mechanism",
+                "type": key,
+                "action": "APPLY_IR_DELTA",
+                "delta_action": item.action.value,
+            }
+        )
+
+    outcomes = {item.evidence_type.value: item for item in base.outcome_confirmation}
+    for item in delta.outcomes:
+        valid_refs = refs(item, "outcome")
+        if item.action == IrDeltaAction.NO_EFFECT or not valid_refs:
+            continue
+        key = item.evidence_type.value
+        current = outcomes.get(key)
+        if current is None and item.action not in {
+            IrDeltaAction.ADD,
+            IrDeltaAction.STRENGTHEN,
+        }:
+            continue
+        if current is None:
+            outcomes[key] = ContextualOutcomeAssessment(
+                evidence_type=item.evidence_type,
+                strength_bucket=item.strength_bucket,
+                persistence_bucket=item.persistence_bucket,
+                reference_ids=valid_refs,
+                rationale=_qualitative_rationale(item.rationale),
+            )
+        else:
+            strengthening = item.action in {
+                IrDeltaAction.ADD,
+                IrDeltaAction.STRENGTHEN,
+            }
+            contradiction = item.action == IrDeltaAction.CONTRADICT
+            outcomes[key] = current.model_copy(
+                update={
+                    "strength_bucket": (
+                        max(current.strength_bucket, item.strength_bucket)
+                        if strengthening
+                        else 0
+                        if contradiction
+                        else min(current.strength_bucket, item.strength_bucket)
+                    ),
+                    "persistence_bucket": (
+                        max(current.persistence_bucket, item.persistence_bucket)
+                        if strengthening
+                        else 0
+                        if contradiction
+                        else min(current.persistence_bucket, item.persistence_bucket)
+                    ),
+                    "reference_ids": sorted(set(current.reference_ids) | set(valid_refs)),
+                }
+            )
+        material_delta_count += 1
+        actions.append(
+            {
+                "category": "outcome",
+                "type": key,
+                "action": "APPLY_IR_DELTA",
+                "delta_action": item.action.value,
+            }
+        )
+
+    counters = {item.evidence_type.value: item for item in base.counterevidence}
+    for item in delta.counterevidence:
+        valid_refs = refs(item, "counterevidence")
+        if item.action == IrDeltaAction.NO_EFFECT or not valid_refs:
+            continue
+        key = item.evidence_type.value
+        current = counters.get(key)
+        if current is None and item.action not in {
+            IrDeltaAction.ADD,
+            IrDeltaAction.STRENGTHEN,
+        }:
+            continue
+        if current is None:
+            counters[key] = ContextualCounterevidenceAssessment(
+                evidence_type=item.evidence_type,
+                severity_bucket=item.severity_bucket,
+                reference_ids=valid_refs,
+                rationale=_qualitative_rationale(item.rationale),
+            )
+        else:
+            strengthening = item.action in {
+                IrDeltaAction.ADD,
+                IrDeltaAction.STRENGTHEN,
+            }
+            counters[key] = current.model_copy(
+                update={
+                    "severity_bucket": (
+                        max(current.severity_bucket, item.severity_bucket)
+                        if strengthening
+                        else min(current.severity_bucket, item.severity_bucket)
+                    ),
+                    "reference_ids": sorted(set(current.reference_ids) | set(valid_refs)),
+                }
+            )
+        material_delta_count += 1
+        actions.append(
+            {
+                "category": "counterevidence",
+                "type": key,
+                "action": "APPLY_IR_DELTA",
+                "delta_action": item.action.value,
+            }
+        )
+
+    sufficiency = base.evidence_sufficiency
+    if material_delta_count:
+        sufficiency = max(
+            0,
+            min(4, base.evidence_sufficiency + delta.evidence_sufficiency_delta),
+        )
+    merged = ContextualMoatAssessment(
+        evidence_sufficiency=sufficiency,
+        mechanisms=[mechanisms[key] for key in sorted(mechanisms)],
+        outcome_confirmation=[outcomes[key] for key in sorted(outcomes)],
+        counterevidence=[counters[key] for key in sorted(counters)],
+    )
+    return merged, {
+        "schema_version": "ir-incremental-merge/1",
+        "strategy": "FROZEN_DART_BASE_PLUS_VALIDATED_IR_DELTA",
+        "material_delta_count": material_delta_count,
         "actions": actions,
     }
 

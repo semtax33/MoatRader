@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from moatrader.adapters import RawDocument
+from moatrader.adapters import PaddlePdfOcrAdapter, RawDocument
 from moatrader.backtest import (
     BacktestConfig,
     PointInTimeBacktester,
@@ -25,6 +25,9 @@ from moatrader.ingestion import (
     BronzeFilingStore,
     DartCollector,
     DartOpenApiClient,
+    KindCompanyIdentity,
+    KindIrClient,
+    KindIrCollector,
     ResilientHttpClient,
     SecEdgarClient,
     SecEdgarCollector,
@@ -71,6 +74,18 @@ def _preflight_universe_tickers(
     return [ticker for ticker in tickers if ticker] or fallback_tickers
 
 
+def _ir_ocr_adapter(args: argparse.Namespace) -> PaddlePdfOcrAdapter | None:
+    engine = str(getattr(args, "ir_ocr_engine", "none") or "none").casefold()
+    if engine == "none":
+        return None
+    if engine != "paddle":
+        raise ValueError(f"unsupported IR OCR engine: {engine}")
+    return PaddlePdfOcrAdapter(
+        device=str(getattr(args, "ir_ocr_device", "cpu")),
+        cpu_threads=int(getattr(args, "ir_ocr_cpu_threads", 6)),
+    )
+
+
 def _ingest(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     metadata = json.loads(Path(args.metadata).read_text(encoding="utf-8-sig"))
@@ -84,11 +99,15 @@ def _ingest(args: argparse.Namespace) -> int:
             if input_path.suffix.lower() == ".xml"
             else "application/xhtml+xml"
             if input_path.suffix.lower() == ".xhtml"
+            else "application/pdf"
+            if input_path.suffix.lower() == ".pdf"
             else "text/html"
         ),
         hints=metadata,
     )
-    prepared = CanonicalFinancialDocumentPipeline().prepare_for_llm(
+    prepared = CanonicalFinancialDocumentPipeline(
+        ir_ocr_adapter=_ir_ocr_adapter(args)
+    ).prepare_for_llm(
         raw,
         model_context_tokens=args.context_tokens,
     )
@@ -238,6 +257,61 @@ def _collect_sec(args: argparse.Namespace) -> int:
     return _finish_collection(args, result, "sec-edgar")
 
 
+def _kind_company_identities(path: str | Path) -> list[KindCompanyIdentity]:
+    source = Path(path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"KIND company identity CSV not found: {source}")
+    identities: dict[str, KindCompanyIdentity] = {}
+    with source.open("r", encoding="utf-8-sig", newline="") as stream:
+        for row_number, row in enumerate(csv.DictReader(stream), start=2):
+            raw_ticker = str(row.get("ticker") or row.get("stock_code") or "").strip()
+            ticker = raw_ticker.zfill(6)
+            issuer_id = str(row.get("issuer_id") or row.get("corp_code") or "").strip()
+            issuer_name = str(row.get("issuer_name") or row.get("name") or row.get("corp_name") or "").strip()
+            if not raw_ticker or not issuer_id or not issuer_name:
+                raise ValueError(
+                    f"row {row_number}: company file requires ticker/stock_code, "
+                    "issuer_id/corp_code, and issuer_name/name"
+                )
+            identity = KindCompanyIdentity(
+                ticker=ticker,
+                issuer_id=issuer_id,
+                issuer_name=issuer_name,
+                kind_company_code=(str(row.get("kind_company_code") or "").strip() or None),
+            )
+            prior = identities.get(ticker)
+            if prior is not None and prior != identity:
+                raise ValueError(f"row {row_number}: conflicting identity for ticker {ticker}")
+            identities[ticker] = identity
+    if not identities:
+        raise ValueError("KIND company identity CSV contains no companies")
+    return list(identities.values())
+
+
+def _collect_kind_ir(args: argparse.Namespace) -> int:
+    http = ResilientHttpClient(
+        user_agent="MoatRader KIND IR collector",
+        requests_per_second=args.requests_per_second,
+        timeout_seconds=args.timeout,
+        max_retries=args.retries,
+        default_max_bytes=int(args.max_download_mb * 1024 * 1024),
+    )
+    collector = KindIrCollector(
+        KindIrClient(http),
+        BronzeFilingStore(args.output),
+        max_download_bytes=int(args.max_download_mb * 1024 * 1024),
+    )
+    result = collector.collect(
+        begin_date=args.begin_date,
+        end_date=args.end_date,
+        companies=_kind_company_identities(args.company_file),
+        refresh=args.refresh,
+        max_materials=args.max_materials,
+        max_materials_per_company=args.max_materials_per_company,
+    )
+    return _finish_collection(args, result, "kind-ir")
+
+
 def _collect_manifest(args: argparse.Namespace) -> int:
     output = write_collected_universe_manifest(BronzeFilingStore(args.bronze_root), args.output)
     print(f"manifest={output}")
@@ -312,7 +386,12 @@ def _moat_run(args: argparse.Namespace) -> int:
         allow_low_quality=args.allow_low_quality,
         maximum_price_age_days=args.maximum_price_age_days,
         maximum_atomic_evidence_units=args.maximum_atomic_evidence_units,
+        maximum_ir_atomic_evidence_units=args.maximum_ir_atomic_evidence_units,
+        incremental_ir_mode=args.incremental_ir,
         consolidate_section_summaries=args.consolidate_section_summaries,
+        ir_ocr_engine=args.ir_ocr_engine,
+        ir_ocr_device=args.ir_ocr_device,
+        ir_ocr_cpu_threads=args.ir_ocr_cpu_threads,
         workers=args.workers,
         resume=args.resume,
         dry_run=args.dry_run,
@@ -375,6 +454,9 @@ def _moat_run(args: argparse.Namespace) -> int:
         config=config,
         output_directory=args.output,
         transport=transport,
+        pipeline=CanonicalFinancialDocumentPipeline(
+            ir_ocr_adapter=_ir_ocr_adapter(args)
+        ),
     )
     result = runner.run(manifest, companies)
     print(f"run_id={result.run_id}")
@@ -581,6 +663,32 @@ def build_parser() -> argparse.ArgumentParser:
     collect_sec.add_argument("--refresh", action="store_true", help="redownload known IDs to detect revisions")
     collect_sec.set_defaults(handler=_collect_sec)
 
+    collect_kind = collect_subparsers.add_parser(
+        "kind-ir",
+        help="discover and download PIT-safe IR PDFs from the official KIND IR materials list",
+    )
+    collect_kind.add_argument("--from", dest="begin_date", required=True, type=_calendar_date)
+    collect_kind.add_argument("--to", dest="end_date", required=True, type=_calendar_date)
+    collect_kind.add_argument(
+        "--company-file",
+        required=True,
+        help="UTF-8 CSV with ticker, issuer_id, issuer_name (DART manifest columns are accepted)",
+    )
+    collect_kind.add_argument("--output", default="data-lake/bronze", help="Bronze root directory")
+    collect_kind.add_argument("--manifest", help="combined latest-filings universe CSV output")
+    collect_kind.add_argument("--requests-per-second", type=float, default=2.0)
+    collect_kind.add_argument("--timeout", type=float, default=60.0)
+    collect_kind.add_argument("--retries", type=int, default=4)
+    collect_kind.add_argument("--max-download-mb", type=float, default=256.0)
+    collect_kind.add_argument("--max-materials", type=int)
+    collect_kind.add_argument(
+        "--max-materials-per-company",
+        type=int,
+        help="keep only the latest N available PDF attachments per matched company",
+    )
+    collect_kind.add_argument("--refresh", action="store_true", help="redownload known IDs to detect revisions")
+    collect_kind.set_defaults(handler=_collect_kind_ir)
+
     collect_manifest = collect_subparsers.add_parser(
         "manifest",
         help="rebuild a runner-compatible universe CSV from Bronze latest pointers",
@@ -589,12 +697,22 @@ def build_parser() -> argparse.ArgumentParser:
     collect_manifest.add_argument("--output", required=True)
     collect_manifest.set_defaults(handler=_collect_manifest)
 
-    ingest = subparsers.add_parser("ingest-html", help="convert DART/EDGAR/IR HTML to canonical artifacts")
+    ingest = subparsers.add_parser("ingest-html", help="convert DART/EDGAR/IR HTML or IR PDF to canonical artifacts")
     ingest.add_argument("input")
     ingest.add_argument("--metadata", required=True, help="UTF-8 JSON metadata/hints")
     ingest.add_argument("--source", required=True, choices=["dart", "sec_edgar", "ir"])
     ingest.add_argument("--output", required=True)
     ingest.add_argument("--context-tokens", type=int)
+    ingest.add_argument(
+        "--ir-ocr-engine",
+        choices=["none", "paddle"],
+        default=os.getenv("MOATRADER_IR_OCR_ENGINE", "none"),
+    )
+    ingest.add_argument(
+        "--ir-ocr-device",
+        default=os.getenv("MOATRADER_IR_OCR_DEVICE", "cpu"),
+    )
+    ingest.add_argument("--ir-ocr-cpu-threads", type=int, default=6)
     ingest.set_defaults(handler=_ingest)
     schema = subparsers.add_parser("schema", help="print CanonicalDocumentBundle JSON Schema")
     schema.set_defaults(handler=_schema)
@@ -684,11 +802,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="classify at most this many content-ranked atomic evidence units; the old chunk flag is an alias",
     )
     moat_run.add_argument(
+        "--maximum-ir-atomic-evidence-units",
+        type=int,
+        default=12,
+        help="classify IR atomic evidence in a separate slot so it cannot displace DART evidence",
+    )
+    moat_run.add_argument(
+        "--incremental-ir",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="freeze the DART assessment and evaluate IR only as a deterministic incremental delta",
+    )
+    moat_run.add_argument(
         "--consolidate-section-summaries",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="group deterministic evidence-preserving summaries at company level",
     )
+    moat_run.add_argument(
+        "--ir-ocr-engine",
+        choices=["none", "paddle"],
+        default=os.getenv("MOATRADER_IR_OCR_ENGINE", "none"),
+        help="selective OCR engine for image-dominant or encoding-corrupt IR PDF pages",
+    )
+    moat_run.add_argument(
+        "--ir-ocr-device",
+        default=os.getenv("MOATRADER_IR_OCR_DEVICE", "cpu"),
+        help="PaddleOCR device, for example cpu or gpu:0",
+    )
+    moat_run.add_argument("--ir-ocr-cpu-threads", type=int, default=6)
     moat_run.add_argument("--workers", type=int, default=1)
     moat_run.add_argument("--validation-attempts", type=int, default=2)
     moat_run.add_argument("--api-retries", type=int, default=4)

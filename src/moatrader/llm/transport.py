@@ -226,6 +226,7 @@ class OpenAIResponsesTransport:
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
             LLMTask.CANDIDATE_ATOMIC_AUDIT,
             LLMTask.FINAL_MOAT_SCORING,
         }:
@@ -427,7 +428,10 @@ class OpenAIResponsesTransport:
         # while the configured global maximum remains a compatibility ceiling.
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
             return min(self.max_output_tokens, 2_000)
-        if task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+        }:
             return min(self.max_output_tokens, 8_000)
         if task == LLMTask.CANDIDATE_ATOMIC_AUDIT:
             return min(self.max_output_tokens, 2_000)

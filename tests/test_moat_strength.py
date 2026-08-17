@@ -16,10 +16,14 @@ from moatrader.evidence.models import (
     EvidenceCard,
     EvidenceDirection,
     EvidenceType,
+    IrDeltaAction,
+    IrIncrementalAssessment,
+    IrMechanismDelta,
     MoatAuditStatus,
 )
 from moatrader.evidence.atomic import select_context_cited_atomic_units
 from moatrader.evidence.validation import (
+    apply_ir_incremental_assessment,
     build_candidate_manifest,
     derive_audited_moat_score,
     derive_rank_refinement,
@@ -106,6 +110,56 @@ def _reference(chunk: SemanticChunk) -> ContextEvidenceReference:
         raw_quote=chunk.markdown,
         source_types=[SourceType.DART],
     )
+
+
+def test_ir_incremental_merge_keeps_base_frozen_and_requires_known_ir_refs() -> None:
+    base = ContextualMoatAssessment(
+        evidence_sufficiency=2,
+        mechanisms=[
+            ContextualMechanismAssessment(
+                evidence_type=EvidenceType.SWITCHING_COST,
+                strength_bucket=2,
+                scope_materiality_bucket=2,
+                durability_bucket=2,
+                economic_scope=EconomicScope.COMPANY,
+                reference_ids=["DART-R1"],
+                rationale="Contractual integration creates switching friction.",
+            )
+        ],
+    )
+    ir_reference = ContextEvidenceReference(
+        ref_id="IR-R1",
+        chunk_id="IR-C1",
+        document_id="IR-D1",
+        node_ids=["IR-N1"],
+        raw_quote="A longer qualification program was disclosed.",
+        source_types=[SourceType.IR],
+    )
+    delta = IrIncrementalAssessment(
+        evidence_sufficiency_delta=1,
+        mechanisms=[
+            IrMechanismDelta(
+                evidence_type=EvidenceType.SWITCHING_COST,
+                action=IrDeltaAction.STRENGTHEN,
+                strength_bucket=4,
+                scope_materiality_bucket=3,
+                durability_bucket=4,
+                economic_scope=EconomicScope.COMPANY,
+                reference_ids=["IR-R1", "UNKNOWN"],
+                rationale="The qualification process strengthens switching friction.",
+            )
+        ],
+    )
+
+    merged, report = apply_ir_incremental_assessment(base, delta, [ir_reference])
+
+    assert base.mechanisms[0].strength_bucket == 2
+    assert base.mechanisms[0].reference_ids == ["DART-R1"]
+    assert merged.evidence_sufficiency == 3
+    assert merged.mechanisms[0].strength_bucket == 4
+    assert merged.mechanisms[0].reference_ids == ["DART-R1", "IR-R1"]
+    assert report["material_delta_count"] == 1
+    assert any(action["action"] == "DROP_UNKNOWN_IR_REFS" for action in report["actions"])
 
 
 def _assessment(_chunk: SemanticChunk) -> ContextualMoatAssessment:
