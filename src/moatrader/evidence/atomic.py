@@ -22,7 +22,7 @@ from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 
 ATOMIC_SEGMENTATION_VERSION = "atomic-evidence/2"
-ATOMIC_RUBRIC_VERSION = "structural-moat-rubric/6"
+ATOMIC_RUBRIC_VERSION = "structural-moat-rubric/9"
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)

@@ -161,6 +161,26 @@ def test_atomic_request_exposes_issuer_identity_for_third_party_guard() -> None:
     assert request.metadata["issuer_name"] == "글로벌텍스프리"
 
 
+def test_atomic_request_prioritizes_explicit_observable_outcome_anchors() -> None:
+    unit = build_atomic_evidence_units(
+        [_chunk("C1", "회사의 제품은 시장점유율 1위이다.")],
+        issuer_id="ISSUER-1",
+    )[0]
+
+    request = build_atomic_evidence_request(
+        unit,
+        issuer_id="ISSUER-1",
+        issuer_name="Issuer",
+    )
+
+    assert request.metadata["prompt_version"] == "atomic-evidence-classifier/10"
+    assert request.metadata["rubric_version"] == "structural-moat-rubric/9"
+    assert "Positive routing priority" in request.system
+    assert "does not mean an observable outcome should be returned as NONE" in request.system
+    assert "issuer-owned product, brand, or platform outcome belongs to COMPANY" in request.system
+    assert "Do not use PRODUCT_CATEGORY for an issuer-owned product's market share" in request.system
+
+
 def test_atomic_api_schema_uses_explicit_aliases_without_changing_internal_fields() -> None:
     schema = AtomicEvidenceExtraction.model_json_schema()
     properties = schema["properties"]

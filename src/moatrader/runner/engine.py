@@ -1772,7 +1772,10 @@ class MoatUniverseRunner:
                             audits,
                             company_dir,
                         )
-                    extraction, repair_actions = normalize_atomic_extraction(extraction)
+                    extraction, repair_actions = normalize_atomic_extraction(
+                        extraction,
+                        source_text=chunk.markdown,
+                    )
                     self.store.write_json(vote_checkpoint, extraction)
                     votes.append(extraction)
                     vote_repairs.append(

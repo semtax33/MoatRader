@@ -74,7 +74,7 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["compression_invariance_gate_required"] = True
     contract["metamorphic_gate_required"] = True
     contract["moat_model_snapshot_policy"] = "EXACT_ID_NO_LATEST_ALIAS"
-    contract["atomic_prompt_version"] = "atomic-evidence-classifier/7"
+    contract["atomic_prompt_version"] = "atomic-evidence-classifier/10"
     contract["atomic_api_schema"] = "closed-moat-role-and-subtype/2"
     contract["atomic_consensus"] = "strict-majority-fail-closed/1"
     contract["atomic_output_token_cap"] = min(config.max_output_tokens, 2_000)

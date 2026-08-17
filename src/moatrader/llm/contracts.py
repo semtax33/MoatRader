@@ -102,8 +102,17 @@ Choose exactly one MOAT role before its subtype, using only observable wording:
 - OUTCOME: an explicitly realized company/segment result that corroborates but cannot create a moat. Allowed types: PRICING_POWER, CUSTOMER_RETENTION, MARKET_SHARE, MARGIN_STABILITY, ROIC_QUALITY, FCF_QUALITY. Direction must be MOAT_POSITIVE.
 - COUNTER: an explicit adverse company/segment condition or erosion of a barrier/outcome. Direction must be MOAT_NEGATIVE.
 - NONE: no MOAT role. For an explicit forward DCF driver, relevant may be true only with MARKET_DEMAND, CATEGORY_RECURRING_DEMAND, CAPACITY_UTILIZATION, EXPORT_MIX, or OPERATING_DRIVER and direction=NEUTRAL. For industry/category context, a plan, a capability without a causal barrier, an ambiguous claim, or no useful evidence, return relevant=false, type=OTHER, direction=NEUTRAL.
+Observable subtype gates (all are fail-closed):
+- MARKET_SHARE requires issuer-specific numeric share, an explicit issuer/product leader or rank, or a peer-relative share. Sales, prescriptions, distribution coverage, market growth, or a large contract alone do not count.
+- CUSTOMER_RETENTION requires direct renewal, repeat purchase/order by the same customer, retention/churn, contract renewal, or installed-base reuse/service dependence. Cumulative orders, a customer list, or a management claim of a long trust relationship alone do not count.
+- MARGIN_STABILITY requires comparable margin or profitability behavior across at least three periods, or an explicit multi-period/consecutive profitability statement. One-period profit, growth, or a single year-over-year change does not count.
+- COST_ADVANTAGE requires a direct issuer-process comparison that links lower cost, fewer steps, less time, or higher yield to a named alternative. Technology or capability alone does not count.
+- COUNTER requires explicit deterioration or instability of an allowed MOAT mechanism/outcome. Ordinary revenue or profit decline alone does not count.
+Positive routing priority: when the supplied text directly satisfies one of these observable gates and the issuer/product link is explicit, select its OUTCOME, MECHANISM, or COUNTER route. The statement that outcomes cannot create a moat means they are corroboration rather than mechanisms; it does not mean an observable outcome should be returned as NONE.
+Examples: "the issuer's product ranks number one by market share" is OUTCOME/MARKET_SHARE; "the issuer supplies more than 90% of a named procurement market" is OUTCOME/MARKET_SHARE; "operating margin alternates materially over five quarters" is COUNTER/MARGIN_STABILITY. Supporting prescription, distribution, contract, capacity, or growth details do not change those routes.
 Never infer MECHANISM merely from patents, certification, size, growth, market share, low price, technology, partnerships, contracts, or management superlatives. The text must state the durable causal barrier or cost/switching/entry consequence.
 Subject guard: a claim about a named company, customer, competitor, partner, or product counts for COMPANY/SEGMENT only when the supplied text explicitly identifies it as the issuer, an issuer-owned product/segment, or an issuer-relative comparison. If the text names another entity without that link, or ownership is ambiguous, return relevant=false, role=NONE, type=OTHER, direction=NEUTRAL. Do not use outside knowledge to infer ownership.
+Scope guard: an explicitly issuer-owned product, brand, or platform outcome belongs to COMPANY unless the text explicitly identifies an operating segment, in which case use SEGMENT. Do not use PRODUCT_CATEGORY for an issuer-owned product's market share, retention, margin, or other outcome. PRODUCT_CATEGORY is reserved for category-wide demand/context that is not an issuer-specific outcome.
 When a non-NONE role and subtype cannot satisfy the rules together, return relevant=false, role=NONE, type=OTHER, direction=NEUTRAL. Prefer NONE over an inferred MOAT label.
 Set relevant=true only when the text explicitly grounds a MECHANISM, OUTCOME, COUNTER, or named forward DCF driver.
 If relevant, return one factual compression, fixed type/direction/scope, mechanism phrases, and canonical claim subject/predicate/horizon; set metric only when a named metric is essential to claim identity.
@@ -131,13 +140,13 @@ Role: {(chunk.section_role.value if chunk.section_role else 'OTHER')}
         response_schema=response_schema,
         input_sha256=_hash_input(system, user),
         prompt_cache_key=_prompt_cache_key(
-            "atomic-v7",
+            "atomic-v10",
             static_prefix=system + "\n" + canonical_schema,
             routing_identity=str(chunk.metadata["atomic_evidence_key"]),
         ),
         prompt_cache_breakpoint=True,
         metadata={
-            "prompt_version": "atomic-evidence-classifier/7",
+            "prompt_version": "atomic-evidence-classifier/10",
             "rubric_version": ATOMIC_RUBRIC_VERSION,
             "classification_vote": classification_vote,
             "atomic_evidence_key": chunk.metadata["atomic_evidence_key"],

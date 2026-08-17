@@ -18,6 +18,8 @@
 - generated summary가 완전히 제외된 scoring dossier, factor별 compact claim pack, on-demand raw provenance, coverage 기록
 - OpenAI Responses API/Pydantic Structured Outputs transport, retry, usage audit, `store=false`
 - compact Structured Outputs와 task별 cap을 쓰는 atomic evidence 분류: pinned `gpt-5.6-luna` (`gpt-5-nano`는 선택적 문장 요약용 예약 설정)
+- `MARKET_SHARE`/`CUSTOMER_RETENTION`/`MARGIN_STABILITY`/`COST_ADVANTAGE`/`COUNTER` observable-anchor gate와 issuer-owned product scope guard
+- IR visual score-bearing 9건 A/B/C 수동 골드, 독립 3표 재판정, production classifier 6표 재현성 audit
 - final-score LLM 호출이 없는 canonical claim Python reducer
 - LLM 비의존 Python unlevered DCF, assumptions hash/as-of manifest
 - 한 종목/복수 종목/전체 universe 실행, 병렬 처리, 회사별 실패 격리, chunk/section resume
@@ -45,7 +47,7 @@
 ## 아직 별도 adapter/서비스가 필요한 범위
 
 - DART 명시적 XML taxonomy와 SEC taxonomy/version별 정교한 concept mapping
-- IR PDF/PPT, OCR, chart, page/slide bbox viewer
+- IR PDF/PPT production adapter, chart/figure semantic extraction, page/slide bbox viewer (`ir-visual-ablation-v1`의 vision full semantics 15/30, 실제 score-bearing route 3/7로 아직 gate 미통과)
 - 실제 모델 tokenizer와 대표 corpus 기반 prompt/model calibration
 - parser 원문/AST/Markdown 동시 비교 viewer와 15~30개 실제 공시 golden corpus
 - segment별 MOAT 산출 및 revenue/EBIT 가중 company score

@@ -224,6 +224,96 @@ def test_atomic_none_role_preserves_explicit_forward_dcf_driver() -> None:
     assert "PRESERVE_EXPLICIT_NON_MOAT_DCF_DRIVER" in actions
 
 
+def test_observable_anchor_rejects_cumulative_orders_as_customer_retention() -> None:
+    vote = _atomic_vote(
+        AtomicMoatRole.OUTCOME,
+        EvidenceType.CUSTOMER_RETENTION,
+        EvidenceDirection.MOAT_POSITIVE,
+    )
+
+    normalized, actions = normalize_atomic_extraction(
+        vote,
+        source_text=(
+            "AVACO shows cumulative sputter orders rising 74.9 times and describes "
+            "a long trust relationship with a global display customer."
+        ),
+    )
+
+    assert normalized.is_investment_relevant is False
+    assert normalized.moat_role == AtomicMoatRole.NONE
+    assert normalized.evidence_type == EvidenceType.OTHER
+    assert any("CUSTOMER_RETENTION_REQUIRES_DIRECT_RETENTION_BEHAVIOR" in action for action in actions)
+
+
+def test_observable_anchor_rejects_ordinary_profit_decline_as_counter() -> None:
+    vote = _atomic_vote(
+        AtomicMoatRole.COUNTER,
+        EvidenceType.MARGIN_STABILITY,
+        EvidenceDirection.MOAT_NEGATIVE,
+    )
+
+    normalized, actions = normalize_atomic_extraction(
+        vote,
+        source_text="2021 Q3 revenue fell 7% and operating profit fell 33% year over year.",
+    )
+
+    assert normalized.is_investment_relevant is False
+    assert normalized.evidence_type == EvidenceType.OTHER
+    assert any("MARGIN_STABILITY_REQUIRES_MULTI_PERIOD_PROFITABILITY" in action for action in actions)
+
+
+def test_observable_anchors_preserve_true_share_margin_cost_and_retention_routes() -> None:
+    cases = [
+        (
+            _atomic_vote(
+                AtomicMoatRole.OUTCOME,
+                EvidenceType.MARKET_SHARE,
+                EvidenceDirection.MOAT_POSITIVE,
+            ),
+            "Global Tax Free is the domestic number-one operator with 70-75% market share.",
+        ),
+        (
+            _atomic_vote(
+                AtomicMoatRole.OUTCOME,
+                EvidenceType.CUSTOMER_RETENTION,
+                EvidenceDirection.MOAT_POSITIVE,
+            ),
+            "The same customers renewed 92% of expiring contracts during 2025.",
+        ),
+        (
+            _atomic_vote(
+                AtomicMoatRole.COUNTER,
+                EvidenceType.MARGIN_STABILITY,
+                EvidenceDirection.MOAT_NEGATIVE,
+            ),
+            "Operating margin was 24.7%, 12.1%, 30.5%, 11.8%, and 28.9% over five-quarter volatility.",
+        ),
+        (
+            _atomic_vote(
+                AtomicMoatRole.MECHANISM,
+                EvidenceType.COST_ADVANTAGE,
+                EvidenceDirection.MOAT_POSITIVE,
+            ),
+            "EcML reduces production time and manufacturing cost versus GLA's 30-plus synthesis steps.",
+        ),
+        (
+            _atomic_vote(
+                AtomicMoatRole.OUTCOME,
+                EvidenceType.MARGIN_STABILITY,
+                EvidenceDirection.MOAT_POSITIVE,
+            ),
+            "BIO-FD&C remained profitable for eleven consecutive years from 2011 through 2023.",
+        ),
+    ]
+
+    for vote, source_text in cases:
+        normalized, actions = normalize_atomic_extraction(vote, source_text=source_text)
+        assert normalized.is_investment_relevant is True
+        assert normalized.moat_role == vote.moat_role
+        assert normalized.evidence_type == vote.evidence_type
+        assert not any(action.startswith("FAIL_CLOSED_OBSERVABLE_ANCHOR") for action in actions)
+
+
 def test_evidence_ledger_carries_omitted_structural_evidence_without_future_leak(tmp_path: Path) -> None:
     ledger = EvidenceLedgerStore(tmp_path, experiment_id="exp")
     first_date = datetime.fromisoformat("2025-08-31T23:59:59+09:00")

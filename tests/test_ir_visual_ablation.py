@@ -27,17 +27,23 @@ def test_visual_gold_has_frozen_role_and_subtype_for_every_claim() -> None:
     root = Path(__file__).resolve().parents[1]
     gold = json.loads((root / "docs" / "ir-visual-coverage-gold-v1.json").read_text(encoding="utf-8"))
 
-    assert gold["schema_version"] == "ir-visual-coverage-gold/2"
+    assert gold["schema_version"] == "ir-visual-coverage-gold/3"
     assert len(gold["claims"]) == 30
     assert all(
         claim.get("gold_role") and claim.get("gold_subtype") and claim.get("gold_rationale")
         for claim in gold["claims"]
     )
     assert Counter(claim["gold_role"] for claim in gold["claims"]) == {
-        "NONE": 21,
-        "OUTCOME": 6,
-        "COUNTER": 2,
+        "NONE": 23,
+        "OUTCOME": 5,
+        "COUNTER": 1,
         "MECHANISM": 1,
+    }
+    adjudicated = [claim for claim in gold["claims"] if claim.get("adjudication_class")]
+    assert Counter(claim["adjudication_class"] for claim in adjudicated) == {
+        "A": 7,
+        "B": 1,
+        "C": 1,
     }
 
 

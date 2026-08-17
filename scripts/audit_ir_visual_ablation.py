@@ -37,6 +37,7 @@ from moatrader.evidence.models import (
 from moatrader.evidence.processing import (
     atomic_routing_signature,
     build_atomic_classification_consensus,
+    normalize_atomic_extraction,
 )
 from moatrader.llm.contracts import build_atomic_evidence_request
 from moatrader.llm.transport import _openai_compatible_schema
@@ -547,18 +548,26 @@ def run_classifications(
             "effort": effort,
             "input_sha256": request.input_sha256,
         }
-        payload = _checkpointed_call(
-            path,
-            identity,
-            lambda: _call_structured(
+        def call() -> dict[str, Any]:
+            result = _call_structured(
                 model=model,
                 effort=effort,
                 system=request.system,
                 user=request.user,
                 response_model=AtomicEvidenceExtraction,
                 max_output_tokens=2_000,
-            ),
-        )
+            )
+            extraction = AtomicEvidenceExtraction.model_validate(result["parsed"])
+            result["raw_parsed"] = extraction.model_dump(mode="json", by_alias=True)
+            normalized, repair_actions = normalize_atomic_extraction(
+                extraction,
+                source_text=chunk.markdown,
+            )
+            result["parsed"] = normalized.model_dump(mode="json", by_alias=True)
+            result["repair_actions"] = repair_actions
+            return result
+
+        payload = _checkpointed_call(path, identity, call)
         return {"lane": lane, "claim_id": claim["claim_id"], "vote": vote, **payload}
 
     return _run_tasks(tasks, execute, max_workers=max_workers)

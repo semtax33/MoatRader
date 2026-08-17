@@ -498,7 +498,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         classification_vote=vote_index,
                     )
                     result = transport.execute(request, AtomicEvidenceExtraction)
-                    extraction, repair_actions = normalize_atomic_extraction(result.parsed)
+                    extraction, repair_actions = normalize_atomic_extraction(
+                        result.parsed,
+                        source_text=chunk.markdown,
+                    )
                     usage = result.usage.model_dump(mode="json")
                     for field in total_usage:
                         total_usage[field] += int(usage.get(field, 0))

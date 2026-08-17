@@ -46,6 +46,52 @@ _RETENTION_RE = re.compile(
     r"고객\s*(?:유지|이탈률|재구매율)|갱신률|renewal|retention|churn|switching|전환\s*비용",
     re.IGNORECASE,
 )
+_MARKET_SHARE_ANCHOR_RE = re.compile(
+    r"(?:시장\s*)?점유율|시장\s*점유|M\s*/\s*S|market\s*share|share\s+of\s+(?:the\s+)?market|"
+    r"(?:국내|글로벌|시장|업계|제품|category|market)\s*(?:내\s*)?(?:#\s*)?(?:1위|leader)|"
+    r"#\s*1|number[-\s]?one|market\s+leader|"
+    r"(?:\d+(?:\.\d+)?\s*%).{0,50}(?:시장|market)|(?:시장|market).{0,50}(?:\d+(?:\.\d+)?\s*%)",
+    re.IGNORECASE,
+)
+_CUSTOMER_RETENTION_ANCHOR_RE = re.compile(
+    r"고객\s*(?:유지|이탈)|유지율|이탈률|재구매|재수주|반복\s*(?:구매|주문|수주)|"
+    r"재계약|계약\s*갱신|갱신률|renewal|retention|churn|reorder|"
+    r"repeat(?:ed)?\s+(?:purchase|order)|same\s+customer|"
+    r"installed\s+base.{0,50}(?:reuse|service|maintenance|upgrade)|"
+    r"설치\s*(?:기반|대수).{0,50}(?:재사용|서비스|유지보수|교체|업그레이드)",
+    re.IGNORECASE,
+)
+_MARGIN_OR_PROFITABILITY_ANCHOR_RE = re.compile(
+    r"마진|이익률|수익성|수익\s*실현|흑자|"
+    r"gross\s*(?:margin|%)|operating\s*(?:margin|%)|net\s*(?:margin|%)|"
+    r"profitability|profitable",
+    re.IGNORECASE,
+)
+_EXPLICIT_MULTIPERIOD_RE = re.compile(
+    r"(?:[3-9]|[1-9]\d+)\s*(?:개\s*)?(?:년|분기)|"
+    r"(?:three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)[-\s]+(?:years?|quarters?)|"
+    r"연속|consecutive",
+    re.IGNORECASE,
+)
+_PERIOD_TOKEN_RE = re.compile(
+    r"(?:19|20)\d{2}(?:[.\-/\s]?(?:[1-4]Q|Q[1-4]|[1-4]\s*분기))?|[‘'’]?\d{2}[.]?[1-4]Q",
+    re.IGNORECASE,
+)
+_COST_PROCESS_ANCHOR_RE = re.compile(
+    r"비용|원가|공정|단계|시간|수율|생산성|cost|unit\s+cost|steps?|process|time|yield|productivity",
+    re.IGNORECASE,
+)
+_DIRECT_COMPARISON_RE = re.compile(
+    r"대비|비교|절감|감축|줄(?:임|여)|낮은|적은|단축|피하|극복|"
+    r"versus|vs\.?|compared\s+(?:with|to)|avoid|reduce|lower|less|fewer|higher\s+yield|alternative",
+    re.IGNORECASE,
+)
+_COUNTER_EROSION_RE = re.compile(
+    r"불안정|변동|등락|악화|침식|훼손|축소|약화|"
+    r"volatil|instabil|unstable|deterior|erosion|erod|weaken|"
+    r"declin(?:e|ed|ing).{0,30}(?:share|margin|retention|renewal)",
+    re.IGNORECASE,
+)
 _FORWARD_LANGUAGE_RE = re.compile(
     r"전망|계획|예상|기대|목표|가이던스|추정|will|expect|plan|target|forecast|guidance",
     re.IGNORECASE,
@@ -114,6 +160,44 @@ def atomic_moat_role(extraction: AtomicEvidenceExtraction) -> AtomicMoatRole:
     if explicit is None:
         return inferred
     return explicit if explicit == inferred else AtomicMoatRole.NONE
+
+
+def observable_atomic_anchor_violation(
+    extraction: AtomicEvidenceExtraction,
+    source_text: str,
+) -> str | None:
+    """Return a fail-closed reason when selected MOAT routes lack an observable anchor.
+
+    The LLM chooses the semantic route, but Python enforces the narrow claims
+    that repeatedly caused false precision in IR pages.  This is deliberately
+    not a keyword classifier: it can reject an unsupported route, but it never
+    promotes a ``NONE`` vote into score-bearing evidence.
+    """
+
+    role = atomic_moat_role(extraction)
+    if role == AtomicMoatRole.NONE:
+        return None
+    text = unicodedata.normalize("NFKC", source_text or "")
+    evidence_type = extraction.evidence_type
+    if evidence_type == EvidenceType.MARKET_SHARE and not _MARKET_SHARE_ANCHOR_RE.search(text):
+        return "MARKET_SHARE_REQUIRES_ISSUER_SHARE_OR_RANK"
+    if (
+        evidence_type == EvidenceType.CUSTOMER_RETENTION
+        and not _CUSTOMER_RETENTION_ANCHOR_RE.search(text)
+    ):
+        return "CUSTOMER_RETENTION_REQUIRES_DIRECT_RETENTION_BEHAVIOR"
+    if evidence_type == EvidenceType.MARGIN_STABILITY:
+        periods = {match.group(0).casefold() for match in _PERIOD_TOKEN_RE.finditer(text)}
+        multi_period = bool(_EXPLICIT_MULTIPERIOD_RE.search(text)) or len(periods) >= 3
+        if not (_MARGIN_OR_PROFITABILITY_ANCHOR_RE.search(text) and multi_period):
+            return "MARGIN_STABILITY_REQUIRES_MULTI_PERIOD_PROFITABILITY"
+    if evidence_type == EvidenceType.COST_ADVANTAGE and not (
+        _COST_PROCESS_ANCHOR_RE.search(text) and _DIRECT_COMPARISON_RE.search(text)
+    ):
+        return "COST_ADVANTAGE_REQUIRES_DIRECT_PROCESS_COMPARISON"
+    if role == AtomicMoatRole.COUNTER and not _COUNTER_EROSION_RE.search(text):
+        return "COUNTER_REQUIRES_EXPLICIT_MOAT_ANCHOR_EROSION"
+    return None
 
 
 def _canonical_atomic_fact(source_text: str) -> str:
@@ -252,6 +336,8 @@ def build_atomic_classification_consensus(
 
 def normalize_atomic_extraction(
     extraction: AtomicEvidenceExtraction,
+    *,
+    source_text: str | None = None,
 ) -> tuple[AtomicEvidenceExtraction, list[str]]:
     """Keep free LLM prose qualitative; Python owns source numbers/periods.
 
@@ -283,6 +369,11 @@ def normalize_atomic_extraction(
     evidence_type = extraction.evidence_type
     direction = extraction.direction
     scope = extraction.economic_scope
+    if source_text is not None:
+        anchor_violation = observable_atomic_anchor_violation(extraction, source_text)
+        if anchor_violation is not None:
+            relevant = False
+            actions.append(f"FAIL_CLOSED_OBSERVABLE_ANCHOR:{anchor_violation}")
     if not relevant:
         role = AtomicMoatRole.NONE
         evidence_type = EvidenceType.OTHER
