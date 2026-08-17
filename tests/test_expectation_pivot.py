@@ -193,6 +193,26 @@ def test_valuation_mapper_preserves_moat_none_forward_evidence_and_prevents_doub
     assert pipeline.moat_role == AtomicMoatRole.NONE
 
 
+def test_persistence_parser_ignores_implausible_large_year_counts() -> None:
+    assert ValuationDriverMapper._persistence_years_text("10년 연속 유지") == 10
+    assert ValuationDriverMapper._persistence_years_text("987년 수치가 표에 있음") is None
+
+
+def test_legacy_positive_disclosed_fact_is_valuation_support_not_claim_support() -> None:
+    disclosed = _cards()[0].model_copy(
+        update={
+            "moat_role": AtomicMoatRole.NONE,
+            "direction": EvidenceDirection.MOAT_POSITIVE,
+            "statement_type": StatementType.DISCLOSED_FACT,
+            "reliability": 0.8,
+        }
+    )
+    forecast = disclosed.model_copy(update={"statement_type": StatementType.FORECAST})
+
+    assert ValuationDriverMapper._role(disclosed) == ValuationEvidenceRole.SUPPORT
+    assert ValuationDriverMapper._role(forecast) == ValuationEvidenceRole.SCENARIO_INPUT
+
+
 def test_valuation_selector_and_prompt_are_independent_from_frozen_moat_sensor() -> None:
     chunk = SemanticChunk(
         chunk_id="PIPELINE",

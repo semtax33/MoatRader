@@ -1,18 +1,8 @@
-from enum import StrEnum
-
 from pydantic import Field
 
 from moatrader.business.lifecycle import CompanyType, LifeCycleStage
 from moatrader.canonical.models import ContractModel
-
-
-class ValuationMethod(StrEnum):
-    ECONOMIC_FCFF = "ECONOMIC_FCFF"
-    STEADY_STATE_FCFF = "STEADY_STATE_FCFF"
-    EXCESS_RETURN_EQUITY = "EXCESS_RETURN_EQUITY"
-    BIOTECH_RNPV = "BIOTECH_RNPV"
-    NARRATIVE_DCF = "NARRATIVE_DCF"
-    FAILURE_ADJUSTED_DCF = "FAILURE_ADJUSTED_DCF"
+from moatrader.valuation.base import ValuationMethod
 
 
 class ValuationModelRoute(ContractModel):

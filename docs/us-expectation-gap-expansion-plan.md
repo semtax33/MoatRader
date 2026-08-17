@@ -6,7 +6,7 @@
 
 대상 저장소: MoatRader 1.0.0
 
-코드 감사 기준: `af6b51748bf723ac53efc75bdea0f9cf0668d74b`의 tracked baseline. 작성 중 병행된 uncommitted scoring/source-ablation 실험은 호환성 검토 대상으로만 읽었고 baseline 완료 기능으로 간주하지 않았다.
+코드 감사 기준: 설계 감사를 시작한 `af6b51748bf723ac53efc75bdea0f9cf0668d74b`의 tracked baseline. 작성 중 병행된 scoring/source-ablation 실험은 호환성 검토 대상으로만 읽었고 baseline 완료 기능으로 간주하지 않았다. 검토 도중 외부 작업으로 interim 문서와 그 실험이 `2cb22c90264315deb2e819e5f51f7e94a5f60efb`에 커밋됐으며, 현재 문서는 그 commit 위의 최종 review delta다. 기능 gap 판단의 기준선은 소급 변경하지 않는다.
 
 읽는 순서: 의사결정자는 0·16·17·19·21, 구현자는 3·7~14·22, research 설계 검토자는 10·11·15를 먼저 보면 된다. 23은 source 검증, 24는 전달받은 제안과의 traceability다.
 
@@ -26,6 +26,8 @@
 6. 현재 수동 JSON인 `expectation_assumptions`는 자동 숫자 생성기가 아니라 provenance가 붙은 assumption workbench와 승인 artifact로 바꾼다.
 7. 현재 Expectation Gap의 축별 min/max 투표는 joint reverse-DCF surface 비교로 교체한다.
 8. 5개 gold set을 통과한 뒤 30개 고정 연구 표본으로 확대하고, 가치가 측정된 소스만 더 넓게 수집한다.
+
+설계·gold·30개 engineering pilot까지의 1인 추정은 26~39 engineer-week다. 경제적 검증 준비는 licensed market/security-master/action data와 ledger를 위해 추가 8~14 engineer-week이며, 권장 prospective primary evidence는 별도로 24개 complete monthly decision 관측을 기다린다. 따라서 가까운 완료 기준은 “미국 입력과 GAP v2를 PIT-safe하게 재현하는 research MVP”이고, “검증된 alpha/실거래 구현 가능성”은 독립 gate다.
 
 이 순서를 따르면 SEC 중심의 깨끗한 PIT 장점을 보존하면서도, IR crawler와 유료 데이터에 먼저 큰 비용을 쓰는 것을 피할 수 있다.
 
@@ -230,6 +232,25 @@ LlmClassificationRun
 
 동일 run replay는 저장 권리가 있는 raw response를 사용하고 network를 다시 호출하지 않는다. 같은 prompt/model 이름을 다시 호출해 결과가 달라지면 기존 output을 덮어쓰지 않고 새 run ID를 만든다. Temperature를 0으로 두는 것을 결정론 보장으로 간주하지 않는다. Prompt, schema, model version 중 하나가 바뀌면 gold regression을 다시 실행한다. Source policy가 `LOCAL_ONLY/NONE`이면 cloud LLM 호출 전 payload gate에서 차단하고, 입력 node 밖 지식이나 도구 검색을 허용하지 않는다. Input/output retention 권리가 없어 response를 보존할 수 없으면 `NON_REPLAYABLE`이며 core audited evidence나 primary signal로 승격하지 않고 capability/shadow diagnostic에만 쓴다.
 
+장기 prospective holdout은 LLM alias를 그대로 24개월 호출하는 연속 experiment가 아니다.
+
+```text
+ExperimentAnalysisEpoch
+  analysis_epoch_id
+  code_execution_identity_id / input_schema_hash
+  economic_policy_bundle_hash
+  provider / exact_model_version
+  prompt_template_hash / response_schema_version
+  generation_parameters / tool_policy
+  source_selection_policy_id
+  started_at / ended_at?
+  retirement_reason?
+  gold_regression_report_id
+  primary_eligible
+```
+
+Primary window는 사전 고정한 exact analysis epoch만 사용한다. Provider가 model을 retire해 새 event를 같은 version으로 처리할 수 없거나 code/schema/economic policy가 결과에 영향을 주게 바뀌면 old epoch의 monthly series를 조용히 이어 붙이지 않고 그 epoch를 종료한다. 후보 model/build를 price/return이 가려진 gold·prospective shadow traffic과 old-input exact replay에서 regression한 뒤 새 preregistration/experiment epoch를 시작한다. 사전에 선언한 paired bridge study 없이 서로 다른 epoch의 return을 한 primary estimator로 pool하지 않는다. Output-equivalent infrastructure/security patch라고 주장하려면 전체 frozen-input replay hash가 같은 equivalence report를 남기며, 달라진 case가 하나라도 있으면 새 epoch다. 24개월을 현실적으로 유지하려면 primary path의 가능한 많은 부분을 deterministic parser/policy로 만들고, 장기 보존 가능한 local checkpoint 또는 vendor support horizon을 provider scorecard에 포함한다.
+
 수집 문서는 trusted instruction이 아니라 untrusted data다. Prompt는 document node를 명시적 data delimiter 안에 넣고 그 안의 “ignore previous instructions”, URL 호출, secret 요청 등을 실행하지 않도록 고정한다. LLM task에는 network/file/shell tool을 연결하지 않으며, schema/quote/numeric validation이 통과하지 않으면 output을 폐기한다. Gold에 synthetic prompt-injection paragraph/table/alt-text fixture를 포함한다.
 
 ### 4.3 누락은 0이 아니다
@@ -319,13 +340,13 @@ FRED는 기술적 PIT 장점이 있는 ALFRED를 제공하지만, 현재 약관�
 | identity | 생성 기준 | 불변조건 |
 | --- | --- | --- |
 | `issuer_id` | CIK 중심 stable key | ticker 변경과 무관 |
-| `security_id` | issuer + share class + listing | 유효기간을 가지고 price/universe에 사용 |
+| `security_id` | append-only registry + authoritative native issue/share-class anchor | ticker/listing observation과 분리하고 explicit action resolution으로 연속성 판정 |
 | `resource_id` | provider native ID 또는 canonical request identity | 같은 logical resource의 revision에서 유지; semantic query/body는 포함하고 secret은 제외 |
 | `resource_version_id` | resource ID + content SHA-256 | bytes가 바뀌면 새 ID, in-place overwrite 금지 |
 | `canonical_document_id` | resource version + parser contract | parser 재처리는 lineage로 구분 |
 | `observation_key` | issuer + concept/period/scope/unit/dimensions | 같은 economic cell의 filing/revision을 연결 |
 | `observation_id` | observation key + accession/resource + value | 다른 report/version을 덮어쓰지 않음 |
-| `snapshot_id` | issuer/security + cutoff + input hashes + policy versions | 같은 입력의 replay는 동일 결과 |
+| `snapshot_id` | subject issuer 또는 security + cutoff + input hashes + policy versions | 같은 입력의 replay는 동일 결과; issuer artifact에 security를 억지로 포함하지 않음 |
 
 Event resolver가 나중에 두 event가 같음을 발견해도 기존 artifact를 지우지 않고 alias/merge relation을 추가한다. 모든 Gold result는 사용한 resource version, parser, source policy, concept policy, assumption approval hash를 run manifest에 고정한다.
 
@@ -333,7 +354,7 @@ Event resolver가 나중에 두 event가 같음을 발견해도 기존 artifact�
 
 `CanonicalHashPolicy`는 schema/version과 함께 다음을 고정한다. Decimal은 exponent와 negative zero를 정규화하되 경제적으로 의미 있는 unit은 별도 field로 hash하고, datetime은 원 offset을 보존한 record에서 UTC instant로 canonicalize한다. Identity용 Unicode string은 raw source text를 바꾸지 않은 채 canonical copy에 NFC와 명시적 line-ending policy를 적용하고, NFKC로 서로 다른 symbol을 임의 합치지 않는다. Enum은 value, set-like ID list는 dedup+sort, 문서/node 순서처럼 의미 있는 list는 원 순서를 사용한다. Absolute local path, temporary directory, retrieval worker 수는 economic artifact hash에서 제외하고 content/resource ID로 대체한다. URL은 credential/tracking/query-token을 제거하되 symbol, CIK, fiscal period, function, date처럼 response 의미를 바꾸는 allowlisted query는 canonical sort해 request identity에 포함한다. POST body도 secret field를 제외한 semantic body hash와 method를 포함한다. Canonical identity와 raw redacted request를 구분하며, 서로 다른 as-of query가 한 resource로 collapse되지 않게 한다. 기존 `default=str` 기반 hash는 v1 adapter로만 두고 v2 hash에 `hash_policy_version`을 포함한다.
 
-Fractional discount와 adaptive surface를 위해 `CalculationContext`(Decimal precision, rounding mode, day-count, fractional-power method, output quantization, solver tolerance)를 versioning한다. Default fractional factor는 binary float가 아니라 pinned high-precision Decimal에서 `exp(-t * ln(1 + WACC))`, day count는 `ACT/365F`로 계산한다. Intermediate value는 일찍 cents/bps로 round하지 않고, serialization/report boundary에서만 policy대로 quantize한다. Python/OS가 달라도 gold DCF hash가 같아야 한다.
+Fractional discount와 adaptive surface를 위해 stable `calculation_context_id`를 가진 `CalculationContext`(Decimal precision, rounding mode, day-count, fractional-power method, output quantization, solver tolerance)를 versioning한다. Default fractional factor는 binary float가 아니라 pinned high-precision Decimal에서 `exp(-t * ln(1 + WACC))`, day count는 `ACT/365F`로 계산한다. Intermediate value는 일찍 cents/bps로 round하지 않고, serialization/report boundary에서만 policy대로 quantize한다. Python/OS가 달라도 gold DCF hash가 같아야 한다.
 
 `code_version`도 Git SHA 한 줄이 아니다. `CodeExecutionIdentity`는 commit SHA, dirty flag, tracked+relevant untracked source-tree content hash, package/build hash, dependency lock hash, Python implementation/version, OS/architecture, timezone DB, optional native-library versions를 가진다. 같은 commit의 dirty worktree나 다른 lockfile은 다른 task/run signature다. Engineering replay는 dirty tree도 exact content hash가 있으면 허용할 수 있지만 economic holdout primary는 freeze된 clean build와 immutable environment manifest만 허용한다. Absolute workspace path와 worker count는 identity가 아니지만 계산 결과를 바꿀 native/Decimal/compression library version은 manifest에 남긴다.
 
@@ -400,6 +421,25 @@ supersedes_identity_observation_id?
 
 Issuer equity value를 한 share class 가격과 비교하려면 class별 경제적 권리와 share-equivalent 분모가 필요하다. Multiple-class issuer는 `economic_rights_group`과 conversion ratio가 검증된 경우에만 동일 per-share value를 비교하고, voting right만 다르더라도 price spread를 diagnostics로 남긴다. 권리/전환비율이 모호하거나 tracking-stock 구조이면 MVP에서 제외한다. Gold 5개는 single-class 또는 명확한 equal-economic-rights issuer를 고른다.
 
+`security_id`는 ticker 문자열 hash가 아니라 append-only identity registry가 발급하는 내부 ID다. Engineering pilot은 SEC cover page, exchange directory, issuer action notice를 묶은 수동/자동 resolution을 허용하고, economic holdout은 기간별 stable native issue ID와 action lineage를 제공하는 승인 security master를 요구한다.
+
+```text
+SecurityIdentityResolution
+  identity_resolution_id
+  candidate_observation_ids
+  resolution_type          SAME_SECURITY / NEW_SECURITY / SUCCESSOR_SECURITY /
+                           SHARE_CLASS_CONVERSION / AMBIGUOUS
+  retained_security_id?
+  new_or_successor_security_id?
+  effective_at
+  authoritative_action_refs
+  resolution_method        AUTO_EXACT_ACTION / MANUAL_BLINDED / PROVIDER_MASTER
+  policy_version
+  review_resolution_id?
+```
+
+Ticker/exchange 변경 전후 record는 explicit symbol-change/action lineage가 있을 때만 `SAME_SECURITY`로 묶고, 같은 ticker가 재사용돼도 issuer/share class/native issue anchor가 다르면 새 ID를 발급한다. CIK가 같다는 이유만으로 class A/B를 합치거나, ticker가 같다는 이유로 delisted predecessor의 price history를 새 listing에 연결하지 않는다. Candidate가 여러 개면 첫 row를 고르지 않고 `AMBIGUOUS`; 그 security와 영향을 받는 universe/run을 막는다. Registry ID 발급과 resolution은 원 observation을 수정하지 않으며 correction은 새 resolution/version으로 남긴다.
+
 Merger, spinoff, reincorporation으로 CIK/legal issuer가 바뀌면 동일 issuer ID로 과거를 억지로 이어 붙이지 않고 `IssuerLineageRelation`(`PREDECESSOR_OF`, `MERGED_INTO`, `SPUN_OFF_FROM`)을 만든다. Financial history와 return settlement의 연결은 각각 별도 승인 policy를 사용한다.
 
 ### 7.3 ResourceSnapshot
@@ -455,6 +495,9 @@ URL이 같아도 bytes가 바뀌면 새 `resource_version_id`를 만든다. 같�
 단일 `available_at + grade`보다 timestamp의 출처를 분리한다.
 
 ```text
+availability_evidence_id
+subject_type / subject_id
+resource_version_id?
 event_at?
 publisher_claimed_at?
 regulator_accepted_at?
@@ -466,6 +509,8 @@ availability_precision     EXACT / DAY / INFERRED
 pit_grade                  A / B / C / D
 backtest_eligible
 source_refs
+collection_clock_evidence_id?
+availability_policy_version
 ```
 
 기본 판정은 다음과 같다.
@@ -651,6 +696,7 @@ other_non_common_claims[]?    pension/convertible/material claim
 net_debt
 source_fact_ids
 corporate_action_refs
+security_rights_basis_id
 calculation_policy
 freshness_status
 snapshot_status          READY / STALE / REVIEW_REQUIRED / INELIGIBLE
@@ -693,6 +739,8 @@ record_status           ASSERTED / CORRECTED / CANCELLED
 Exact split ratio처럼 산술이 확정된 것만 base snapshot에 적용한다. Authorization size, “up to” buyback, announced deal value처럼 실제 closing balance를 뜻하지 않는 수치는 base cash/debt/share count에 적용하지 않는다. Materiality threshold는 assets/equity/share-count 대비로 price-blind하게 고정하고, current market cap을 보고 사후 조절하지 않는다.
 
 Future buyback accretion은 primary intrinsic DCF에 넣지 않는다. Cutoff 전에 실제 실행되어 shares/cash가 source-backed bridge로 확인된 거래만 snapshot에 반영하고, authorization·remaining capacity·management intent는 capital-allocation evidence일 뿐 미래 share 감소가 아니다. Buyback 가격을 current price로 가정해 per-share value를 올리는 것도 price leakage다. Declared dividend, debt repayment/issuance, equity issuance는 cutoff 전 effective/payment 상태와 exact amount가 확인된 경우에만 cash/claim bridge에 적용하며 announced와 settled를 구분한다.
+
+Declared-but-unpaid common distribution은 cash를 그대로 둔 채 무시하거나 cash outflow와 주주 receivable을 이중 차감하지 않는다. 별도 `SecurityRightsBasis`가 cutoff session의 `CUM_DISTRIBUTION / EX_DISTRIBUTION / UNKNOWN`, action version, ex/entitlement rule, payable/common-equity adjustment, entitled-holder receivable per share, source refs를 가진다. Capital snapshot의 ex-distribution common-equity bridge와 cutoff raw close가 cum-rights basis라면 comparison value에 같은 action의 receivable을 정확히 한 번 더하고, ex-rights면 더하지 않는다. 이 basis는 price drop이나 adjusted close에서 추정하지 않고 official/provider corporate-action record로 resolve한다. UNKNOWN이거나 raw-bar session basis와 맞지 않으면 `PriceIntersection`을 막는다.
 
 Acquisition/divestiture/spinoff처럼 operating perimeter도 바꾸는 event는 cash/debt/share bridge만 exact하다고 base를 부분 갱신하지 않는다. Pro-forma revenue/NOPAT/invested-capital와 consolidation effective date가 source-backed `OperatingPerimeterBridge`로 함께 resolve되거나, immaterial policy를 통과한 경우에만 새 operating snapshot을 만든다. `OperatingPerimeterBridge`는 bridge ID/version, issuer, predecessor/successor operating-snapshot ID, consolidation effective time, acquired/disposed scope, revenue·NOPAT·invested-capital adjustment과 각 source/derivation, reconciliation residual, status를 가진다. 그렇지 않으면 capital snapshot은 event를 표시하되 valuation은 `OPERATING_PERIMETER_UNRESOLVED`로 blocking review다. 인수대금만 debt에 더하고 피인수 사업 cash flow는 빠뜨리거나, divestiture proceeds만 cash에 더하고 매각 사업 이익을 base에 남기는 half-bridge를 금지한다. Capital/operating bridge 중 하나가 correction/cancellation되면 이를 참조한 두 successor snapshot을 모두 stale로 만들고 같은 cutoff closure에서 함께 재생성한다.
 
@@ -790,6 +838,7 @@ Capacity sizing은 signal cutoff까지 완료된 session만 사용한다.
 
 ```text
 LiquiditySnapshot
+  liquidity_snapshot_id
   security_id
   as_of
   lookback_sessions
@@ -853,7 +902,7 @@ value
 unit
 segment?
 gaap_reconciliation_refs
-available_at
+conservative_available_at
 source_refs
 ```
 
@@ -896,6 +945,7 @@ Industry/sector도 현재 vendor label을 과거에 소급하지 않고 versione
 
 ```text
 IndustryClassificationSnapshot
+  classification_snapshot_id
   issuer_id
   as_of
   source_code              SEC_SIC / NAICS / LICENSED_TAXONOMY
@@ -1025,6 +1075,7 @@ Portfolio construction도 versioned policy다.
 
 ```text
 PortfolioConstructionPolicy
+  portfolio_construction_policy_id
   long_only                 true
   slot_count
   target_weight_per_slot
@@ -1041,6 +1092,7 @@ Closing price와 실제 체결비용도 분리한다.
 
 ```text
 ExecutionCostPolicy
+  execution_cost_policy_id
   execution_reference       OFFICIAL_RAW_CLOSE
   commission_bps
   slippage_model            FIXED_BPS / PRECOMMIT_SPREAD_IMPACT / UNAVAILABLE
@@ -1089,6 +1141,7 @@ CorporateActionSettlement
 
 ```text
 PortfolioAccountingPolicy
+  portfolio_accounting_policy_id
   mode                    ACTION_LEDGER / TOTAL_RETURN_FACTOR
   dividend_recognition    EX_DATE_RECEIVABLE / PAYMENT_DATE_CASH
   split_fraction_policy
@@ -1105,6 +1158,7 @@ Mark-to-market과 tradability/settlement도 같은 값이 아니다.
 
 ```text
 PositionMark
+  position_mark_id
   security_id / session_date
   quantity / action_adjusted_basis
   mark_type              CURRENT_RAW_CLOSE / STALE_LAST_OBSERVABLE /
@@ -1155,6 +1209,7 @@ MVP backtest는 각 월의 마지막 정규 session close에 최신 PIT pack으�
 
 ```text
 RunClosurePolicy
+  run_closure_policy_id
   universe_snapshot_id
   required_stage_set
   order_commit_deadline
@@ -1565,6 +1620,7 @@ Aggregate mean 변화는 같은 analyst들의 수정이 아니라 coverage 구�
 MVP는 macro 전체 수집기가 아니라 versioned `WaccPolicy`를 만든다.
 
 ```text
+wacc_policy_id
 risk_free_rate
 risk_free_tenor
 risk_free_observed_at
@@ -1815,7 +1871,7 @@ Annual one-period ROIIC는 audit용으로 남기되 scenario range의 초기 권
 
 Historical ROIC는 가능한 경우 beginning/end invested capital 평균을 분모로 쓰고, DCF base invested capital은 cutoff에서 알려진 latest point-in-time balance를 쓴다. Normalized tax rate, excess cash, lease debt, restructuring/SBC adjustment는 policy와 source ref가 없으면 자동 추정하지 않는다. Reported view와 adjusted economic view를 모두 보존하고, 어느 view가 scenario input인지 approval artifact에 기록한다.
 
-조정은 field별 toggle을 임의 조합하지 않고 `EconomicViewPolicy` bundle로 고정한다.
+조정은 field별 toggle을 임의 조합하지 않고 stable `economic_view_policy_id`와 version을 가진 `EconomicViewPolicy` bundle로 고정한다.
 
 | policy cell | operating profit | invested capital / net debt | 기본 역할 |
 | --- | --- | --- | --- |
@@ -1832,6 +1888,7 @@ Earnings event의 `as_of` 종가는 최신 보고 분기말보다 수 주 늦다
 
 ```text
 ForecastCalendar
+  forecast_calendar_id
   valuation_at
   base_financial_period_id
   base_period_end
@@ -1896,6 +1953,7 @@ LLM은 숫자를 채우지 않는다. 설명 가능한 policy가 후보값을 �
 
 ```text
 DriverRangePolicy
+  driver_range_policy_id
   driver
   company_history_window / minimum_observations
   company_quantiles
@@ -1946,6 +2004,7 @@ SEC periodic/core evidence quota를 먼저 보장하고 IR/transcript는 별도 
 
 ```text
 CapRangePolicy
+  cap_range_policy_id
   reference_distribution_id
   reference_quantiles
   realized_persistence_measurement
@@ -1975,6 +2034,31 @@ Downside/central/upside는 각 driver의 low/median/high를 독립적으로 조�
 각 bundle에는 `scenario_role = CENTRAL_PROBABLE / PLAUSIBLE_BOUND / STRESS_ONLY`를 둔다. Central은 Possible PASS, reference/economic Plausible 범위, Probable이 최소 non-contradicted여야 한다. Down/up이 probable valuation range를 구성하려면 Possible PASS와 사전 정의한 plausible boundary를 만족해야 한다. Possible만 통과하고 reference/realized economics에서 outlier인 조합은 `STRESS_ONLY`로 이동하며 confidence-adjusted cheap/robust range의 low/high가 될 수 없다. Probable이 `WEAK/MIXED`이면 central 숫자를 움직이지 않지만 confidence/eligibility를 낮추고, `CONTRADICTED`이면 review/ineligible다. 어떤 role도 확률 weight를 뜻하지 않는다.
 
 V2 aggregate Possible은 `어느 check도 FAIL이 아니면 PASS`로 만들지 않는다. TAM/gross-margin ceiling처럼 route policy가 required로 지정한 check가 `UNKNOWN`이면 aggregate도 `UNKNOWN`이며 robust/primary evidence set에 들어가지 않는다. Optional check의 unknown만 무시할 수 있고 required/optional 목록은 `PossiblePolicy` version에 고정한다. Plausible도 `UNKNOWN`을 `IN_RANGE`처럼 취급하지 않는다. Engineering coverage report에서는 unknown을 별도 denominator로 보여 주고, source가 없는 숫자를 넓은 boundary로 보충하지 않는다.
+
+```text
+PossiblePolicy
+  possible_policy_id
+  model_route / version
+  checks[]:
+    check_id / check_type
+    required
+    input_driver_ids
+    constraint_or_policy_ref
+    missing_input_status       UNKNOWN
+    source_class_requirement
+  aggregate_rule              ANY_REQUIRED_FAIL=>FAIL /
+                              ANY_REQUIRED_UNKNOWN=>UNKNOWN / ELSE_PASS
+
+PlausibilityPolicy
+  plausibility_policy_id
+  model_route / version
+  reference_metric_rules
+  minimum_reference_n / fallback_order
+  outlier_thresholds
+  missing_reference_status    UNKNOWN
+```
+
+Check ID와 required flag는 issuer별로 바꾸지 않고 model route/version에 귀속한다. 한 check를 삭제·optional 전환하거나 reference fallback을 바꾸면 새 policy ID와 operating lattice hash가 필요하다. Stress diagnostic은 FAIL/UNKNOWN point도 보존할 수 있지만 aggregate status를 덮어쓰지 않는다.
 
 ### 10.4 ApprovedExpectationRequest의 v2 분해
 
@@ -2039,6 +2123,7 @@ Human approval은 source 없는 숫자 입력 창이 아니다. Proposed value�
 현재 scenario set의 단일 `evidence_confidence`를 임의 입력으로 두지 않고, driver별 data quality profile에서 compile한다.
 
 ```text
+evidence_confidence_profile_id
 driver
 pit_eligible_source_coverage
 provenance_completeness
@@ -2135,6 +2220,9 @@ Downside/central/upside가 같은 base facts를 공유하고 한 evidence를 여
 일반 비금융 MVP의 권장 기본값:
 
 ```text
+ScenarioVariationPolicy
+  scenario_variation_policy_id / version
+
 MUST_BE_IDENTICAL_ACROSS_SCENARIOS
   base_period
   base_revenue
@@ -2242,7 +2330,8 @@ normalized_joint_distance
 evidence_feasible_point_count
 market_evidence_intersection_count
 weighted_solution_overlap_volume
-three_p_status_by_solution
+numeric_possible_plausible_status_by_solution
+scenario_probable_result_refs
 solutions_requiring_above_evidence_by_driver
 solutions_below_evidence_by_driver
 minimum_concession_sets
@@ -2308,6 +2397,7 @@ PriceIntersection                # security-level, price-aware
   security_lattice_id
   raw_market_bar_version_id
   capital_structure_snapshot_id  # security lattice와 반드시 동일; 교체 불가
+  security_rights_basis_id        # capital snapshot/raw-bar session과 동일
   comparison_basis               PER_SHARE
   price_tolerance
   supplemental_refinement_point_ids
@@ -2315,7 +2405,7 @@ PriceIntersection                # security-level, price-aware
   nearest_diagnostic_point_ids
 ```
 
-Operating lattice는 approved issuer operating request만으로 enterprise value grid를 계산한다. Security lattice가 price-blind `CapitalStructureSnapshot`을 고정해 각 point의 non-common claims/non-operating assets/common equity/per-share value를 산출한다. `PriceIntersection.capital_structure_snapshot_id != SecurityValuationLattice.capital_structure_snapshot_id`이면 즉시 실패하며, price 단계에서 더 최신이거나 유리한 share/debt 값을 교체하지 않는다. Capital snapshot만 바뀌면 operating lattice는 재사용하고 security lattice부터 새로 만든다.
+Operating lattice는 approved issuer operating request만으로 enterprise value grid를 계산한다. Security lattice가 price-blind `CapitalStructureSnapshot`을 고정해 각 point의 non-common claims/non-operating assets/common equity/per-share value를 산출한다. `PriceIntersection.capital_structure_snapshot_id != SecurityValuationLattice.capital_structure_snapshot_id`이거나 rights basis가 capital snapshot/raw-bar session과 다르면 즉시 실패하며, price 단계에서 더 최신이거나 유리한 share/debt/distribution 값을 교체하지 않는다. Capital snapshot만 바뀌면 operating lattice는 재사용하고 security lattice부터 새로 만든다.
 
 Evidence corridor refinement까지가 operating-lattice identity다. Price band를 보고 선택한 supplemental point는 content-addressed `OperatingValuationPointCache`에서 같은 engine/context로 enterprise value를 계산하고 동일 bridge를 적용하되 `PriceIntersection`의 자식이며 어느 lattice에도 append하지 않는다. 따라서 price가 바뀌어도 operating/security lattice hash와 기존 modeled value는 변하지 않고 intersection/supplemental selection만 달라진다. Cache는 요청된 exact coordinate의 lookup/reuse만 허용하고 기존 cache directory를 enumerate해 lattice나 evidence set 후보를 만들지 않는다. 그렇지 않으면 과거에 어떤 가격을 분석했는지가 미래 price-blind point set을 바꾸기 때문이다. Supplemental point도 Possible/Plausible/constraint를 검사해 distance 정밀화에 쓸 수 있지만 scenario proposal, intrinsic range, evidence envelope를 다시 만들지 못한다. Operating cache key에는 engine, policy, base input, point coordinate, calculation context, security bridge cache key에는 operating point ID와 capital snapshot을 넣는다.
 
@@ -2325,6 +2415,7 @@ Surface 자체의 자유도도 contract로 고정한다.
 
 ```text
 ReverseSurfacePolicy
+  surface_policy_id
   driver_schema_id
   driver_bounds
   coarse_grid_values
@@ -2342,6 +2433,25 @@ ReverseSurfacePolicy
   no_solution_expansion_policy
   policy_version
 ```
+
+Surface별 10만 제한만으로는 fine-grid와 policy cells의 곱을 통제할 수 없으므로 run-level budget도 고정한다.
+
+```text
+ValuationBudgetPolicy
+  valuation_budget_policy_id
+  maximum_primary_lattice_valuations
+  maximum_grid_stability_valuations
+  maximum_policy_sensitivity_valuations
+  maximum_supplemental_valuations_per_intersection
+  maximum_total_valuations_per_issuer_cutoff
+  maximum_peak_memory_bytes
+  maximum_artifact_bytes
+  required_cell_priority
+  budget_exhaustion_status
+  policy_version
+```
+
+Engineering 시작값은 primary 100,000, grid-stability 추가 100,000, 사전 지정 policy cells 합계 500,000, 한 intersection supplemental 10,000, issuer-cutoff 전체 710,000 valuations로 둔다. 이 값은 성과가 아니라 5개 gold의 runtime/peak-memory와 required sensitivity coverage로 낮출 수 있으며 holdout 전에 freeze한다. Budget을 맞추려고 favorable cell만 먼저 계산하지 않고 `required_cell_priority`는 base → coarse/fine stability → paired downside policy stress → 나머지 diagnostic 순으로 고정한다. Screen에 필요한 cell 하나라도 미완료면 `ROBUST`가 아니라 `BUDGET_EXHAUSTED/INSUFFICIENT`; 선택되지 않은 종목이라는 이유로 중간에 계산을 멈추거나 현재 price proximity로 issuer 간 compute budget을 차등 배분하지 않는다. Cache hit도 logical valuation count와 physical compute count를 둘 다 보고해 capacity planning과 결과 의미를 구분한다.
 
 Driver schema는 reinvestment method와 함께 고정한다.
 
@@ -2432,7 +2542,7 @@ SelectorPolicy v2 research default
 
 이 숫자는 historical return에서 찾은 optimal cutoff가 아니라 해석 가능한 보수적 시작점이다. 비용/coverage pilot 전에 freeze하고 sensitivity report에서만 주변 threshold를 보여 준다. User risk budget이 다르면 ADR로 바꾸되 같은 holdout을 재튜닝에 사용하지 않는다.
 
-1. 3P possible fail, ambiguous fiscal period, PIT violation, unsupported route, open blocking review이면 `INELIGIBLE`이다. 이는 유효한 분석이지만 싸지 않은 `NOT_SELECTED`와 다르다.
+1. 3P possible fail/unknown, Plausible unknown, empty `E`, final expansion 뒤에도 empty `M(P)`, non-complete required surface cell, bounds/budget truncation, capital/rights-basis mismatch, ambiguous fiscal period, PIT violation, unsupported route, open blocking review이면 GAP screen은 `INELIGIBLE`이다. Intrinsic value만 계산됐더라도 price-implied expectation을 유효하게 비교하지 못한 상태를 싸지 않은 `NOT_SELECTED`로 숨기지 않는다. Coarse/fine 모두 계산됐지만 state가 바뀌는 경우만 아래 `GRID_UNSTABLE` watchlist 경로다.
 2. Eligible valuation의 상태는 다음 precedence로 하나만 정한다. Range width가 price의 100%를 초과하면 `WIDE`; 그렇지 않고 confidence-adjusted low gap이 0% 이상이며 central gap이 20% 이상이면 `CHEAP_ROBUST`; central gap만 20% 이상이면 `CHEAP_CENTRAL_ONLY`; confidence-adjusted high gap이 0% 미만이면 `EXPENSIVE`; 나머지는 `FAIR`다. 정확히 threshold와 같은 값은 통과(`>=`)하고 width만 `>`일 때 WIDE다.
 3. Material market component별로 evidence set과 교차하면 `INTERSECTS_EVIDENCE`, evidence-feasible set보다 value-increasing local gradient의 반대/같은 방향으로 일관된 concession을 요구하면 각각 `LESS_DEMANDING / MORE_DEMANDING`이다. 모든 component가 교차해야 aggregate `WITHIN_EVIDENCE`이고, intersects+less 또는 intersects+more만 있는 경우는 각각 less/more로 보수적으로 합친다. 양방향 regime이나 gradient sign 변화는 `NON_MONOTONIC`, 안정적으로 가까운 solution이 없으면 `DISCONNECTED`다.
 4. coarse/fine grid 또는 approved valuation-policy sensitivity에서 상태가 바뀌면 `GRID_UNSTABLE`/`POLICY_SENSITIVE`다.
@@ -2616,6 +2726,36 @@ data-lake/
          └─ expectation-gap-v2.json
 ```
 
+Backtest/economic holdout은 company run subtree에 summary만 끼워 넣지 않고 독립 ledger를 가진다.
+
+```text
+backtests/{experiment_id}/
+├─ economic-holdout-manifest.json
+├─ code-input-policy-identity.json
+├─ decision-months/{session_date}/
+│  ├─ universe-snapshot-ref.json
+│  ├─ run-closure.json
+│  ├─ selector-cohorts/
+│  │  ├─ expectation-gap-v2.json
+│  │  └─ no-expectation-direction.json
+│  ├─ pending-signals.jsonl
+│  ├─ execution-basis-bridges.jsonl
+│  ├─ execution-legs.jsonl
+│  ├─ corporate-action-entries.jsonl
+│  ├─ cash-and-receivable-entries.jsonl
+│  ├─ position-marks.jsonl
+│  └─ decision-closure.json
+├─ portfolio-ledger.jsonl
+├─ benchmark-ledger.jsonl
+├─ settlement-index.jsonl
+├─ backtest-closure-report.json
+├─ metrics.json
+├─ statistical-report.json
+└─ amendments/{amendment_id}.json
+```
+
+Ledger row는 `entry_id`, effective/observed/accounting time, debit/credit asset 또는 lot, quantity/currency/value, action/execution/source refs, policy version을 갖고 immutable하게 쌓인다. Portfolio NAV는 summary field를 신뢰하지 않고 ledger+marks에서 재계산할 수 있어야 한다. Decision month가 unresolved이면 이후 month가 그 미확정 proceeds/position을 0이나 cash로 가정해 이어가지 않고 dependent months도 unresolved로 전파한다. 나중 final settlement가 확인되면 기존 ledger/report를 수정하지 않고 새 settlement version을 참조하는 backtest version과 amendment를 만들어 최초 unresolved 결과도 보존한다. `metrics.json`은 closure report의 eligible horizon/denominator만 집계하고, statistical report는 manifest hash와 exact monthly paired-return series ID를 참조한다.
+
 Issuer operating assumptions/enterprise valuation과 security별 capital/share/price intersection을 디렉터리에서도 분리한다. MVP가 primary class 하나만 허용하더라도 이 경계를 두어 ticker alias나 향후 equal-economic-rights class가 issuer evidence를 복제하지 않게 한다.
 
 Bronze bucket은 “웹에서 공개적으로 보였다”가 아니라 승인된 `storage_class`로 결정한다. IR/API라도 immutable retention 권리가 없으면 retained에 넣지 않고 leased/ephemeral gate를 따른다. 위 provider 하위 경로는 권장 기본 배치이며 SourcePolicy가 최종 authority다.
@@ -2681,6 +2821,7 @@ src/moatrader/ingestion/treasury.py
 src/moatrader/ingestion/market.py
 src/moatrader/ingestion/corporate_actions.py
 src/moatrader/identity/models.py
+src/moatrader/identity/resolution.py
 src/moatrader/universe/snapshots.py
 src/moatrader/events/earnings.py
 src/moatrader/events/coverage.py
@@ -2689,14 +2830,17 @@ src/moatrader/financial/us_periods.py
 src/moatrader/financial/us_concepts.py
 src/moatrader/financial/economic_policy.py
 src/moatrader/financial/capital_structure.py
+src/moatrader/financial/perimeter.py
 src/moatrader/market/calendar.py
 src/moatrader/market/models.py
+src/moatrader/market/rights.py
 src/moatrader/review/models.py
 src/moatrader/runtime/identity.py
 src/moatrader/adapters/sec_package.py
 src/moatrader/expectations/guidance.py
 src/moatrader/expectations/input_pack.py
 src/moatrader/expectations/workbench.py
+src/moatrader/expectations/policies.py
 src/moatrader/expectations/constraints.py
 src/moatrader/expectations/surface_v2.py
 src/moatrader/expectations/change_bridge.py
@@ -2704,11 +2848,15 @@ src/moatrader/valuation/operating_request.py
 src/moatrader/valuation/common_equity.py
 src/moatrader/valuation/lattice.py
 src/moatrader/valuation/spatial.py
+src/moatrader/valuation/budget.py
 src/moatrader/runner/intrinsic.py
 src/moatrader/runner/market_gap.py
 src/moatrader/backtest/execution.py
 src/moatrader/backtest/accounting.py
 src/moatrader/backtest/settlements.py
+src/moatrader/backtest/ledger.py
+src/moatrader/backtest/closure.py
+src/moatrader/backtest/holdout.py
 ```
 
 ### 13.2 수정 모듈
@@ -2769,6 +2917,7 @@ Migration adapter는 `lossless / lossy / impossible` status와 warning을 내고
 - malicious PDF/HTML/audio가 parser worker의 network/shell/active content를 실행하지 못하고 CPU/memory/decompression timeout을 빈 성공 문서로 바꾸지 않음
 - API request fingerprint가 auth/tracking token은 제외하지만 symbol/as-of/function 같은 semantic query/body를 보존해 서로 다른 payload identity를 collapse하지 않음
 - canonical hash가 Decimal exponent/negative-zero, UTC-equivalent offsets, NFC Unicode와 CRLF/LF policy에서 재현되고 의미 있는 list order는 보존함
+- explicit symbol-change action은 같은 security ID를 유지하지만 ticker 재사용·다른 share class는 새 ID가 되고 ambiguous candidate가 첫-row join으로 해소되지 않음
 - CompanyFacts accession-acceptance join
 - same period의 later restatement가 earlier cutoff에 들어오지 않음
 - cutoff 전 Item 4.02 non-reliance가 affected facts를 base에서 무효화하고 later amendment가 공백 기간을 소급 수정하지 않음
@@ -2816,6 +2965,7 @@ Migration adapter는 `lossless / lossy / impossible` status와 warning을 내고
 - closing-auction/fill evidence가 없는 fixed-bps run은 `execution_fidelity=IDEALIZED_FIXED_BPS`이며 economic-research primary일 수는 있어도 implementability primary로 승격되지 않음
 - 완결된 action/settlement ledger와 execution fidelity를 한 enum으로 합치지 않고 `closure_status`, `execution_fidelity`, `study_eligibility`가 독립적으로 검증됨
 - 세 operating scenario의 per-share bridge와 security reverse lattice가 같은 CapitalStructureSnapshot을 사용
+- cum/ex-distribution SecurityRightsBasis가 raw-bar session과 capital bridge에서 일치하고 declared payable/cash/receivable을 정확히 한 번 반영하며, UNKNOWN basis는 PriceIntersection을 막음
 - operating DCF가 net-debt/share field를 받지 않고 common-equity bridge만 동일 snapshot으로 enterprise value를 per-share로 변환함
 - `PriceIntersection`이 security lattice와 다른 CapitalStructureSnapshot을 주입하거나 price 단계에서 share/debt bridge를 교체하면 거부됨
 - 허용되지 않은 base/WACC/stable-state scenario 차이가 compiler에서 거부됨
@@ -2876,7 +3026,9 @@ Migration adapter는 `lossless / lossy / impossible` status와 warning을 내고
 - commit 전 기존 보유 SELL/RESIZE 취소는 전체 rebalance를 abort하고, commit 후 partial/missing execution은 소급 취소하지 않고 primary performance를 unresolved 처리함
 - eligible candidate가 slot 수보다 적은 달에도 fixed-slot exposure를 유지하고 remaining names에 100% 재가중하지 않음
 - merger/spinoff/delisting 정산 근거가 없을 때 generic missing-return 또는 last-price 정산으로 primary 성과가 생성되지 않음
+- unresolved execution/settlement의 proceeds·position을 0/cash로 가정해 다음 decision month가 계속되지 않고 dependent closure가 명시적으로 전파됨
 - ACTION_LEDGER에서 dividend/split/merger가 total-return factor와 이중계상되지 않고, 두 accounting mode의 교차검증이 tolerance를 통과함
+- portfolio/benchmark NAV와 비용·receivable·settlement가 immutable double-entry-like ledger에서 재계산되어 summary/metric hash와 일치함
 - regular cash dividend가 기간별 exchange ex-entitlement rule에 따라 receivable과 payment-date cash로 한 번만 인식되고, record date 추정·due-bill 예외 누락·중간 가짜 drawdown·자동 재투자를 만들지 않음
 - cash return이 명시적 policy를 따르고 미래 Treasury yield를 과거 cash accrual에 사용하지 않음
 - calendar-day lag가 아니라 다음 session close의 raw execution price를 사용하고 보유수익 total-return series와 분리됨
@@ -2889,12 +3041,15 @@ Migration adapter는 `lossless / lossy / impossible` status와 warning을 내고
 - 여러 price-solution component가 반대 concession sign을 가질 때 가장 유리한 component만 골라 directional state를 만들지 않음
 - 한 material component만 evidence와 교차하고 다른 component가 more-demanding일 때 aggregate를 `WITHIN_EVIDENCE`로 승격하지 않음
 - adaptive refinement가 worker/order와 무관하게 동일 point set을 만들고 budget/bounds 소진을 `GRID_COMPLETE`로 오표시하지 않으며 grid-complete를 continuous proof로 보고하지 않음
+- base·stability·policy·supplemental valuations의 issuer-cutoff aggregate budget이 고정 순서로 적용되고 required cell 미완료/issuer별 favorable early-stop이 ROBUST screen을 만들지 않음
 - deterministic spatial nearest search가 small-lattice brute-force oracle과 exact distance/all-tie set이 같고 100k point에서 pairwise matrix를 만들지 않음
 - no-solution nearest points가 implied solution range/overall direction으로 승격되지 않음
+- empty E/M(P), required-cell budget/bounds truncation, rights-basis mismatch가 단순 NOT_SELECTED로 축약되지 않고 GAP screen INELIGIBLE reason을 보존함
 - SelectorPolicy threshold 경계값과 version/hash가 replay에서 동일하게 적용됨
 - 3축 composite가 hard ineligibility/fragility/data gate를 우회하지 않고 missing improving을 0점으로 치환하지 않음
 - percentile이 same-cutoff frozen cohort/tie policy로 재현되며 small/complete-case cohort를 전체 universe처럼 사용하지 않음
 - policy/schema/share-basis가 다른 intrinsic run 간 value change가 economic improving revision으로 승격되지 않음
+- primary `NO_EXPECTATION_DIRECTION` comparator가 v2와 동일 artifact/closure/cost/slot policy를 쓰고 expectation filter/rank step 외의 후보·순서를 바꾸지 않음
 - event change bridge의 price-only step이 old lattice를 재사용하고 비선형 순서 residual/order sensitivity를 숨기지 않음
 - source policy block이 network 요청 전에 작동
 - worker 수를 늘려도 SEC/IR host별 aggregate rate budget과 Retry-After가 지켜짐
@@ -2913,6 +3068,7 @@ Migration adapter는 `lossless / lossy / impossible` status와 warning을 내고
 - `RETROSPECTIVE_DEV` human resolution이 economic holdout signal에 들어가지 않음
 - LLM output의 source quote/node 밖 사실이 historical evidence로 승격되지 않음
 - 저장된 LLM replay는 network 없이 동일 parsed output을 만들고, prompt/model/schema 변경은 새 run signature와 gold regression을 요구함
+- prospective primary에서 exact analysis epoch의 model/code/schema/policy 변경이 서로 다른 monthly return series를 silent pool하지 않고 새 preregistration 경계를 만듦
 - LOCAL_ONLY/NONE source payload가 cloud LLM request body나 failure log로 유출되지 않음
 - 문서 본문/table/alt-text의 prompt injection이 tool 실행, node 밖 fact, market-lane leakage를 만들지 않음
 - NOT_PUBLISHED, DISCOVERY_MISS, FETCH_FAILED, POLICY_BLOCKED가 coverage에서 구분됨
@@ -3121,6 +3277,7 @@ EconomicHoldoutManifest
   resampling_seed / statistical_implementation_version
   multiple_test_family
   code/input-schema hashes
+  analysis_epoch_ids
   frozen_at
   outcome_unsealed_at?
   amendment_events
@@ -3156,12 +3313,13 @@ Manifest hash를 outcome data 접근 전에 고정하고 access log를 남긴다
 
 #### 15.3.1 첫 economic holdout의 권장 preregistration
 
-첫 holdout은 여러 주장을 동시에 primary로 만들지 않는다. 권장 단일 가설은 “동일 PIT universe·fixed-slot·cost policy에서 v2의 `CHEAP_ROBUST + LESS/WITHIN + ROBUST` gate가 단순 value/quality baseline보다 다음 월 실행 후 순수익을 개선한다”이다. 이때 baseline도 같은 slot 수, cash rule, sector/issuer cap, execution date, corporate-action accounting을 사용하고 신호만 사전 고정한 price-to-fundamental·quality 조합으로 바꾼다. V1, SEC-only/SEC+IR, IC, Q5-Q1, factor-neutral result는 secondary family다.
+첫 holdout은 여러 주장을 동시에 primary로 만들지 않는다. 권장 단일 가설은 “동일 PIT universe·fixed-slot·cost policy에서 v2의 `CHEAP_ROBUST + LESS/WITHIN + ROBUST` gate가 expectation direction만 제거한 동일-intrinsic baseline보다 다음 월 실행 후 순수익을 개선한다”이다. `BaselineSelectorPolicy=NO_EXPECTATION_DIRECTION`은 같은 v2 base facts, operating/security valuation, 3P/data hard gate, `CHEAP_ROBUST`, `ROBUST`, threshold와 lexicographic rank를 사용하되 `expectation_state in {LESS_DEMANDING, WITHIN_EVIDENCE}` 조건과 ranking의 expectation-priority step만 제거한다. 이후 downside gap → central gap → width → security ID 순서는 같다. 두 portfolio는 같은 slot 수, cash rule, issuer/sector cap, execution date, cost와 corporate-action accounting을 사용한다. 따라서 차이는 미국 재무 parser나 새 DCF engine 전체가 아니라 joint expectation-direction gate의 incremental effect에 더 가깝다. 현재 frozen `ValueMoatRanker` v1, 독립 value/quality factor baseline, SEC-only/SEC+IR, IC, Q5-Q1, factor-neutral result는 secondary family다.
 
 권장 첫 manifest 값은 다음과 같다. 숫자는 alpha 최적값이 아니라 검증을 시작하기 위한 보수적 연구 계약이며, provider coverage/power simulation을 outcome unseal 전에 수행한 뒤 한 번만 확정한다.
 
 ```text
 primary_observation          monthly paired net active return: v2 minus baseline
+primary_comparator          NO_EXPECTATION_DIRECTION on identical v2 artifacts
 primary_estimator            arithmetic mean monthly active return * 12
 minimum_effect_size          +0.02 annualized
 uncertainty                  two-sided 95% moving-block-bootstrap CI
@@ -3203,7 +3361,7 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 ### Phase 0 — contract freeze와 source policy, 1~2주
 
 - US-0.1 `SourcePolicy`, `ResourceSnapshot`, `AvailabilityEvidence` schema
-- US-0.2 issuer/security identity와 fiscal-period schema
+- US-0.2 issuer/security identity resolution, ticker-reuse/share-class fixtures와 fiscal-period schema
 - US-0.2b model applicability/route policy와 special-structure exclusions
 - US-0.3 5개 issuer/20 event gold manifest
 - US-0.4 source entitlement checklist
@@ -3219,7 +3377,7 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-1.5 earnings-event resolver와 dedup
 - 종료 조건: exhibit recall/kind F1 gate
 
-### Phase 2 — US financial PIT pack, 3~4주
+### Phase 2 — US financial PIT pack, 4~6주
 
 - US-2.1 CompanyFacts raw collector
 - US-2.2 accession/acceptance reconciliation
@@ -3231,10 +3389,11 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-2.7b EconomicFact/EconomicViewPolicy의 D&A·R&D·lease·tax paired-adjustment fixtures
 - US-2.8 capital structure/share-basis snapshot
 - US-2.8b 8-K capital-event resolver와 effective/announced bridge gate
+- US-2.8c SecurityRightsBasis와 declared-distribution cum/ex bridge
 - US-2.9 PIT reference-class manifest와 승인 range
 - 종료 조건: 5개 issuer의 base DCF facts가 source refs와 함께 재현
 
-### Phase 3 — assumption workbench, 2~3주
+### Phase 3 — assumption workbench, 3~4주
 
 - US-3.1 evidence/reference range pack
 - US-3.2 guidance/KPI observation과 revision resolver
@@ -3245,7 +3404,7 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-3.7 runner compile과 run-signature integration
 - 종료 조건: hand-copy 없이 v1 request를 compile하고 price leakage tests 통과
 
-### Phase 4 — US IR gap-fill, 2~3주
+### Phase 4 — US IR gap-fill, 2~4주
 
 - US-4.1 endpoint registry
 - US-4.2 static HTML adapter와 link classifier
@@ -3254,7 +3413,7 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-4.5 가치가 확인된 issuer adapter만 추가
 - 종료 조건: incremental-yield scale gate
 
-### Phase 5 — market data와 expectation lane, 2~3주
+### Phase 5 — market data와 expectation lane, 3~5주
 
 - US-5.1 security-keyed raw price/corporate action adapter
 - US-5.2 reverse-DCF raw price와 backtest total-return series 분리
@@ -3265,7 +3424,7 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-5.7 transcript source contract, 필요 시 1개 adapter
 - 종료 조건: shadow report, historical PIT 오승격 0건
 
-### Phase 6 — Economic DCF/Expectation GAP v2, 4~6주
+### Phase 6 — Economic DCF/Expectation GAP v2, 6~9주
 
 - US-6.1 issuer operating EV/common-equity bridge 분리와 near-term/structural/stable path engine
 - US-6.2 ReinvestmentPath와 decline/margin-change policy
@@ -3277,9 +3436,10 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-6.8 fine-grid/policy stability gate와 v1-v2 comparison
 - US-6.9 v2 screen-state와 lexicographic ranker
 - US-6.10 3축 score 실험을 v2 cohort/revision contract에 연결하고 primary rank 전까지 shadow gate
+- US-6.11 issuer-cutoff aggregate ValuationBudgetPolicy와 deterministic exhaustion gate
 - 종료 조건: gold/pilot stability threshold
 
-### Phase 7A — 30개 engineering pilot와 contract freeze, 3주 이상
+### Phase 7A — 30개 engineering pilot와 contract freeze, 4~6주 + prospective event 대기
 
 - US-7.1 preflight와 coverage run
 - US-7.2 source ablation
@@ -3287,19 +3447,19 @@ Engineering MVP의 critical path는 `P0 -> P2 -> P3 -> P6 -> P7A`, 경제적 검
 - US-7.4 150~300개 reference-fact-only pipeline을 current/prospective snapshot에서 검증; historical-primary라고 부르지 않음
 - US-7.5 gold/pilot 결과만으로 engineering MVP go/no-go review
 
-Phase 7A의 3주는 구현/labeling 최소치다. Direct-IR timing scale gate는 freeze 이후 30개 issuer에서 최소 한 prospective earnings event가 관측될 때까지 `PENDING_OBSERVATION`이며 별도 calendar wait가 붙는다.
+Phase 7A의 4~6주는 실행·triage·재검증 effort이며 prospective 관측 대기시간은 포함하지 않는다. Direct-IR timing scale gate는 freeze 이후 30개 issuer에서 최소 한 prospective earnings event가 관측될 때까지 `PENDING_OBSERVATION`이며 별도 calendar wait가 붙는다.
 
-### Phase 7B — economic-validation readiness와 unseen holdout, 추가 5~9 engineer-week + 관측 기간
+### Phase 7B — economic-validation readiness와 unseen holdout, 추가 8~14 engineer-week + 관측 기간
 
 - US-7B.1 licensed market/universe/security-master provider acceptance fixture와 entitlement 승인
 - US-7B.2 historical membership·identity·corporate-action/delisting settlement backfill과 cutoff별 PIT reference distribution 생성
 - US-7B.3 session-based execution, fixed-leg order lifecycle, cost/slippage/capacity policy
 - US-7B.4 execution-basis bridge, action-ledger dividend/cash/merger-spinoff settlement와 total-return cross-check
-- US-7B.5 prospective operational-ready/commit SLA rehearsal와 closure report
-- US-7B.6 EconomicHoldoutManifest preregistration, outcome lock/unseal 통제
+- US-7B.5 immutable portfolio ledger, prospective operational-ready/commit SLA rehearsal와 multi-axis closure report
+- US-7B.6 EconomicHoldoutManifest와 ExperimentModelEpoch preregistration, outcome lock/unseal 통제
 - US-7B.7 unseen multi-date holdout와 economic go/no-go review
 
-Phase 7B의 5~9주는 구축 추정이며 새 prospective outcome이 쌓이는 calendar wait는 포함하지 않는다. Historical lockbox가 빨리 끝나도 prospective-forward 검증을 완료한 것으로 보지 않는다.
+Phase 7B의 8~14주는 provider integration, identity/action acceptance, ledger/closure와 holdout harness 구축 추정이며 새 prospective outcome이 쌓이는 calendar wait는 포함하지 않는다. 권장 primary gate의 24 complete monthly decisions는 최소 약 24개월의 forward calendar를 요구한다. Historical lockbox가 빨리 끝나도 prospective-forward 검증을 완료한 것으로 보지 않는다.
 
 ### Phase 8 — 선택적 sector adapter, 별도 추정
 
@@ -3310,7 +3470,7 @@ Phase 7B의 5~9주는 구축 추정이며 새 prospective outcome이 쌓이는 c
 
 Phase 8은 core MVP 완료 조건이 아니며 선택 sector가 정해진 뒤 별도 산정한다.
 
-1인 기준 Phase 7A까지의 30개 engineering/research MVP는 약 20~28 engineer-week 범위로 본다. Phase 7B economic-validation readiness에는 licensed market/universe acceptance와 action-ledger backtest accounting을 위해 추가 5~9 engineer-week와 실제 unseen observation window가 필요하다. IR site별 예외, earnings-release provisional statements, operating/common-equity DCF split, market/universe data entitlement가 가장 큰 변동 요인이다. 2명이면 Phase 4와 5를 Phase 2 이후 병행할 수 있지만 gold labeling, policy freeze, prospective data 축적과 holdout 대기시간 때문에 calendar time이 단순 절반이 되지는 않는다.
+1인 기준 Phase 7A까지의 30개 engineering/research MVP는 약 26~39 engineer-week 범위로 본다. Phase 7B economic-validation readiness에는 licensed market/universe acceptance와 action-ledger backtest accounting을 위해 추가 8~14 engineer-week와 실제 unseen observation window가 필요하다. 이는 법률 검토·vendor procurement·24개월 forward outcome 대기를 제외한 effort range다. IR site별 예외, earnings-release provisional statements, identity/action history, operating/common-equity DCF split, surface runtime이 가장 큰 변동 요인이다. Phase 0의 5-company package/identity/provider spikes를 끝낸 뒤 work-breakdown 실제치로 한 번 reforecast하고, 단지 원 추정을 지키기 위해 scope를 silent 축소하지 않는다. 2명이면 Phase 4와 5를 Phase 2 이후 병행할 수 있지만 gold labeling, policy freeze, prospective data 축적과 holdout 대기시간 때문에 calendar time이 단순 절반이 되지는 않는다.
 
 ## 17. 비용과 vendor 의사결정
 
@@ -3381,6 +3541,7 @@ Quartr의 무료 mobile/display access는 사람이 coverage를 대조하는 QA�
 | diluted shares 오류 | per-share value 왜곡 | share basis artifact와 sensitivity |
 | crawler site drift | silent coverage loss | expected-event monitor와 status/degradation |
 | review queue가 coverage와 함께 폭증 | 승인 지연·임의 bypass | review 유형별 SLA/volume 측정, 자동화보다 ambiguity 감소 우선 |
+| 24개월 중 LLM model retire/upgrade | signal 정의 drift | exact ExperimentModelEpoch, deterministic core, 새 epoch/preregistration |
 | source coverage가 좋은 기업만 남음 | coverage-selection bias | eligible 전체와 complete-case 결과를 분리 보고 |
 | valuation policy 민감도를 alpha로 오인 | overfit | WACC/stable sensitivity를 scenario와 분리하고 holdout 전 freeze |
 | signal과 체결 사이 새 공시 무시 | stale-order bias | material-input invalidation과 PendingSignal audit |

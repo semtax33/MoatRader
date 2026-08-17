@@ -379,6 +379,16 @@ class ValuationDriverMapper:
     def _role(card: EvidenceCard) -> ValuationEvidenceRole:
         if card.direction == EvidenceDirection.MOAT_NEGATIVE or card.moat_role == AtomicMoatRole.COUNTER:
             return ValuationEvidenceRole.COUNTER
+        if (
+            card.direction == EvidenceDirection.MOAT_POSITIVE
+            and card.statement_type
+            not in {StatementType.MANAGEMENT_CLAIM, StatementType.FORECAST}
+            and card.reliability >= 0.50
+        ):
+            # Legacy evidence checkpoints may predate the explicit moat_role
+            # field. A source-grounded positive disclosed fact still supports
+            # its exclusively mapped valuation driver; claims/forecasts do not.
+            return ValuationEvidenceRole.SUPPORT
         if card.moat_role == AtomicMoatRole.NONE or card.statement_type in {
             StatementType.MANAGEMENT_CLAIM,
             StatementType.FORECAST,
@@ -391,12 +401,14 @@ class ValuationDriverMapper:
     @staticmethod
     def _persistence_years(card: EvidenceCard) -> int | None:
         match = _PERSISTENCE_RE.search(" ".join((card.fact, card.raw_quote or "")))
-        return int(match.group("years")) if match else None
+        years = int(match.group("years")) if match else None
+        return years if years is not None and years <= 200 else None
 
     @staticmethod
     def _persistence_years_text(text: str) -> int | None:
         match = _PERSISTENCE_RE.search(text)
-        return int(match.group("years")) if match else None
+        years = int(match.group("years")) if match else None
+        return years if years is not None and years <= 200 else None
 
     @staticmethod
     def _statement_type_from_source(text: str, source_type: SourceType) -> StatementType:

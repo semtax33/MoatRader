@@ -45,19 +45,22 @@ class FragilityComponents(ContractModel):
 
 
 class ExpectationThreeAxisScore(ContractModel):
+    """Legacy weighted composite retained for benchmark diagnostics only."""
+
     cheap: float = Field(ge=0, le=100)
     improving: float | None = Field(default=None, ge=0, le=100)
     non_fragile: float = Field(ge=0, le=100)
     composite: float | None = Field(default=None, ge=0, le=100)
     status: ExpectationScoreStatus
     rank_eligible: bool = False
+    diagnostic_only: bool = True
 
     @model_validator(mode="after")
     def consistent_status(self) -> "ExpectationThreeAxisScore":
-        if self.rank_eligible and self.composite is None:
-            raise ValueError("rank-eligible score requires a composite")
-        if self.rank_eligible and self.status != ExpectationScoreStatus.VALID:
-            raise ValueError("only VALID scores may be rank eligible")
+        if not self.diagnostic_only:
+            raise ValueError("weighted composite is permanently diagnostic-only")
+        if self.rank_eligible:
+            raise ValueError("weighted composite cannot be used as a production rank")
         return self
 
 
@@ -128,7 +131,6 @@ def build_three_axis_score(
         non_fragile=non_fragile,
         composite=composite,
         status=ExpectationScoreStatus.VALID,
-        rank_eligible=True,
     )
 
 

@@ -41,7 +41,8 @@ def test_fixed_three_axis_weights_and_geometric_composite() -> None:
     assert result.non_fragile == pytest.approx(80.0)
     assert result.composite == pytest.approx(weighted_geometric_score(66, 64, 80))
     assert result.status == ExpectationScoreStatus.VALID
-    assert result.rank_eligible
+    assert result.diagnostic_only
+    assert not result.rank_eligible
 
 
 def test_missing_revision_is_insufficient_evidence_not_a_zero() -> None:
