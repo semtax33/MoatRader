@@ -8,6 +8,8 @@
 - DART XML/HTML, SEC HTML/iXBRL, IR HTML/PDF를 source-neutral `CanonicalDocumentBundle`로 변환
 - section/paragraph/list/note/figure/table AST, rowspan/colspan, multi-header, 단위·기간·주석, inline XBRL `StructuredFact`, 원문 provenance
 - IR PDF text/table parser, 선택적 OCR, figure crop/vision 후보와 visual ablation audit
+- Hankyung 애널리스트 산업 보고서 수집, Synalyst 0.2.15 parser bridge, 산업 전용
+  atomic valuation-evidence unit/request와 issuer-MOAT lane 격리
 - timezone-aware 공개시각 filtering, scope-safe FY/YTD/TTM financial snapshot, 숫자 provenance와 hard-fail quality gate
 
 ### Frozen Evidence Sensor v1

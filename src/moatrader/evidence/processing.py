@@ -502,7 +502,12 @@ def atomic_extraction_to_judgment(
 
     text = chunk.markdown
     source_type = chunk.source_refs[0].source_type if chunk.source_refs else SourceType.OTHER
-    if source_type == SourceType.ANALYST:
+    if _FORWARD_LANGUAGE_RE.search(text) and source_type in {
+        SourceType.ANALYST,
+        SourceType.INDUSTRY,
+    }:
+        statement_type = StatementType.FORECAST
+    elif source_type == SourceType.ANALYST:
         statement_type = StatementType.ANALYST_INTERPRETATION
     elif source_type == SourceType.INDUSTRY:
         statement_type = StatementType.INDUSTRY_INTERPRETATION

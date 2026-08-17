@@ -401,7 +401,11 @@ class ValuationDriverMapper:
     @staticmethod
     def _statement_type_from_source(text: str, source_type: SourceType) -> StatementType:
         if re.search(r"전망|계획|예상|기대|목표|추정|will|expect|plan|target|forecast", text, re.I):
-            return StatementType.MANAGEMENT_CLAIM
+            return (
+                StatementType.MANAGEMENT_CLAIM
+                if source_type in {SourceType.DART, SourceType.SEC_EDGAR, SourceType.IR}
+                else StatementType.FORECAST
+            )
         if source_type == SourceType.ANALYST:
             return StatementType.ANALYST_INTERPRETATION
         if source_type == SourceType.INDUSTRY:

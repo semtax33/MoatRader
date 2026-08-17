@@ -28,9 +28,12 @@ from moatrader.ingestion import (
     KindCompanyIdentity,
     KindIrClient,
     KindIrCollector,
+    HankyungIndustryClient,
+    HankyungIndustryCollector,
     ResilientHttpClient,
     SecEdgarClient,
     SecEdgarCollector,
+    raw_document_from_synalyst_pdf,
     write_collected_universe_manifest,
 )
 from moatrader.llm import OpenAIResponsesTransport
@@ -111,7 +114,8 @@ def _ingest(args: argparse.Namespace) -> int:
         hints=metadata,
     )
     prepared = CanonicalFinancialDocumentPipeline(
-        ir_ocr_adapter=_ir_ocr_adapter(args)
+        ir_ocr_adapter=_ir_ocr_adapter(args),
+        synalyst_root=getattr(args, "synalyst_root", None),
     ).prepare_for_llm(
         raw,
         model_context_tokens=args.context_tokens,
@@ -127,6 +131,22 @@ def _ingest(args: argparse.Namespace) -> int:
     )
     (output / "evidence-requests.jsonl").write_text(
         "\n".join(request.model_dump_json(exclude_none=True) for request in prepared.evidence_requests) + "\n",
+        encoding="utf-8",
+    )
+    (output / "valuation-evidence-units.jsonl").write_text(
+        "\n".join(
+            unit.model_dump_json(exclude_none=True)
+            for unit in prepared.valuation_evidence_units
+        )
+        + ("\n" if prepared.valuation_evidence_units else ""),
+        encoding="utf-8",
+    )
+    (output / "valuation-evidence-requests.jsonl").write_text(
+        "\n".join(
+            request.model_dump_json(exclude_none=True)
+            for request in prepared.valuation_evidence_requests
+        )
+        + ("\n" if prepared.valuation_evidence_requests else ""),
         encoding="utf-8",
     )
     if prepared.selected_context:
@@ -169,12 +189,18 @@ def _collection_result_path(output: str | Path, source: str, started_at: datetim
     return Path(output).resolve() / "collections" / f"{stamp}-{source}.json"
 
 
-def _finish_collection(args: argparse.Namespace, result: object, source: str) -> int:
+def _finish_collection(
+    args: argparse.Namespace,
+    result: object,
+    source: str,
+    *,
+    write_company_manifest: bool = True,
+) -> int:
     from moatrader.ingestion import CollectionResult
 
     typed = CollectionResult.model_validate(result)
     manifest_path: Path | None = None
-    if typed.filings:
+    if typed.filings and write_company_manifest:
         manifest_path = Path(args.manifest).resolve() if args.manifest else Path(args.output).resolve() / "collected-universe.csv"
         write_collected_universe_manifest(BronzeFilingStore(args.output), manifest_path)
         typed = typed.model_copy(update={"manifest_path": str(manifest_path)})
@@ -315,6 +341,151 @@ def _collect_kind_ir(args: argparse.Namespace) -> int:
         max_materials_per_company=args.max_materials_per_company,
     )
     return _finish_collection(args, result, "kind-ir")
+
+
+def _collect_hankyung_industry(args: argparse.Namespace) -> int:
+    token = os.getenv(args.bearer_token_env, "").strip()
+    if not token:
+        raise ValueError(
+            f"Hankyung bearer token is missing; set {args.bearer_token_env}"
+        )
+    http = ResilientHttpClient(
+        user_agent="MoatRader Hankyung industry collector",
+        requests_per_second=args.requests_per_second,
+        timeout_seconds=args.timeout,
+        max_retries=args.retries,
+        default_max_bytes=int(args.max_download_mb * 1024 * 1024),
+    )
+    collector = HankyungIndustryCollector(
+        HankyungIndustryClient(http, token),
+        BronzeFilingStore(args.output),
+        max_pdf_bytes=int(args.max_download_mb * 1024 * 1024),
+    )
+    result = collector.collect(
+        begin_date=args.begin_date,
+        end_date=args.end_date,
+        industry_codes=set(args.industry_code or []),
+        maximum=args.max_reports,
+        refresh=args.refresh,
+    )
+    # Industry reports are reference-class inputs, not synthetic companies in
+    # the issuer universe manifest.
+    return _finish_collection(
+        args,
+        result,
+        "hankyung-industry",
+        write_company_manifest=False,
+    )
+
+
+def _write_prepared_document(prepared: object, output: Path) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    output.joinpath("bundle.json").write_text(prepared.bundle.to_json(), encoding="utf-8")
+    output.joinpath("document.md").write_text(
+        prepared.structured_markdown,
+        encoding="utf-8",
+    )
+    output.joinpath("chunks.jsonl").write_text(
+        "\n".join(chunk.model_dump_json(exclude_none=True) for chunk in prepared.chunks)
+        + ("\n" if prepared.chunks else ""),
+        encoding="utf-8",
+    )
+    output.joinpath("industry-evidence-units.jsonl").write_text(
+        "\n".join(
+            unit.model_dump_json(exclude_none=True)
+            for unit in prepared.valuation_evidence_units
+        )
+        + ("\n" if prepared.valuation_evidence_units else ""),
+        encoding="utf-8",
+    )
+    output.joinpath("valuation-evidence-requests.jsonl").write_text(
+        "\n".join(
+            request.model_dump_json(exclude_none=True)
+            for request in prepared.valuation_evidence_requests
+        )
+        + ("\n" if prepared.valuation_evidence_requests else ""),
+        encoding="utf-8",
+    )
+
+
+def _prepare_hankyung_industry(args: argparse.Namespace) -> int:
+    pdf_root = Path(args.pdf_root).expanduser().resolve()
+    if pdf_root.is_file():
+        paths = [pdf_root]
+    elif pdf_root.is_dir():
+        paths = sorted(pdf_root.rglob("*.pdf"))
+    else:
+        raise FileNotFoundError(f"industry PDF path not found: {pdf_root}")
+    if args.limit is not None:
+        paths = paths[: args.limit]
+    if not paths:
+        raise ValueError("no industry PDF files matched")
+    output = Path(args.output).expanduser().resolve()
+    pipeline = CanonicalFinancialDocumentPipeline(
+        synalyst_root=args.synalyst_root,
+    )
+    successes: list[dict[str, object]] = []
+    failures: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            raw = raw_document_from_synalyst_pdf(path, args.reports_json)
+            prepared = pipeline.prepare_for_llm(
+                raw,
+                model_context_tokens=args.context_tokens,
+                maximum_valuation_units=args.maximum_evidence_units,
+            )
+            document_output = output / prepared.bundle.metadata.source_document_id
+            _write_prepared_document(prepared, document_output)
+            successes.append(
+                {
+                    "source_document_id": prepared.bundle.metadata.source_document_id,
+                    "input": str(path),
+                    "output": str(document_output),
+                    "page_count": prepared.bundle.metadata.source_specific.get(
+                        "pdf_page_count"
+                    ),
+                    "chunk_count": len(prepared.chunks),
+                    "valuation_evidence_unit_count": len(
+                        prepared.valuation_evidence_units
+                    ),
+                    "valuation_request_count": len(
+                        prepared.valuation_evidence_requests
+                    ),
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "input": str(path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    manifest = {
+        "schema_version": "hankyung-industry-prepare/1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "synalyst_root": (
+            str(Path(args.synalyst_root).resolve())
+            if args.synalyst_root
+            else "auto-discovered"
+        ),
+        "reports_json": str(Path(args.reports_json).resolve()),
+        "input_count": len(paths),
+        "success_count": len(successes),
+        "failure_count": len(failures),
+        "successes": successes,
+        "failures": failures,
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"output={output}")
+    print(f"parsed={len(successes)}")
+    print(f"failed={len(failures)}")
+    for failure in failures:
+        print(f"{failure['input']}\tFAILED\t{failure['error']}", file=sys.stderr)
+    return 2 if failures else 0
 
 
 def _collect_manifest(args: argparse.Namespace) -> int:
@@ -733,6 +904,34 @@ def build_parser() -> argparse.ArgumentParser:
     collect_kind.add_argument("--refresh", action="store_true", help="redownload known IDs to detect revisions")
     collect_kind.set_defaults(handler=_collect_kind_ir)
 
+    collect_industry = collect_subparsers.add_parser(
+        "hankyung-industry",
+        help="discover and download PIT-safe analyst industry PDFs from Hankyung Consensus",
+    )
+    collect_industry.add_argument("--from", dest="begin_date", required=True, type=_calendar_date)
+    collect_industry.add_argument("--to", dest="end_date", required=True, type=_calendar_date)
+    collect_industry.add_argument(
+        "--industry-code",
+        action="append",
+        help="Hankyung industry code; repeatable (default: all industries)",
+    )
+    collect_industry.add_argument("--output", default="data-lake/bronze")
+    collect_industry.add_argument(
+        "--bearer-token-env",
+        default="HANKYUNG_BEARER_TOKEN",
+    )
+    collect_industry.add_argument("--requests-per-second", type=float, default=1.0)
+    collect_industry.add_argument("--timeout", type=float, default=90.0)
+    collect_industry.add_argument("--retries", type=int, default=4)
+    collect_industry.add_argument("--max-download-mb", type=float, default=256.0)
+    collect_industry.add_argument("--max-reports", type=int)
+    collect_industry.add_argument(
+        "--refresh",
+        action="store_true",
+        help="redownload known IDs to detect byte revisions",
+    )
+    collect_industry.set_defaults(handler=_collect_hankyung_industry)
+
     collect_manifest = collect_subparsers.add_parser(
         "manifest",
         help="rebuild a runner-compatible universe CSV from Bronze latest pointers",
@@ -741,10 +940,17 @@ def build_parser() -> argparse.ArgumentParser:
     collect_manifest.add_argument("--output", required=True)
     collect_manifest.set_defaults(handler=_collect_manifest)
 
-    ingest = subparsers.add_parser("ingest-html", help="convert DART/EDGAR/IR HTML or IR PDF to canonical artifacts")
+    ingest = subparsers.add_parser(
+        "ingest-html",
+        help="convert DART/EDGAR/IR or analyst-industry documents to canonical artifacts",
+    )
     ingest.add_argument("input")
     ingest.add_argument("--metadata", required=True, help="UTF-8 JSON metadata/hints")
-    ingest.add_argument("--source", required=True, choices=["dart", "sec_edgar", "ir"])
+    ingest.add_argument(
+        "--source",
+        required=True,
+        choices=["dart", "sec_edgar", "ir", "industry"],
+    )
     ingest.add_argument("--output", required=True)
     ingest.add_argument("--context-tokens", type=int)
     ingest.add_argument(
@@ -757,7 +963,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("MOATRADER_IR_OCR_DEVICE", "cpu"),
     )
     ingest.add_argument("--ir-ocr-cpu-threads", type=int, default=6)
+    ingest.add_argument(
+        "--synalyst-root",
+        default=os.getenv("MOATRADER_SYNALYST_ROOT"),
+        help="Synalyst checkout used by the industry PDF adapter",
+    )
     ingest.set_defaults(handler=_ingest)
+
+    industry = subparsers.add_parser(
+        "industry",
+        help="prepare analyst industry-report evidence without downloading PDFs",
+    )
+    industry_subparsers = industry.add_subparsers(
+        dest="industry_command",
+        required=True,
+    )
+    industry_prepare = industry_subparsers.add_parser(
+        "prepare",
+        help="parse existing Synalyst Hankyung PDFs and emit valuation evidence units",
+    )
+    industry_prepare.add_argument(
+        "--pdf-root",
+        required=True,
+        help="one existing PDF or a directory recursively containing PDFs",
+    )
+    industry_prepare.add_argument(
+        "--reports-json",
+        required=True,
+        help="matching Synalyst Hankyung reports.json",
+    )
+    industry_prepare.add_argument(
+        "--synalyst-root",
+        default=os.getenv("MOATRADER_SYNALYST_ROOT") or None,
+        help="Synalyst checkout containing synalyst.pdf_pipeline",
+    )
+    industry_prepare.add_argument("--output", required=True)
+    industry_prepare.add_argument("--limit", type=int)
+    industry_prepare.add_argument("--context-tokens", type=int)
+    industry_prepare.add_argument(
+        "--maximum-evidence-units",
+        type=int,
+        default=24,
+        help="maximum valuation evidence units per report (default: 24)",
+    )
+    industry_prepare.set_defaults(handler=_prepare_hankyung_industry)
     schema = subparsers.add_parser("schema", help="print CanonicalDocumentBundle JSON Schema")
     schema.set_defaults(handler=_schema)
 

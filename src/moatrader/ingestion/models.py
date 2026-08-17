@@ -99,6 +99,19 @@ class FilingDescriptor(ContractModel):
                     "language": "ko",
                 }
             )
+        elif self.source_type == SourceType.INDUSTRY:
+            metadata.update(
+                {
+                    "jurisdiction": "KR",
+                    "language": "ko",
+                    "economic_scope": "INDUSTRY",
+                    "industry_code": self.source_specific.get("industry_code"),
+                    "industry_name": self.source_specific.get("industry_name"),
+                    "publisher": self.source_specific.get("publisher"),
+                    "author": self.source_specific.get("author"),
+                    "source_system": "hankyung_consensus",
+                }
+            )
         return {key: value for key, value in metadata.items() if value is not None}
 
 

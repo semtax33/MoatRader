@@ -1,4 +1,4 @@
-# DART/SEC 공식 원문 수집기
+# DART/SEC/IR/산업 보고서 원문 수집기
 
 ## 선택한 원천
 
@@ -78,3 +78,7 @@ SEC 기본 form은 `10-K`, `10-Q`, `20-F`, `40-F`와 각각의 amendment입니�
 ## 운영상 남은 경계
 
 CLI collector는 재실행·revision·부분 실패 격리를 제공하지만 daemon scheduler, distributed queue, database transaction, alerting, API key vault는 아직 포함하지 않습니다. 상시 서비스에서는 CLI를 scheduler에서 호출하고 collection 결과의 `failures`와 latest pointer 무결성을 모니터링해야 합니다.
+
+한국경제 컨센서스의 애널리스트 산업 보고서 수집과 Synalyst 저장 PDF 재사용 절차는
+[`industry-reports.md`](industry-reports.md)를 따릅니다. 산업 보고서는 회사 universe
+manifest에 넣지 않고 reference-class evidence catalog로 분리합니다.

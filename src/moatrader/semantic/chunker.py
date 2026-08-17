@@ -100,7 +100,13 @@ class SemanticChunker:
             markdown = "\n\n".join(atom.markdown for atom in current)
             node_ids = list(dict.fromkeys(node_id for atom in current for node_id in atom.node_ids))
             refs = list({ref.model_dump_json(): ref for atom in current for ref in atom.source_refs}.values())
-            metadata: dict[str, Any] = {}
+            metadata: dict[str, Any] = {
+                "source_document_id": bundle.ast.document_id,
+                "source_type": bundle.metadata.source_type.value,
+                "available_at": bundle.metadata.available_at.isoformat(),
+            }
+            if bundle.metadata.published_at is not None:
+                metadata["published_at"] = bundle.metadata.published_at.isoformat()
             if len(current) == 1:
                 metadata.update(current[0].metadata)
             chunk_type = current[0].chunk_type if len({atom.chunk_type for atom in current}) == 1 else "mixed"

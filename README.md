@@ -19,7 +19,7 @@ MoatRader의 목표는 “해자가 높은 회사를 줄 세우는 것”이 아
 ## 핵심 아이디어
 
 ```text
-DART / SEC EDGAR / IR text·table·vision
+DART / SEC EDGAR / IR / analyst industry reports
           │
           ▼
 CanonicalDocumentBundle ── AST · StructuredFact · Asset · Provenance
@@ -73,6 +73,11 @@ Compact evidence pack은 audit용 claim·counterevidence 보존만 검사합니�
 ### 4. PIT와 provenance
 
 모든 문서는 timezone-aware `available_at`을 가지며 평가 시점 이후에 공개된 공시는 제외됩니다. 계산 숫자는 `StructuredFact`로 관리하고, 파생지표와 DCF 입력에는 사용한 공시·기간·재무제표 범위·가정 출처·input hash를 남깁니다.
+
+애널리스트 산업 보고서는 Synalyst의 provenance-first PDF parser를 재사용하고 회사 MOAT
+evidence와 분리된 reference-class valuation lane으로 처리합니다. 저장된 PDF를 다시
+다운로드하지 않고 검사하는 명령과 신규 수집 명령은
+[`docs/industry-reports.md`](docs/industry-reports.md)에 있습니다.
 
 한국 주식 TTM은 동일한 CFS/OFS 범위에서 `직전 FY + 당기 YTD - 전년 동기 YTD`로 구성합니다. 필요한 누적값이 없으면 서로 다른 범위나 3개월 값을 임의로 혼합하지 않고 해당 DCF를 제외합니다.
 

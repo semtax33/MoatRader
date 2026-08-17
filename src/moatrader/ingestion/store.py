@@ -38,6 +38,8 @@ def source_namespace(source_type: SourceType) -> str:
         return "sec-edgar"
     if source_type == SourceType.IR:
         return "kind-ir"
+    if source_type == SourceType.INDUSTRY:
+        return "hankyung-industry"
     raise ValueError(f"Bronze API collector does not support source type {source_type.value}")
 
 

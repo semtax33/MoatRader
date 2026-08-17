@@ -49,6 +49,15 @@ _VALUATION_TERMS_RE = re.compile(
     r"working\s*capital|reinvest|invested\s*capital|buyback|dividend|competition|substitut|risk",
     re.IGNORECASE,
 )
+_INDUSTRY_VALUATION_TERMS_RE = re.compile(
+    r"전망|추정|예상|예정|증가|감소|상승|하락|회복|둔화|개선|악화|"
+    r"수요|공급|업황|판매|가격|요금|보험료|손익|영업이익|순이익|비용|"
+    r"생산|수출|수입|재고|주문|계약|점유|투자|지원|회수|자금|통합|"
+    r"정책|제도|관세|환율|금리|원자재|활동|일정|시장|산업|"
+    r"outlook|estimate|demand|supply|cycle|inventory|order|contract|"
+    r"tariff|interest\s*rate|foreign\s*exchange|commodity",
+    re.IGNORECASE,
+)
 _ROLE_WEIGHT = {
     SectionRole.COMPETITION: 16,
     SectionRole.RISK: 15,
@@ -379,7 +388,10 @@ def select_valuation_evidence_units(
     }
 
     def relevance(unit: SemanticChunk) -> tuple[int, int]:
-        keyword_count = min(30, len(_VALUATION_TERMS_RE.findall(unit.markdown)))
+        keyword_count = len(_VALUATION_TERMS_RE.findall(unit.markdown))
+        if _source_type(unit) == SourceType.INDUSTRY:
+            keyword_count += len(_INDUSTRY_VALUATION_TERMS_RE.findall(unit.markdown))
+        keyword_count = min(30, keyword_count)
         return role_weight.get(unit.section_role or SectionRole.OTHER, 1) + keyword_count, keyword_count
 
     ranked = sorted(

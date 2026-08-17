@@ -413,12 +413,16 @@ def _numeric_coordinate_match_rate(
     return checked, (matched / checked if checked else None)
 
 
-def enrich_ir_table_semantics(
+def enrich_pdf_table_semantics(
     bundle: CanonicalDocumentBundle,
 ) -> CanonicalDocumentBundle:
     """Attach page-grounded period/unit context omitted by PDF table finders."""
 
-    if bundle.metadata.source_type != SourceType.IR:
+    if bundle.metadata.source_type not in {
+        SourceType.IR,
+        SourceType.ANALYST,
+        SourceType.INDUSTRY,
+    }:
         return bundle
     nodes = list(bundle.ast.walk())
     page_text: dict[int, list[str]] = {}
@@ -537,6 +541,11 @@ def enrich_ir_table_semantics(
             )
         }
     )
+
+
+# Backwards-compatible public name retained for callers that imported the IR-only
+# helper before analyst and industry PDFs shared the same canonical table lane.
+enrich_ir_table_semantics = enrich_pdf_table_semantics
 
 
 def _hint_source(source: RawDocument) -> str:
@@ -671,6 +680,15 @@ def _deduplicate_blocks(blocks: list[PdfTextBlock]) -> tuple[list[PdfTextBlock],
 class IrPdfAdapter(SourceAdapter[ParsedPdf]):
     source_type = SourceType.IR
     default_zone = _KST
+    document_type = DocumentType.IR_PRESENTATION
+    statement_type = StatementType.MANAGEMENT_CLAIM
+    source_label = "IR"
+    parser_version = PARSER_VERSION
+    text_transform = "pymupdf_page_layout_to_canonical_ast"
+    asset_transform = "pymupdf_image_region_extract"
+    asset_kind = AssetKind.IMAGE
+    always_emit_figure_nodes = False
+    table_text_suppression_threshold = 0.60
 
     def __init__(
         self,
@@ -724,11 +742,11 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
             else None
         )
         source_specific = dict(hints.get("source_specific", {}))
-        source_specific.setdefault("statement_type", StatementType.MANAGEMENT_CLAIM.value)
+        source_specific.setdefault("statement_type", self.statement_type.value)
         return DocumentMetadata(
-            source_type=SourceType.IR,
+            source_type=self.source_type,
             source_document_id=document_id,
-            document_type=DocumentType.IR_PRESENTATION,
+            document_type=self.document_type,
             issuer_id=hints.get("issuer_id") or hints.get("corp_code"),
             issuer_name=hints.get("issuer_name"),
             ticker=hints.get("ticker") or hints.get("stock_code"),
@@ -745,7 +763,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
             language=str(hints.get("language") or "ko"),
             jurisdiction=str(hints.get("jurisdiction") or "KR"),
             raw_sha256=raw_hash,
-            parser_version=PARSER_VERSION,
+            parser_version=self.parser_version,
             source_specific=source_specific,
         )
 
@@ -1187,7 +1205,9 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
         text_retention = min(1.0, ast_chars / raw_visible_chars) if raw_visible_chars else None
         numeric_retention = min(1.0, canonical_numeric / raw_numeric) if raw_numeric else None
         if text_retention is not None and text_retention < 0.90:
-            warnings.append("visible text retention is below the 90% IR PDF target")
+            warnings.append(
+                f"visible text retention is below the 90% {self.source_label} PDF target"
+            )
         if numeric_retention is not None and numeric_retention < 0.99:
             warnings.append("numeric cell retention is below the 99% IR PDF target")
 
@@ -1196,15 +1216,15 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
             records[node.node_id] = ProvenanceRecord(
                 object_id=node.node_id,
                 source_refs=node.source_refs,
-                transform="pymupdf_page_layout_to_canonical_ast",
-                transform_version=PARSER_VERSION,
+                transform=self.text_transform,
+                transform_version=self.parser_version,
             )
         for asset in assets:
             records[asset.asset_id] = ProvenanceRecord(
                 object_id=asset.asset_id,
                 source_refs=asset.source_refs,
-                transform="pymupdf_image_region_extract",
-                transform_version=PARSER_VERSION,
+                transform=self.asset_transform,
+                transform_version=self.parser_version,
             )
         values = [
             normalize_text(node.normalized_text).casefold()
@@ -1214,7 +1234,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
         duplicate_ratio = (
             (len(values) - len(set(values))) / len(values) if values else None
         )
-        return enrich_ir_table_semantics(CanonicalDocumentBundle(
+        return enrich_pdf_table_semantics(CanonicalDocumentBundle(
             metadata=metadata,
             ast=ast,
             facts=[],
@@ -1262,7 +1282,11 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
             table_boxes = [table.bbox for table in page.tables]
             entries: list[tuple[float, float, str, Any]] = []
             for block in page.blocks:
-                if any(_coverage_by(block.bbox, table_bbox) >= 0.60 for table_bbox in table_boxes):
+                if any(
+                    _coverage_by(block.bbox, table_bbox)
+                    >= self.table_text_suppression_threshold
+                    for table_bbox in table_boxes
+                ):
                     continue
                 entries.append((block.bbox[1], block.bbox[0], "text", block))
             for table in page.tables:
@@ -1287,7 +1311,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                     )
                 )
                 ref = SourceRef(
-                    source_type=SourceType.IR,
+                    source_type=self.source_type,
                     document_id=metadata.source_document_id,
                     uri=uri,
                     page=page.number,
@@ -1295,7 +1319,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                     source_hash=parsed.raw_sha256,
                 )
                 attributes = {
-                    "statement_type": StatementType.MANAGEMENT_CLAIM.value,
+                    "statement_type": self.statement_type.value,
                     "native_block_index": block.native_index,
                     "font_size": block.max_font_size,
                     "bold_ratio": block.bold_ratio,
@@ -1357,7 +1381,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
 
             for image in page.images:
                 ref = SourceRef(
-                    source_type=SourceType.IR,
+                    source_type=self.source_type,
                     document_id=metadata.source_document_id,
                     uri=uri,
                     page=page.number,
@@ -1374,14 +1398,14 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                 assets.append(
                     DocumentAsset(
                         asset_id=asset_id,
-                        kind=AssetKind.IMAGE,
+                        kind=self.asset_kind,
                         media_type="image/unknown",
                         uri=uri,
                         alt_text=f"PDF image region on page {page.number}",
                         source_refs=[ref],
                     )
                 )
-                if page.needs_ocr:
+                if page.needs_ocr or self.always_emit_figure_nodes:
                     append(
                         FigureNode(
                             node_id=stable_id("PF", asset_id),
@@ -1390,9 +1414,13 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                             normalized_text="",
                             source_refs=[ref],
                             attributes={
-                                "statement_type": StatementType.MANAGEMENT_CLAIM.value,
+                                "statement_type": self.statement_type.value,
                                 "ocr_status": (
-                                    "APPLIED" if page.ocr_applied else "REQUIRED_NOT_CONFIGURED"
+                                    "APPLIED"
+                                    if page.ocr_applied
+                                    else "REQUIRED_NOT_CONFIGURED"
+                                    if page.needs_ocr
+                                    else "NOT_REQUIRED"
                                 ),
                                 "ocr_engine": page.ocr_engine,
                                 "ocr_dpi": page.ocr_dpi,
@@ -1400,15 +1428,17 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                             },
                             asset_id=asset_id,
                             alt_text=(
-                                f"Image-dominant IR page {page.number}; OCR applied"
+                                f"Image-dominant {self.source_label} page {page.number}; OCR applied"
                                 if page.ocr_applied
-                                else f"Image-dominant IR page {page.number}; OCR required"
+                                else f"Image-dominant {self.source_label} page {page.number}; OCR required"
+                                if page.needs_ocr
+                                else f"{self.source_label} chart/figure region on page {page.number}"
                             ),
                         )
                     )
                     order += 1
             page_ref = SourceRef(
-                source_type=SourceType.IR,
+                source_type=self.source_type,
                 document_id=metadata.source_document_id,
                 uri=uri,
                 page=page.number,
@@ -1420,7 +1450,7 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                     order=order,
                     source_refs=[page_ref],
                     page_after=page.number,
-                    attributes={"statement_type": StatementType.MANAGEMENT_CLAIM.value},
+                    attributes={"statement_type": self.statement_type.value},
                 )
             )
             order += 1
@@ -1437,15 +1467,15 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
         assign_paths(root, [])
         return DocumentAST(document_id=metadata.source_document_id, children=root), assets
 
-    @staticmethod
     def _table_node(
+        self,
         table: PdfTable,
         metadata: DocumentMetadata,
         uri: str | None,
         order: int,
     ) -> TableNode:
         ref = SourceRef(
-            source_type=SourceType.IR,
+            source_type=self.source_type,
             document_id=metadata.source_document_id,
             uri=uri,
             page=table.page,
@@ -1519,10 +1549,10 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
             normalized_text=normalize_text(raw_text),
             source_refs=[ref],
             attributes={
-                "statement_type": StatementType.MANAGEMENT_CLAIM.value,
+                "statement_type": self.statement_type.value,
                 "table_extraction_strategy": table.strategy,
             },
-            caption=f"IR table — page {table.page}",
+            caption=f"{self.source_label} table — page {table.page}",
             period=(
                 ReportingPeriod(
                     kind=PeriodKind.UNKNOWN,
