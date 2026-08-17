@@ -1,0 +1,230 @@
+{
+  "schema_version": "ir-score-bearing-adjudication/1",
+  "audit_id": "ir-visual-score-bearing-recheck-v1",
+  "created_on": "2026-08-17",
+  "selection_uses_return_data": false,
+  "methodology": {
+    "scope": "The nine claims previously labeled score-bearing in ir-visual-coverage-gold-v1.",
+    "source_rule": "Each decision uses only the rendered source PDF page and the issuer identity shown on that page. Prior classifier outputs and forward returns are excluded.",
+    "classes": {
+      "A": "The page contains an issuer-linked observable anchor that is genuinely score-bearing under the structural MOAT ontology.",
+      "B": "The page contains MOAT-relevant context, but no observable score-bearing anchor.",
+      "C": "The page lacks enough information to make a MOAT classification. Ordinary performance movement belongs here unless it directly erodes an allowed MOAT anchor."
+    },
+    "observable_anchors": {
+      "MARKET_SHARE": "An issuer-specific numeric share, explicit leader/rank, or peer-relative share.",
+      "CUSTOMER_RETENTION": "Explicit renewal, repeat purchase/order by the same customer, retention/churn, contract renewal, or installed-base reuse/service dependence.",
+      "MARGIN_STABILITY": "Comparable margin or profitability persistence across at least three periods, or an explicit multi-period/consecutive profitability statement.",
+      "COST_ADVANTAGE": "A direct issuer-process comparison that links fewer steps, less time, lower cost, or higher yield to a named alternative.",
+      "COUNTER": "Observable deterioration or instability of an allowed MOAT anchor; ordinary revenue or profit decline alone is not enough."
+    }
+  },
+  "summary": {
+    "reviewed_claims": 9,
+    "A_true_score_bearing": 7,
+    "B_relevant_non_score_bearing": 1,
+    "C_insufficient_information": 1
+  },
+  "claims": [
+    {
+      "claim_id": "VC_038390_03_OPERATING_CHANGE",
+      "ticker": "038390",
+      "issuer_name": "Redcap Tour",
+      "page": 3,
+      "adjudication_class": "C",
+      "score_bearing_route": null,
+      "score_bearing_component": null,
+      "non_score_bearing_components": [
+        "One-year revenue and operating-profit changes by segment",
+        "Travel operating-loss narrowing"
+      ],
+      "observable_anchors": [],
+      "canonical_classifier_text": "Redcap Tour reports that 2021 Q3 revenue fell 7% and operating profit fell 33% year over year, while rental-car profit fell 40% and the travel operating loss narrowed 51%.",
+      "rationale": "The page reports ordinary two-point performance changes. It does not show a persistent margin series or connect the decline to erosion of a MOAT mechanism or outcome.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11483_1/versions/7733cf7df7edccb5596ffd2edaeb74b448cc8ab82e212cfd8db12212f7a97cb2/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/038390/page-3.jpg"
+    },
+    {
+      "claim_id": "VC_083930_09_SPUTTER_INSTALLED_BASE",
+      "ticker": "083930",
+      "issuer_name": "AVACO",
+      "page": 9,
+      "adjudication_class": "B",
+      "score_bearing_route": null,
+      "score_bearing_component": null,
+      "non_score_bearing_components": [
+        "Cumulative sputter orders increased from 2006 through 2023",
+        "Management describes a long trust relationship with a global display customer"
+      ],
+      "observable_anchors": [],
+      "canonical_classifier_text": "AVACO shows cumulative sputter orders rising about 74.9 times to KRW 674.6 billion and describes a long trust relationship with a global display customer.",
+      "rationale": "Cumulative orders and a customer-reference claim do not directly show renewal, repeat ordering by the same customer, retention, churn, or installed-base reuse.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_17296_1/versions/10bdedc0b5b1f33c69c585dcdc4c7474a497a9afd22c2e03c05bab5b9a0e65d2/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/083930/page-09.jpg"
+    },
+    {
+      "claim_id": "VC_084370_04_QUARTERLY_MARGIN_VOLATILITY",
+      "ticker": "084370",
+      "issuer_name": "Eugene Technology",
+      "page": 4,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "COUNTER",
+        "subtype": "MARGIN_STABILITY"
+      },
+      "score_bearing_component": "Eugene Technology's operating margin moved 24.7%, 12.1%, 30.5%, 11.8%, and 28.9% over five consecutive quarters.",
+      "non_score_bearing_components": [
+        "Revenue and absolute profit levels without the cross-period profitability relation"
+      ],
+      "observable_anchors": [
+        "Five comparable quarterly operating-margin observations",
+        "Large alternating quarter-to-quarter margin changes"
+      ],
+      "canonical_classifier_text": "Eugene Technology's operating margin was 24.7%, 12.1%, 30.5%, 11.8%, and 28.9% from 2020 Q3 through 2021 Q3, showing large five-quarter volatility.",
+      "rationale": "The page directly shows multi-period margin instability, which is counterevidence to MARGIN_STABILITY rather than an ordinary one-period earnings decline.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11578_1/versions/4b0bd239fd171045b78998222dc657646e1597c2c71866ad363bb61726039c05/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/084370/page-4.jpg"
+    },
+    {
+      "claim_id": "VC_195940_14_KCAB_SHARE",
+      "ticker": "195940",
+      "issuer_name": "HK inno.N",
+      "page": 14,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "OUTCOME",
+        "subtype": "MARKET_SHARE"
+      },
+      "score_bearing_component": "HK inno.N identifies K-CAB as the number-one product by market share in the peptic-ulcer drug market.",
+      "non_score_bearing_components": [
+        "Cumulative prescription value",
+        "Monthly prescription value",
+        "Clinic coverage"
+      ],
+      "observable_anchors": [
+        "Explicit issuer-product number-one market-share rank"
+      ],
+      "canonical_classifier_text": "HK inno.N states that its K-CAB product ranks number one by market share in the peptic-ulcer drug market; prescription and clinic-coverage figures are supporting context.",
+      "rationale": "The issuer-owned product and explicit category rank form a realized MARKET_SHARE outcome. Prescription growth alone would not.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11446_1/versions/0cf20db8c1576362cf4666484f6b1f8d4fe5ba871078cb1052df45af064cc988/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/195940/page-14.jpg"
+    },
+    {
+      "claim_id": "VC_195940_27_BRAND_DISTRIBUTION",
+      "ticker": "195940",
+      "issuer_name": "HK inno.N",
+      "page": 27,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "OUTCOME",
+        "subtype": "MARKET_SHARE"
+      },
+      "score_bearing_component": "HK inno.N states that Condition continues to hold the number-one market share in hangover-relief products.",
+      "non_score_bearing_components": [
+        "Convenience-store distribution rates",
+        "Hutgaesoo channel position"
+      ],
+      "observable_anchors": [
+        "Explicit issuer-product maintained number-one category share"
+      ],
+      "canonical_classifier_text": "HK inno.N states that its Condition product continues to rank number one by market share in the hangover-relief category; convenience-store distribution is supporting context.",
+      "rationale": "The maintained number-one share is a realized MARKET_SHARE outcome. Distribution coverage alone is not a score-bearing share anchor.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11446_1/versions/0cf20db8c1576362cf4666484f6b1f8d4fe5ba871078cb1052df45af064cc988/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/195940/page-27.jpg"
+    },
+    {
+      "claim_id": "VC_204620_06_TAX_REFUND_SHARE",
+      "ticker": "204620",
+      "issuer_name": "Global Tax Free",
+      "page": 6,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "OUTCOME",
+        "subtype": "MARKET_SHARE"
+      },
+      "score_bearing_component": "Global Tax Free is identified as the domestic number-one tax-refund operator with 70-75% market share.",
+      "non_score_bearing_components": [
+        "Tax-refund market-size history"
+      ],
+      "observable_anchors": [
+        "Issuer-specific 70-75% numeric market share",
+        "Explicit domestic number-one rank"
+      ],
+      "canonical_classifier_text": "Global Tax Free is identified as the domestic number-one tax-refund operator with a 70-75% market share.",
+      "rationale": "The page directly links the issuer to both a numeric share and an explicit leader rank.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_17282_1/versions/79407ae6a0b40fe963aa556b27aa387b70f4638f01597b3f6baecf0ecdcefa13/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/204620/page-06.jpg"
+    },
+    {
+      "claim_id": "VC_206650_09_UNICEF_SUPPLY",
+      "ticker": "206650",
+      "issuer_name": "EuBiologics",
+      "page": 9,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "OUTCOME",
+        "subtype": "MARKET_SHARE"
+      },
+      "score_bearing_component": "EuBiologics states that Euvichol supplies more than 90% of the UNICEF public market.",
+      "non_score_bearing_components": [
+        "Annual supply volume",
+        "Annual production capacity",
+        "UNICEF contract volume and value"
+      ],
+      "observable_anchors": [
+        "Issuer-product share above 90% in a named procurement market"
+      ],
+      "canonical_classifier_text": "EuBiologics states that its Euvichol oral-cholera vaccine supplies more than 90% of the UNICEF public market; capacity, supply volume, and contract value are supporting context.",
+      "rationale": "Only the explicit UNICEF public-market share is score-bearing. A large supply contract or capacity figure alone is not MARKET_SHARE.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11514_1/versions/ae5bdf2297ab245ea7997792ab6773b9fe65a258648b9813a5a1a070ec30ecab/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/206650/page-09.jpg"
+    },
+    {
+      "claim_id": "VC_206650_14_ECML_ADVANTAGE",
+      "ticker": "206650",
+      "issuer_name": "EuBiologics",
+      "page": 14,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "MECHANISM",
+        "subtype": "COST_ADVANTAGE"
+      },
+      "score_bearing_component": "EuBiologics directly produces EcML in E. coli, reducing production time and manufacturing cost versus GLA's 30-plus synthesis and purification steps.",
+      "non_score_bearing_components": [
+        "Platform-development status",
+        "Unrelated comparator product sales"
+      ],
+      "observable_anchors": [
+        "Named alternative process",
+        "Direct comparison on process steps, production time, and manufacturing cost"
+      ],
+      "canonical_classifier_text": "EuBiologics directly produces EcML in E. coli, reducing production time and manufacturing cost versus GLA, which requires more than 30 synthesis and purification steps and has high manufacturing cost.",
+      "rationale": "The page states a causal process-to-cost comparison against a named alternative, satisfying the COST_ADVANTAGE mechanism anchor.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_11514_1/versions/ae5bdf2297ab245ea7997792ab6773b9fe65a258648b9813a5a1a070ec30ecab/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/206650/page-14.jpg"
+    },
+    {
+      "claim_id": "VC_251120_19_LONG_RUN_PROFITABILITY",
+      "ticker": "251120",
+      "issuer_name": "BIO-FD&C",
+      "page": 19,
+      "adjudication_class": "A",
+      "score_bearing_route": {
+        "role": "OUTCOME",
+        "subtype": "MARGIN_STABILITY"
+      },
+      "score_bearing_component": "BIO-FD&C realized profits for eleven consecutive years.",
+      "non_score_bearing_components": [
+        "Revenue CAGR"
+      ],
+      "observable_anchors": [
+        "Eleven consecutive profitable years",
+        "Thirteen annual operating-margin observations"
+      ],
+      "canonical_classifier_text": "BIO-FD&C realized profits for eleven consecutive years from 2011 through 2023 and presents annual operating margins for the period; revenue CAGR is supporting context.",
+      "rationale": "The explicit long-run profitability persistence and annual margin series support MARGIN_STABILITY. Revenue growth alone does not.",
+      "source_pdf": "data-lake/experiments/source-ablation-20250831-longitudinal-v3/bronze/kind-ir/KINDIR_16099_1/versions/fe3c74c181daa0227801c4e174919a1c3b2e8a680ff3f88a3b9776b27cf28793/documents/document.pdf",
+      "rendered_page": "tmp/pdfs/ir-visual-audit-v1/251120/page-19.jpg"
+    }
+  ]
+}

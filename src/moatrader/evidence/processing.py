@@ -88,7 +88,8 @@ _DIRECT_COMPARISON_RE = re.compile(
 )
 _COUNTER_EROSION_RE = re.compile(
     r"불안정|변동|등락|악화|침식|훼손|축소|약화|"
-    r"volatil|instabil|unstable|deterior|erosion|erod|weaken|"
+    r"volatil|instabil|unstable|deterior|erosion|erod|weaken|alternat|"
+    r"direction\s+revers|reverses?\s+(?:its\s+)?direction|"
     r"declin(?:e|ed|ing).{0,30}(?:share|margin|retention|renewal)",
     re.IGNORECASE,
 )

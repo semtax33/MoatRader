@@ -290,6 +290,17 @@ def test_observable_anchors_preserve_true_share_margin_cost_and_retention_routes
         ),
         (
             _atomic_vote(
+                AtomicMoatRole.COUNTER,
+                EvidenceType.MARGIN_STABILITY,
+                EvidenceDirection.MOAT_NEGATIVE,
+            ),
+            (
+                "Operating margin alternates across five consecutive quarters: 24.7%, 12.1%, "
+                "30.5%, 11.8%, and 28.9%; direction reverses three times."
+            ),
+        ),
+        (
+            _atomic_vote(
                 AtomicMoatRole.MECHANISM,
                 EvidenceType.COST_ADVANTAGE,
                 EvidenceDirection.MOAT_POSITIVE,

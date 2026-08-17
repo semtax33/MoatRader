@@ -1,0 +1,163 @@
+{
+  "schema_version": "ir-visual-extractor-boss/1",
+  "audit_id": "ir-visual-extractor-boss-v1",
+  "methodology": {
+    "boss_fight": true,
+    "selection_uses_return_data": false,
+    "scope": "The seven manually adjudicated score-bearing A claims plus the one B and one C claim from ir-score-bearing-adjudication-v1.",
+    "target_rule": "For A claims the smallest score-bearing component is the authoritative extraction target. Supporting distribution, prescription, contract, capacity, growth, or one-period performance facts cannot substitute for it.",
+    "success_rule": "Vision must recover and correctly route all seven A components, reject both recovered B/C claims, preserve at least 90% split-vote repeatability, and keep score-route conflict below 10%."
+  },
+  "documents": [
+    {
+      "ticker": "038390",
+      "source_document_id": "KINDIR_11483_1",
+      "run_id": "v3-main-dart-plus-ir-01",
+      "meaningful_visual_pages": [3]
+    },
+    {
+      "ticker": "083930",
+      "source_document_id": "KINDIR_17296_1",
+      "run_id": "v3-main-dart-plus-ir-03",
+      "meaningful_visual_pages": [9]
+    },
+    {
+      "ticker": "084370",
+      "source_document_id": "KINDIR_11578_1",
+      "run_id": "v3-main-dart-plus-ir-01",
+      "meaningful_visual_pages": [4]
+    },
+    {
+      "ticker": "195940",
+      "source_document_id": "KINDIR_11446_1",
+      "run_id": "v3-main-dart-plus-ir-03",
+      "meaningful_visual_pages": [14, 27]
+    },
+    {
+      "ticker": "204620",
+      "source_document_id": "KINDIR_17282_1",
+      "run_id": "v3-main-dart-plus-ir-02",
+      "meaningful_visual_pages": [6]
+    },
+    {
+      "ticker": "206650",
+      "source_document_id": "KINDIR_11514_1",
+      "run_id": "v3-main-dart-plus-ir-03",
+      "meaningful_visual_pages": [9, 14]
+    },
+    {
+      "ticker": "251120",
+      "source_document_id": "KINDIR_16099_1",
+      "run_id": "v3-main-dart-plus-ir-01",
+      "meaningful_visual_pages": [19]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "BOSS_038390_03_OPERATING_CHANGE",
+      "ticker": "038390",
+      "page": 3,
+      "claim": "Redcap Tour reports that 2021 Q3 revenue fell 7% and operating profit fell 33% year over year, while rental-car profit fell 40% and the travel operating loss narrowed 51%.",
+      "gold_role": "NONE",
+      "gold_subtype": "OTHER",
+      "gold_rationale": "This is an ordinary two-point performance comparison without persistent margin behavior or explicit MOAT-anchor erosion.",
+      "adjudication_class": "C",
+      "requirements": ["axis_legend", "series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_083930_09_SPUTTER_ORDERS",
+      "ticker": "083930",
+      "page": 9,
+      "claim": "AVACO shows cumulative sputter orders rising about 74.9 times to KRW 674.6 billion and describes a long trust relationship with a global display customer.",
+      "gold_role": "NONE",
+      "gold_subtype": "OTHER",
+      "gold_rationale": "Cumulative orders and customer references do not directly establish renewal, repeat ordering by the same customer, retention, churn, or installed-base reuse.",
+      "adjudication_class": "B",
+      "requirements": ["axis_legend", "series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_084370_04_MARGIN_VOLATILITY",
+      "ticker": "084370",
+      "page": 4,
+      "claim": "Eugene Technology's operating margin was 24.7%, 12.1%, 30.5%, 11.8%, and 28.9% from 2020 Q3 through 2021 Q3, showing large five-quarter volatility.",
+      "score_bearing_component": "Eugene Technology's operating margin moved 24.7%, 12.1%, 30.5%, 11.8%, and 28.9% over five consecutive quarters.",
+      "gold_role": "COUNTER",
+      "gold_subtype": "MARGIN_STABILITY",
+      "gold_rationale": "The five comparable quarterly margin observations directly expose multi-period instability.",
+      "adjudication_class": "A",
+      "requirements": ["axis_legend", "series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_195940_14_KCAB_SHARE",
+      "ticker": "195940",
+      "page": 14,
+      "claim": "HK inno.N states that its K-CAB product ranks number one by market share in the peptic-ulcer drug market.",
+      "score_bearing_component": "HK inno.N identifies K-CAB as the number-one product by market share in the peptic-ulcer drug market.",
+      "gold_role": "OUTCOME",
+      "gold_subtype": "MARKET_SHARE",
+      "gold_rationale": "The issuer-owned product and explicit category rank are the minimum realized MARKET_SHARE component.",
+      "adjudication_class": "A",
+      "requirements": ["series_identity", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_195940_27_CONDITION_SHARE",
+      "ticker": "195940",
+      "page": 27,
+      "claim": "HK inno.N states that its Condition product continues to rank number one by market share in the hangover-relief category.",
+      "score_bearing_component": "HK inno.N states that Condition continues to hold the number-one market share in hangover-relief products.",
+      "gold_role": "OUTCOME",
+      "gold_subtype": "MARKET_SHARE",
+      "gold_rationale": "The maintained number-one category share is authoritative; convenience-store distribution is support only.",
+      "adjudication_class": "A",
+      "requirements": ["series_identity", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_204620_06_GTF_SHARE",
+      "ticker": "204620",
+      "page": 6,
+      "claim": "Global Tax Free is identified as the domestic number-one tax-refund operator with a 70-75% market share.",
+      "score_bearing_component": "Global Tax Free is identified as the domestic number-one tax-refund operator with 70-75% market share.",
+      "gold_role": "OUTCOME",
+      "gold_subtype": "MARKET_SHARE",
+      "gold_rationale": "The page directly links the issuer to a numeric share and leader rank.",
+      "adjudication_class": "A",
+      "requirements": ["series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_206650_09_UNICEF_SHARE",
+      "ticker": "206650",
+      "page": 9,
+      "claim": "EuBiologics states that its Euvichol oral-cholera vaccine supplies more than 90% of the UNICEF public market.",
+      "score_bearing_component": "EuBiologics states that Euvichol supplies more than 90% of the UNICEF public market.",
+      "gold_role": "OUTCOME",
+      "gold_subtype": "MARKET_SHARE",
+      "gold_rationale": "The explicit public-market share is authoritative; contract, capacity, and supply volume are support only.",
+      "adjudication_class": "A",
+      "requirements": ["series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_206650_14_ECML_COST",
+      "ticker": "206650",
+      "page": 14,
+      "claim": "EuBiologics directly produces EcML in E. coli, reducing production time and manufacturing cost versus GLA, which requires more than 30 synthesis and purification steps and has high manufacturing cost.",
+      "score_bearing_component": "EuBiologics directly produces EcML in E. coli, reducing production time and manufacturing cost versus GLA's 30-plus synthesis and purification steps.",
+      "gold_role": "MECHANISM",
+      "gold_subtype": "COST_ADVANTAGE",
+      "gold_rationale": "The direct issuer-process comparison links fewer steps and less time to lower manufacturing cost.",
+      "adjudication_class": "A",
+      "requirements": ["series_identity", "numeric_recovery", "trend_relation"]
+    },
+    {
+      "claim_id": "BOSS_251120_19_PROFITABILITY",
+      "ticker": "251120",
+      "page": 19,
+      "claim": "BIO-FD&C realized profits for eleven consecutive years from 2011 through 2023 and presents annual operating margins for the period.",
+      "score_bearing_component": "BIO-FD&C realized profits for eleven consecutive years.",
+      "gold_role": "OUTCOME",
+      "gold_subtype": "MARGIN_STABILITY",
+      "gold_rationale": "The consecutive profitability statement and multi-year margin observations are authoritative; revenue CAGR is support only.",
+      "adjudication_class": "A",
+      "requirements": ["axis_legend", "series_identity", "numeric_recovery", "trend_relation"]
+    }
+  ]
+}
