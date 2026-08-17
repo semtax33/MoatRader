@@ -12,6 +12,48 @@ from moatrader.canonical.models import (
 )
 
 
+_PACKED_NUMERIC_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])[-(]?\d[\d,]*(?:\.\d+)?%?\)?"
+)
+
+
+def _collapsed_pdf_grid_failures(bundle: CanonicalDocumentBundle) -> list[str]:
+    """Detect table-finder grids that preserved text but destroyed cell relations."""
+
+    if bundle.metadata.source_type != SourceType.IR:
+        return []
+    failures: list[str] = []
+    for node in bundle.ast.walk():
+        if not isinstance(node, TableNode):
+            continue
+        if not node.attributes.get("table_extraction_strategy"):
+            continue
+        width = max((len(row.cells) for row in node.rows), default=0)
+        if width < 4 or len(node.rows) < 3:
+            continue
+        header_rows = max(1, node.header_row_count)
+        header = node.rows[0].cells
+        if sum(bool(cell.normalized_text.strip()) for cell in header) < 3:
+            continue
+        for row in node.rows[header_rows:]:
+            nonempty = [cell for cell in row.cells if cell.normalized_text.strip()]
+            if len(nonempty) > 2:
+                continue
+            for cell in nonempty:
+                text = cell.raw_text
+                line_count = len([line for line in text.splitlines() if line.strip()])
+                numeric_count = len(_PACKED_NUMERIC_TOKEN_RE.findall(text))
+                if line_count >= 2 and numeric_count >= 2 * (width - 1):
+                    failures.append(
+                        f"IR table {node.node_id} has a collapsed multi-column grid: "
+                        f"{numeric_count} numeric tokens are packed into one multiline cell"
+                    )
+                    break
+            if failures and node.node_id in failures[-1]:
+                break
+    return failures
+
+
 class ParserQualityGateConfig(ContractModel):
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
@@ -35,6 +77,7 @@ def assess_parser_quality(
     quality = bundle.quality
     failures: list[str] = []
     warnings = list(quality.warnings)
+    failures.extend(_collapsed_pdf_grid_failures(bundle))
     if quality.text_retention is None:
         failures.append("visible text retention is unavailable")
     elif quality.text_retention < config.minimum_text_retention:

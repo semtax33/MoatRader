@@ -41,9 +41,10 @@ from moatrader.canonical.models import (
 )
 
 
-PARSER_VERSION = "pymupdf-ir/0.2.0"
+PARSER_VERSION = "pymupdf-ir/0.4.0"
 _KST = ZoneInfo("Asia/Seoul")
 _NUMBER = re.compile(r"^\(?[-+]?\d[\d,]*(?:\.\d+)?\)?%?$")
+_PACKED_NUMBER = re.compile(r"(?<![A-Za-z0-9])[-(]?\d[\d,]*(?:\.\d+)?%?\)?")
 _YEAR = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 _UNIT_CONTEXT = re.compile(
     r"(?:단위|unit)\s*[:：]?\s*[\(\[]?\s*"
@@ -108,6 +109,308 @@ class ParsedPdf:
     raw_sha256: str
     pages: list[PdfPage]
     metadata: dict[str, str]
+
+
+def _collapsed_grid(matrix: tuple[tuple[str, ...], ...]) -> bool:
+    width = len(matrix[0]) if matrix else 0
+    if width < 3 or len(matrix) < 2:
+        return False
+    for row in matrix[1:]:
+        nonempty = [value for value in row if value]
+        packed_counts = [len(_PACKED_NUMBER.findall(value)) for value in nonempty]
+        if sum(count >= 2 for count in packed_counts) >= 2 or any(
+            count >= 3 for count in packed_counts
+        ):
+            return True
+    return False
+
+
+def _numeric_word_groups(
+    words: list[Any],
+    *,
+    minimum_y: float,
+) -> list[list[Any]]:
+    numeric_words = [
+        word
+        for word in words
+        if (float(word[1]) + float(word[3])) / 2 >= minimum_y
+        and _NUMBER.fullmatch(normalize_text(_safe_text(word[4])))
+    ]
+    if not numeric_words:
+        return []
+    word_height = median(float(word[3]) - float(word[1]) for word in numeric_words)
+    tolerance = max(2.0, word_height * 0.40)
+    groups: list[list[Any]] = []
+    for word in sorted(
+        numeric_words,
+        key=lambda item: ((float(item[1]) + float(item[3])) / 2, float(item[0])),
+    ):
+        center = (float(word[1]) + float(word[3])) / 2
+        if groups:
+            prior_center = median(
+                (float(item[1]) + float(item[3])) / 2 for item in groups[-1]
+            )
+            if abs(center - prior_center) <= tolerance:
+                groups[-1].append(word)
+                continue
+        groups.append([word])
+    return groups
+
+
+def _matrix_from_axes(
+    words: list[Any],
+    columns: list[tuple[float, float]],
+    rows: list[tuple[float, float]],
+) -> tuple[
+    tuple[tuple[str, ...], ...],
+    tuple[tuple[tuple[float, float, float, float], ...], ...],
+]:
+    rebuilt: list[tuple[str, ...]] = []
+    cell_rows: list[tuple[tuple[float, float, float, float], ...]] = []
+    for y0, y1 in rows:
+        values: list[str] = []
+        boxes: list[tuple[float, float, float, float]] = []
+        for x0, x1 in columns:
+            tokens = [
+                word
+                for word in words
+                if x0 <= (float(word[0]) + float(word[2])) / 2 < x1
+                and y0 <= (float(word[1]) + float(word[3])) / 2 < y1
+            ]
+            tokens.sort(
+                key=lambda word: (
+                    int(word[5]) if len(word) > 5 else 0,
+                    int(word[6]) if len(word) > 6 else 0,
+                    int(word[7]) if len(word) > 7 else 0,
+                    float(word[1]),
+                    float(word[0]),
+                )
+            )
+            values.append(
+                normalize_text(" ".join(_safe_text(word[4]) for word in tokens))
+            )
+            boxes.append((x0, y0, x1, y1))
+        rebuilt.append(tuple(values))
+        cell_rows.append(tuple(boxes))
+    return tuple(rebuilt), tuple(cell_rows)
+
+
+def _repair_collapsed_grid(
+    page: Any,
+    table: Any,
+    matrix: tuple[tuple[str, ...], ...],
+) -> tuple[
+    tuple[tuple[str, ...], ...],
+    tuple[tuple[tuple[float, float, float, float] | None, ...], ...],
+] | None:
+    """Rebuild a collapsed ruled grid from native word centers and surviving axes."""
+
+    if not _collapsed_grid(matrix) or not table.rows:
+        return None
+    width = len(matrix[0])
+    header_cells = table.rows[0].cells
+    if len(header_cells) < width or any(cell is None for cell in header_cells[:width]):
+        return None
+    columns = [tuple(map(float, cell)) for cell in header_cells[:width]]
+    if any(columns[index][2] > columns[index + 1][0] + 1.0 for index in range(width - 1)):
+        return None
+
+    try:
+        words = list(page.get_text("words", clip=table.bbox, sort=True))
+    except TypeError:
+        words = list(page.get_text("words", sort=True))
+    header_y0 = min(column[1] for column in columns)
+    header_y1 = max(column[3] for column in columns)
+    groups = _numeric_word_groups(words, minimum_y=header_y1)
+    groups = [group for group in groups if len(group) >= max(2, width // 2)]
+    if len(groups) < 2:
+        return None
+    centers = [
+        median((float(word[1]) + float(word[3])) / 2 for word in group)
+        for group in groups
+    ]
+    table_bottom = float(table.bbox[3])
+    boundaries = [
+        header_y1,
+        *[
+            (centers[index] + centers[index + 1]) / 2
+            for index in range(len(centers) - 1)
+        ],
+        table_bottom,
+    ]
+    rows: list[tuple[float, float]] = [(header_y0, header_y1)]
+    rows.extend(
+        (boundaries[index], boundaries[index + 1])
+        for index in range(len(centers))
+    )
+    rebuilt_matrix, cell_rows = _matrix_from_axes(
+        words,
+        [(column[0], column[2]) for column in columns],
+        rows,
+    )
+    if _collapsed_grid(rebuilt_matrix):
+        return None
+    prior_nonempty = sum(bool(value) for row in matrix for value in row)
+    rebuilt_nonempty = sum(bool(value) for row in rebuilt_matrix for value in row)
+    if rebuilt_nonempty <= prior_nonempty:
+        return None
+    return rebuilt_matrix, cell_rows
+
+
+def _repair_collapsed_numeric_grid(
+    page: Any,
+    table: Any,
+    matrix: tuple[tuple[str, ...], ...],
+) -> tuple[
+    tuple[tuple[str, ...], ...],
+    tuple[tuple[tuple[float, float, float, float] | None, ...], ...],
+] | None:
+    """Infer lost numeric columns when even the ruled header axes collapsed."""
+
+    if not _collapsed_grid(matrix) or not table.rows:
+        return None
+    try:
+        words = list(page.get_text("words", clip=table.bbox, sort=True))
+    except TypeError:
+        words = list(page.get_text("words", sort=True))
+    if not words:
+        return None
+
+    header_cells = [cell for cell in table.rows[0].cells if cell is not None]
+    if not header_cells:
+        return None
+    header_y0 = min(float(cell[1]) for cell in header_cells)
+    header_y1 = max(float(cell[3]) for cell in header_cells)
+    row_groups = _numeric_word_groups(words, minimum_y=header_y1)
+    row_groups = [group for group in row_groups if len(group) >= 3]
+    if len(row_groups) < 2:
+        return None
+
+    numeric_words = [word for group in row_groups for word in group]
+    word_width = median(float(word[2]) - float(word[0]) for word in numeric_words)
+    x_tolerance = max(4.0, word_width * 0.75)
+    x_clusters: list[list[Any]] = []
+    # Financial tables normally right-align numeric values, so the right edge is
+    # substantially more stable than the word centre when digit counts differ.
+    for word in sorted(numeric_words, key=lambda item: float(item[2])):
+        anchor = float(word[2])
+        if x_clusters:
+            prior_anchor = median(float(item[2]) for item in x_clusters[-1])
+            if abs(anchor - prior_anchor) <= x_tolerance:
+                x_clusters[-1].append(word)
+                continue
+        x_clusters.append([word])
+
+    row_tolerance = max(
+        2.0,
+        median(float(word[3]) - float(word[1]) for word in numeric_words) * 0.40,
+    )
+
+    def row_count(cluster: list[Any]) -> int:
+        centers = sorted((float(word[1]) + float(word[3])) / 2 for word in cluster)
+        count = 0
+        prior: float | None = None
+        for center in centers:
+            if prior is None or abs(center - prior) > row_tolerance:
+                count += 1
+                prior = center
+        return count
+
+    minimum_occurrences = max(2, (len(row_groups) + 1) // 2)
+    x_clusters = [
+        cluster for cluster in x_clusters if row_count(cluster) >= minimum_occurrences
+    ]
+    if len(x_clusters) < 2:
+        return None
+    x_clusters.sort(key=lambda cluster: median(float(word[2]) for word in cluster))
+    anchors = [median(float(word[2]) for word in cluster) for cluster in x_clusters]
+    if any(right - left < max(8.0, word_width) for left, right in zip(anchors, anchors[1:])):
+        return None
+
+    first_numeric_x0 = min(float(word[0]) for word in x_clusters[0])
+    data_label_right = max(
+        (
+            float(word[2])
+            for word in words
+            if (float(word[1]) + float(word[3])) / 2 >= header_y1
+            and not _NUMBER.fullmatch(normalize_text(_safe_text(word[4])))
+            and float(word[2]) < first_numeric_x0
+        ),
+        default=float(table.bbox[0]),
+    )
+    first_boundary = (data_label_right + first_numeric_x0) / 2
+    if not float(table.bbox[0]) < first_boundary < anchors[0]:
+        return None
+    x_boundaries = [
+        first_boundary,
+        *[(anchors[index] + anchors[index + 1]) / 2 for index in range(len(anchors) - 1)],
+    ]
+    columns = [(float(table.bbox[0]), first_boundary)]
+    columns.extend(
+        (x_boundaries[index], x_boundaries[index + 1])
+        for index in range(len(x_boundaries) - 1)
+    )
+    columns.append((x_boundaries[-1], float(table.bbox[2]) + 0.01))
+
+    y_centers = [
+        median((float(word[1]) + float(word[3])) / 2 for word in group)
+        for group in row_groups
+    ]
+    y_boundaries = [
+        header_y1,
+        *[(y_centers[index] + y_centers[index + 1]) / 2 for index in range(len(y_centers) - 1)],
+        float(table.bbox[3]) + 0.01,
+    ]
+    rows: list[tuple[float, float]] = [(header_y0, header_y1)]
+    rows.extend(
+        (y_boundaries[index], y_boundaries[index + 1])
+        for index in range(len(y_centers))
+    )
+    rebuilt_matrix, cell_rows = _matrix_from_axes(words, columns, rows)
+    if _collapsed_grid(rebuilt_matrix):
+        return None
+    if any(
+        sum(_numeric_value(value) is not None for value in row) < len(x_clusters) // 2
+        for row in rebuilt_matrix[1:]
+    ):
+        return None
+    return rebuilt_matrix, cell_rows
+
+
+def _numeric_coordinate_match_rate(
+    page: Any,
+    matrix: tuple[tuple[str, ...], ...],
+    cell_rows: tuple[
+        tuple[tuple[float, float, float, float] | None, ...], ...
+    ],
+) -> tuple[int, float | None]:
+    """Verify that numeric cell text exists as one native word inside its bbox."""
+
+    checked = 0
+    matched = 0
+    for row_index, row in enumerate(matrix):
+        for column, value in enumerate(row):
+            if _numeric_value(value) is None:
+                continue
+            bbox = (
+                cell_rows[row_index][column]
+                if row_index < len(cell_rows) and column < len(cell_rows[row_index])
+                else None
+            )
+            if bbox is None:
+                continue
+            checked += 1
+            try:
+                words = page.get_text("words", clip=bbox, sort=True)
+            except TypeError:
+                words = page.get_text("words", sort=True)
+            target = normalize_text(value).replace("−", "-")
+            if any(
+                normalize_text(_safe_text(word[4])).replace("−", "-") == target
+                for word in words
+            ):
+                matched += 1
+    return checked, (matched / checked if checked else None)
 
 
 def enrich_ir_table_semantics(
@@ -276,6 +579,20 @@ def _bbox(value: tuple[float, float, float, float]) -> BoundingBox:
     return BoundingBox(x0=value[0], y0=value[1], x1=value[2], y1=value[3])
 
 
+def _page_bbox(
+    page: Any,
+    value: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    """Map table-finder coordinates into the visible page coordinate system."""
+
+    if not getattr(page, "rotation", 0):
+        return value
+    import fitz
+
+    rect = fitz.Rect(value) * page.derotation_matrix
+    return tuple(map(float, rect))
+
+
 def _area(value: tuple[float, float, float, float]) -> float:
     return max(0.0, value[2] - value[0]) * max(0.0, value[3] - value[1])
 
@@ -302,7 +619,7 @@ def _overlap(
 
 
 def _numeric_value(value: str) -> Decimal | None:
-    token = re.sub(r"\s+", "", value)
+    token = value.strip().replace("−", "-")
     if not token or not _NUMBER.fullmatch(token):
         return None
     negative = token.startswith("(") and token.endswith(")")
@@ -572,7 +889,9 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
     def _extract_tables(page: Any, snapshot: PdfPage) -> None:
         candidates: list[PdfTable] = []
         for strategy in ("lines", "text"):
-            if strategy == "text" and any(table.strategy == "lines" for table in candidates):
+            if strategy == "text" and any(
+                table.strategy.startswith("lines") for table in candidates
+            ):
                 break
             try:
                 kwargs: dict[str, Any] = {"strategy": strategy}
@@ -585,10 +904,31 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                         for row in table.extract()
                     ]
                     width = max((len(row) for row in raw_matrix), default=0)
-                    if len(raw_matrix) < 2 or not 2 <= width <= 24:
+                    if len(raw_matrix) < 2 or not 2 <= width <= 40:
                         continue
                     matrix = tuple(tuple([*row, *([""] * (width - len(row)))]) for row in raw_matrix)
-                    bbox = tuple(map(float, table.bbox))
+                    raw_bbox = tuple(map(float, table.bbox))
+                    bbox = _page_bbox(page, raw_bbox)
+                    repaired = (
+                        _repair_collapsed_grid(page, table, matrix)
+                        if strategy == "lines"
+                        else None
+                    )
+                    if repaired is None and strategy == "lines":
+                        repaired = _repair_collapsed_numeric_grid(page, table, matrix)
+                    if repaired is not None:
+                        matrix, repaired_cell_rows = repaired
+                        snapshot.warnings.append(
+                            "TABLE_GRID_REPAIRED: rebuilt collapsed ruled table "
+                            "from native word coordinates"
+                        )
+                    else:
+                        repaired_cell_rows = None
+                    if _collapsed_grid(matrix):
+                        snapshot.warnings.append(
+                            "TABLE_CANDIDATE_REJECTED_COLLAPSED_GRID: native text retained"
+                        )
+                        continue
                     nonempty = [value for row in matrix for value in row if value]
                     numeric_ratio = (
                         sum(_numeric_value(value) is not None for value in nonempty) / len(nonempty)
@@ -603,18 +943,57 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
                         # Sparse text clusters around diagrams and agenda braces are not
                         # tables. Their native blocks remain available as paragraphs.
                         continue
-                    cell_rows: list[tuple[tuple[float, float, float, float] | None, ...]] = []
-                    for row_index in range(len(matrix)):
-                        raw_cells = table.rows[row_index].cells if row_index < len(table.rows) else []
-                        converted = [
-                            tuple(map(float, raw_cells[column])) if column < len(raw_cells) and raw_cells[column] is not None else None
-                            for column in range(width)
-                        ]
-                        cell_rows.append(tuple(converted))
+                    cell_rows: list[
+                        tuple[tuple[float, float, float, float] | None, ...]
+                    ] = []
+                    if repaired_cell_rows is not None:
+                        cell_rows.extend(
+                            tuple(
+                                _page_bbox(page, cell) if cell is not None else None
+                                for cell in row
+                            )
+                            for row in repaired_cell_rows
+                        )
+                    else:
+                        for row_index in range(len(matrix)):
+                            raw_cells = (
+                                table.rows[row_index].cells
+                                if row_index < len(table.rows)
+                                else []
+                            )
+                            converted = [
+                                _page_bbox(
+                                    page,
+                                    tuple(map(float, raw_cells[column])),
+                                )
+                                if column < len(raw_cells)
+                                and raw_cells[column] is not None
+                                else None
+                                for column in range(width)
+                            ]
+                            cell_rows.append(tuple(converted))
+                    checked, coordinate_match_rate = _numeric_coordinate_match_rate(
+                        page,
+                        matrix,
+                        tuple(cell_rows),
+                    )
+                    if checked >= 8 and (
+                        coordinate_match_rate is None or coordinate_match_rate < 0.90
+                    ):
+                        snapshot.warnings.append(
+                            "TABLE_CANDIDATE_REJECTED_NUMERIC_COORDINATE_MISMATCH: "
+                            f"{coordinate_match_rate:.3f} across {checked} numeric cells; "
+                            "native text retained"
+                        )
+                        continue
                     candidates.append(
                         PdfTable(
                             page=snapshot.number,
-                            strategy=strategy,
+                            strategy=(
+                                f"{strategy}-coordinate-repair"
+                                if repaired is not None
+                                else strategy
+                            ),
                             bbox=bbox,  # type: ignore[arg-type]
                             matrix=matrix,
                             cell_bboxes=tuple(cell_rows),
@@ -626,7 +1005,11 @@ class IrPdfAdapter(SourceAdapter[ParsedPdf]):
         selected: list[PdfTable] = []
         for candidate in sorted(
             candidates,
-            key=lambda item: (0 if item.strategy == "lines" else 1, item.bbox[1], item.bbox[0]),
+            key=lambda item: (
+                0 if item.strategy.startswith("lines") else 1,
+                item.bbox[1],
+                item.bbox[0],
+            ),
         ):
             if any(_overlap(candidate.bbox, prior.bbox) >= 0.60 for prior in selected):
                 continue

@@ -19,9 +19,14 @@ from moatrader.evidence.models import (
     IrDeltaAction,
     IrIncrementalAssessment,
     IrMechanismDelta,
+    IrOutcomeDelta,
     MoatAuditStatus,
 )
-from moatrader.evidence.atomic import select_context_cited_atomic_units
+from moatrader.evidence.atomic import (
+    build_atomic_evidence_units,
+    select_atomic_evidence_units,
+    select_context_cited_atomic_units,
+)
 from moatrader.evidence.validation import (
     apply_ir_incremental_assessment,
     build_candidate_manifest,
@@ -44,10 +49,12 @@ def _chunk(
     *,
     role: SectionRole = SectionRole.BUSINESS,
     generated: bool = False,
+    document_id: str = "D1",
+    available_at: str | None = None,
 ) -> SemanticChunk:
     return SemanticChunk(
         chunk_id=chunk_id,
-        document_id="D1",
+        document_id=document_id,
         section_path=[role.value],
         section_role=role,
         node_ids=[f"N-{chunk_id}"],
@@ -57,12 +64,15 @@ def _chunk(
         source_refs=[
             SourceRef(
                 source_type=(SourceType.GENERATED_SUMMARY if generated else SourceType.DART),
-                document_id="D1",
+                document_id=document_id,
                 uri="https://example.test/source",
                 source_hash="0" * 64,
             )
         ],
-        metadata={"generated_summary": generated},
+        metadata={
+            "generated_summary": generated,
+            **({"available_at": available_at} if available_at else {}),
+        },
     )
 
 
@@ -162,6 +172,61 @@ def test_ir_incremental_merge_keeps_base_frozen_and_requires_known_ir_refs() -> 
     assert any(action["action"] == "DROP_UNKNOWN_IR_REFS" for action in report["actions"])
 
 
+def test_ir_incremental_merge_requires_two_distinct_years_for_persistence() -> None:
+    references = [
+        ContextEvidenceReference(
+            ref_id=f"IR-R{year}",
+            chunk_id=f"IR-C{year}",
+            document_id=f"IR-D{year}",
+            node_ids=[f"IR-N{year}"],
+            raw_quote="Customer retention remained high.",
+            source_types=[SourceType.IR],
+            available_at=f"{year}-08-31T00:00:00+09:00",
+        )
+        for year in (2024, 2025)
+    ]
+    base = ContextualMoatAssessment(evidence_sufficiency=2)
+    one_year = IrIncrementalAssessment(
+        outcomes=[
+            IrOutcomeDelta(
+                evidence_type=EvidenceType.CUSTOMER_RETENTION,
+                action=IrDeltaAction.ADD,
+                strength_bucket=3,
+                persistence_bucket=4,
+                reference_ids=["IR-R2025"],
+                rationale="Retention supports the mechanism.",
+            )
+        ]
+    )
+    two_years = one_year.model_copy(
+        update={
+            "outcomes": [
+                one_year.outcomes[0].model_copy(
+                    update={"reference_ids": ["IR-R2024", "IR-R2025"]}
+                )
+            ]
+        }
+    )
+
+    one_year_merged, one_year_report = apply_ir_incremental_assessment(
+        base,
+        one_year,
+        references,
+    )
+    two_year_merged, _ = apply_ir_incremental_assessment(
+        base,
+        two_years,
+        references,
+    )
+
+    assert one_year_merged.outcome_confirmation[0].persistence_bucket == 1
+    assert two_year_merged.outcome_confirmation[0].persistence_bucket == 4
+    assert any(
+        action["action"] == "CLAMP_SINGLE_PERIOD_PERSISTENCE"
+        for action in one_year_report["actions"]
+    )
+
+
 def _assessment(_chunk: SemanticChunk) -> ContextualMoatAssessment:
     return ContextualMoatAssessment(
         evidence_sufficiency=4,
@@ -228,9 +293,85 @@ def test_strength_context_is_broad_balanced_and_excludes_generated_summaries() -
     assert len(context.references) == 4
     assert "[R_" in context.markdown
     assert "## CHUNK " not in context.markdown
+
+
+def test_strength_context_can_preserve_longitudinal_document_coverage() -> None:
+    chunks = [
+        _chunk(
+            f"C{year}",
+            "Customer retention and renewal evidence persisted.",
+            role=SectionRole.CUSTOMERS,
+            document_id=f"IR-{year}",
+            available_at=f"{year}-08-31T00:00:00+09:00",
+        )
+        for year in range(2021, 2026)
+    ]
+
+    context = MoatStrengthContextBuilder().build(
+        chunks,
+        preserve_document_coverage=True,
+    )
+
+    assert context.available_document_count == 5
+    assert context.selected_document_count == 5
+    assert context.selected_document_ids == [
+        "IR-2021",
+        "IR-2022",
+        "IR-2023",
+        "IR-2024",
+        "IR-2025",
+    ]
+    assert "Available: 2021-08-31T00:00:00+09:00" in context.markdown
+    assert {reference.available_at.year for reference in context.references} == {
+        2021,
+        2022,
+        2023,
+        2024,
+        2025,
+    }
     assert "Node IDs:" not in context.markdown
 
 
+def test_atomic_selection_can_preserve_longitudinal_document_coverage() -> None:
+    chunks = [
+        _chunk(
+            f"C{year}",
+            "Customer retention and renewal evidence persisted.",
+            role=SectionRole.CUSTOMERS,
+            document_id=f"IR-{year}",
+            available_at=f"{year}-08-31T00:00:00+09:00",
+        ).model_copy(
+            update={
+                "metadata": {
+                    "source_document_id": f"IR-{year}",
+                    "available_at": f"{year}-08-31T00:00:00+09:00",
+                }
+            }
+        )
+        for year in range(2021, 2026)
+    ]
+    units = build_atomic_evidence_units(chunks, issuer_id="ISSUER-1")
+
+    selected = select_atomic_evidence_units(
+        units,
+        5,
+        preserve_document_coverage=True,
+    )
+
+    assert {unit.document_id for unit in selected} == {
+        "IR-2021",
+        "IR-2022",
+        "IR-2023",
+        "IR-2024",
+        "IR-2025",
+    }
+    assert {unit.metadata["available_at"][:4] for unit in selected} == {
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+    }
 def test_strength_retrieval_matches_korean_disclosure_terms() -> None:
     chunks = [
         _chunk("C1", "고객은 장기 계약과 인증 절차 때문에 공급자 전환이 어렵습니다."),

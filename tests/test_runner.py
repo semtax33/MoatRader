@@ -382,6 +382,109 @@ def test_incremental_ir_keeps_dart_base_identical_and_requires_accepted_ir(
     assert ir_audit["treatment_compliant"] is True
 
 
+def test_longitudinal_ir_requires_multi_year_accepted_evidence(
+    tmp_path: Path,
+) -> None:
+    source_manifest = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    sample = source_manifest.companies[0]
+    dart_input = Path(sample.documents[0].input_path)
+    dart_metadata = Path(sample.documents[0].metadata_path)
+    dcf = Path(sample.dcf_assumptions_path or "")
+    rows = [
+        {
+            "ticker": "SAMPLE",
+            "source": "DART",
+            "input": str(dart_input),
+            "metadata": str(dart_metadata),
+            "issuer_id": "00126380",
+            "issuer_name": "Sample Company",
+            "current_price": "10",
+            "price_as_of": "2025-05-15T16:00:00+09:00",
+            "dcf_assumptions": str(dcf),
+        }
+    ]
+    for year in (2022, 2023, 2024):
+        ir_input = tmp_path / f"ir-{year}.html"
+        ir_input.write_text(
+            f"<html><body><h1>{year} customer platform</h1>"
+            "<p>Customers integrate the platform into recurring workflows "
+            "and face a lengthy annual qualification process.</p></body></html>",
+            encoding="utf-8",
+        )
+        ir_metadata = tmp_path / f"ir-{year}-metadata.json"
+        ir_metadata.write_text(
+            json.dumps(
+                {
+                    "source_type": "IR",
+                    "source_document_id": f"IR-SAMPLE-{year}",
+                    "available_at": f"{year}-05-15T12:00:00+09:00",
+                    "document_type": "IR_PRESENTATION",
+                }
+            ),
+            encoding="utf-8",
+        )
+        rows.append(
+            {
+                **rows[0],
+                "source": "IR",
+                "input": str(ir_input),
+                "metadata": str(ir_metadata),
+            }
+        )
+    manifest_path = tmp_path / "longitudinal.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    def handler(request: LLMRequest, response_model: type[Any]) -> Any:
+        if request.task != LLMTask.IR_INCREMENTAL_ASSESSMENT:
+            return _fixture_handler(request, response_model)
+        references = [str(item) for item in request.metadata["reference_ids"]]
+        return IrIncrementalAssessment(
+            evidence_sufficiency_delta=1,
+            mechanisms=[
+                IrMechanismDelta(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    action=IrDeltaAction.STRENGTHEN,
+                    strength_bucket=4,
+                    scope_materiality_bucket=4,
+                    durability_bucket=4,
+                    economic_scope=EconomicScope.COMPANY,
+                    reference_ids=[references[0], references[-1]],
+                    rationale="Repeated annual evidence strengthens switching friction.",
+                )
+            ],
+        )
+
+    manifest = load_universe_manifest(manifest_path)
+    result = MoatUniverseRunner(
+        config=UniverseRunConfig(
+            run_id="longitudinal-ir",
+            as_of=datetime.fromisoformat("2025-05-16T00:00:00+09:00"),
+            incremental_ir_mode=True,
+            longitudinal_ir_mode=True,
+            minimum_longitudinal_ir_years=3,
+        ),
+        output_directory=tmp_path / "runs",
+        transport=FunctionTransport(handler),
+    ).run(manifest, manifest.companies)
+
+    assert result.companies[0].status == CompanyRunStatus.COMPLETE
+    company_dir = tmp_path / "runs" / "longitudinal-ir" / "companies" / "SAMPLE"
+    audit = json.loads(
+        (company_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    context = json.loads(
+        (company_dir / "moat-strength-context-ir.json").read_text(encoding="utf-8")
+    )
+    assert audit["usable_ir_years"] == [2022, 2023, 2024]
+    assert len(audit["accepted_ir_years"]) >= 2
+    assert audit["longitudinal_treatment_compliant"] is True
+    assert audit["treatment_compliant"] is True
+    assert context["selected_document_count"] == 3
+
+
 def test_runner_preserves_official_primary_document_url_in_provenance(tmp_path: Path) -> None:
     source = tmp_path / "source.xml"
     source.write_text("<DOCUMENT><BODY><P>Official source.</P></BODY></DOCUMENT>", encoding="utf-8")

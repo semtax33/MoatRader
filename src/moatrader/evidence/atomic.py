@@ -243,6 +243,11 @@ def build_atomic_evidence_units(
                     "atomic_rubric_version": ATOMIC_RUBRIC_VERSION,
                     "origin_chunk_ids": sorted({chunk.chunk_id for chunk in origin_chunks}),
                     "source_type": _source_type(canonical_origin).value,
+                    "source_document_id": canonical_origin.metadata.get(
+                        "source_document_id",
+                        document_id,
+                    ),
+                    "available_at": canonical_origin.metadata.get("available_at"),
                 },
             )
         )
@@ -252,15 +257,21 @@ def build_atomic_evidence_units(
 def select_atomic_evidence_units(
     units: list[SemanticChunk],
     maximum: int | None,
+    *,
+    preserve_document_coverage: bool = False,
 ) -> list[SemanticChunk]:
     """Content-ranked set selection with no presentation-order tie breaker."""
 
-    unique: dict[str, SemanticChunk] = {}
+    unique: dict[tuple[str, str | None], SemanticChunk] = {}
     for unit in units:
-        key = str(unit.metadata["atomic_evidence_key"])
+        key = (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id if preserve_document_coverage else None,
+        )
         current = unique.get(key)
         if current is None or (unit.document_id, unit.chunk_id) < (current.document_id, current.chunk_id):
             unique[key] = unit
+
     def relevance(unit: SemanticChunk) -> tuple[int, int]:
         keyword_count = min(20, len(_MOAT_TERMS_RE.findall(unit.markdown)))
         return _ROLE_WEIGHT.get(unit.section_role or SectionRole.OTHER, 1) + keyword_count, keyword_count
@@ -287,8 +298,37 @@ def select_atomic_evidence_units(
             str(unit.metadata["atomic_evidence_key"]),
         ),
     )
-    selected = ranked if maximum is None else ranked[:maximum]
-    return sorted(selected, key=lambda unit: str(unit.metadata["atomic_evidence_key"]))
+    if maximum is None or not preserve_document_coverage:
+        selected = ranked if maximum is None else ranked[:maximum]
+    else:
+        anchors_by_document: dict[str, SemanticChunk] = {}
+        for unit in ranked:
+            anchors_by_document.setdefault(unit.document_id, unit)
+        anchors = sorted(
+            anchors_by_document.values(),
+            key=lambda unit: (
+                -relevance(unit)[0],
+                -relevance(unit)[1],
+                unit.token_count,
+                unit.document_id,
+                str(unit.metadata["atomic_evidence_key"]),
+            ),
+        )
+        if len(anchors) > maximum:
+            raise ValueError(
+                "maximum atomic evidence units cannot preserve document coverage"
+            )
+        anchor_ids = {unit.chunk_id for unit in anchors}
+        remaining = [unit for unit in ranked if unit.chunk_id not in anchor_ids]
+        selected = [*anchors, *remaining[: maximum - len(anchors)]]
+    return sorted(
+        selected,
+        key=lambda unit: (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id,
+            unit.chunk_id,
+        ),
+    )
 
 
 def select_context_cited_atomic_units(

@@ -11,6 +11,7 @@ from moatrader.adapters import (
     PdfOcrResult,
     RawDocument,
 )
+from moatrader.adapters.pdf import _numeric_value
 from moatrader.canonical.models import (
     DocumentType,
     FigureNode,
@@ -74,6 +75,56 @@ def _image_pdf() -> bytes:
     return image_document.tobytes()
 
 
+def _partially_ruled_pdf() -> bytes:
+    document = fitz.open()
+    page = document.new_page(width=595, height=420)
+    xs = [40, 150, 230, 310, 390, 470, 550]
+    ys = [80, 115, 150, 185, 220, 255]
+    for x in xs:
+        page.draw_line((x, ys[0]), (x, ys[1]))
+    page.draw_line((xs[-2], ys[0]), (xs[-2], ys[-1]))
+    page.draw_line((xs[-1], ys[0]), (xs[-1], ys[-1]))
+    for y in (ys[0], ys[1], ys[-1]):
+        page.draw_line((xs[0], y), (xs[-1], y))
+    values = [
+        ["Metric", "20.3Q", "20.4Q", "21.1Q", "21.2Q", "21.3Q"],
+        ["Revenue", "58,252", "56,594", "100,754", "52,918", "94,261"],
+        ["GP", "30,886", "27,382", "49,591", "24,348", "45,889"],
+        ["OP", "14,397", "6,857", "30,765", "6,234", "27,279"],
+        ["Net Profit", "9,200", "-227", "26,475", "3,937", "23,073"],
+    ]
+    for row, cells in enumerate(values):
+        for column, value in enumerate(cells):
+            page.insert_text(
+                (xs[column] + 5, ys[row] + 23), value, fontsize=9
+            )
+    return document.tobytes()
+
+
+def _collapsed_header_pdf() -> bytes:
+    document = fitz.open()
+    page = document.new_page(width=720, height=420)
+    xs = [30, 220, 300, 380, 460, 540, 620, 700]
+    ys = [80, 115, 150, 185, 220, 255]
+    # The first three numeric dividers are absent, matching the common IR
+    # failure where both the header and body collapse into a single cell.
+    for x in (xs[0], xs[4], xs[5], xs[6], xs[7]):
+        page.draw_line((x, ys[0]), (x, ys[-1]))
+    for y in ys:
+        page.draw_line((xs[0], y), (xs[-1], y))
+    values = [
+        ["Metric", "2022", "2023", "2024", "2024.2Q", "YoY", "2025.2Q"],
+        ["Revenue", "217,264", "186,852", "305,515", "58,114", "173.68%", "159,047"],
+        ["Cost", "169,231", "156,435", "248,993", "48,032", "164.54%", "127,064"],
+        ["Profit", "48,032", "30,417", "56,521", "10,081", "217.25%", "31,982"],
+        ["Margin", "6.2%", "2.4%", "6.9%", "5.64%", "116.24%", "12.20%"],
+    ]
+    for row, cells in enumerate(values):
+        for column, value in enumerate(cells):
+            page.insert_text((xs[column] + 5, ys[row] + 23), value, fontsize=9)
+    return document.tobytes()
+
+
 def test_ir_pdf_adapter_preserves_page_bbox_table_and_management_claim_semantics() -> None:
     source = _source(_digital_pdf())
     bundle = IrPdfAdapter().convert(source)
@@ -94,6 +145,55 @@ def test_ir_pdf_adapter_preserves_page_bbox_table_and_management_claim_semantics
     assert tables[0].unit.currency == "KRW"
     assert bundle.quality.numeric_retention == 1.0
     assert bundle.facts == []
+
+
+def test_ir_pdf_adapter_repairs_collapsed_partially_ruled_grid() -> None:
+    bundle = IrPdfAdapter().convert(_source(_partially_ruled_pdf()))
+    tables = [node for node in bundle.ast.walk() if isinstance(node, TableNode)]
+    table = max(tables, key=lambda item: len(item.rows))
+
+    assert table.attributes["table_extraction_strategy"] == "lines-coordinate-repair"
+    assert [cell.raw_text for cell in table.rows[1].cells] == [
+        "Revenue",
+        "58,252",
+        "56,594",
+        "100,754",
+        "52,918",
+        "94,261",
+    ]
+    assert table.rows[4].cells[1].numeric_value == 9200
+    assert any("TABLE_GRID_REPAIRED" in item for item in bundle.quality.warnings)
+
+
+def test_ir_pdf_adapter_infers_numeric_axes_when_header_is_also_collapsed() -> None:
+    bundle = IrPdfAdapter().convert(_source(_collapsed_header_pdf()))
+    tables = [node for node in bundle.ast.walk() if isinstance(node, TableNode)]
+    table = max(tables, key=lambda item: len(item.rows))
+
+    assert table.attributes["table_extraction_strategy"] == "lines-coordinate-repair"
+    assert [cell.raw_text for cell in table.rows[0].cells] == [
+        "Metric",
+        "2022",
+        "2023",
+        "2024",
+        "2024.2Q",
+        "YoY",
+        "2025.2Q",
+    ]
+    assert [cell.raw_text for cell in table.rows[1].cells] == [
+        "Revenue",
+        "217,264",
+        "186,852",
+        "305,515",
+        "58,114",
+        "173.68%",
+        "159,047",
+    ]
+
+
+def test_pdf_numeric_parser_does_not_turn_packed_cells_into_fake_numbers() -> None:
+    assert _numeric_value("347 399 502 57") is None
+    assert _numeric_value("347\n399") is None
 
 
 def test_ir_pdf_adapter_fails_closed_when_ocr_is_required() -> None:

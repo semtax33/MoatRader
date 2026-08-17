@@ -208,6 +208,7 @@ Treat IR as management claims, not audited facts. Every material delta must cite
 Classify each material delta as ADD, STRENGTHEN, WEAKEN, CONTRADICT, or NO_EFFECT.
 Only causal company-specific barriers may be mechanism deltas. Growth, guidance, demand, margins, or market size alone are not mechanisms.
 Outcomes may only corroborate a mechanism. Do not infer persistence from one period or from a forecast.
+When dated IR sources span multiple years, raise persistence only for consistent realized observations cited from at least two distinct years. Repeated forecasts or restated targets do not establish persistence.
 Use conservative zero-to-four ordinal buckets. Keep rationales qualitative and omit digits.
 Return only IR deltas. Never repeat unchanged DART items merely to restate them, and never return a final MOAT score.
 Python validates references, extracts atomic IR evidence, determines whether a delta is score-producing, and merges accepted changes deterministically."""
@@ -241,13 +242,13 @@ As of: {as_of.isoformat()}
         response_schema=response_schema,
         input_sha256=_hash_input(system, user),
         prompt_cache_key=_prompt_cache_key(
-            "ir-incremental-v1",
+            "ir-incremental-v2",
             static_prefix=system + "\n" + canonical_schema,
             routing_identity=issuer_id,
         ),
         prompt_cache_breakpoint=True,
         metadata={
-            "prompt_version": "ir-incremental-assessment/1",
+            "prompt_version": "ir-incremental-assessment/2",
             "rubric_version": "dual-lane-moat/2",
             "issuer_id": issuer_id,
             "as_of": as_of.isoformat(),

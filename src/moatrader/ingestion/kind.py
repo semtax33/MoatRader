@@ -242,6 +242,8 @@ class KindIrCollector:
         refresh: bool = False,
         max_materials: int | None = None,
         max_materials_per_company: int | None = None,
+        max_materials_per_company_per_year: int | None = None,
+        max_years_per_company: int | None = None,
     ) -> CollectionResult:
         if not companies:
             raise ValueError("at least one company identity is required")
@@ -258,7 +260,53 @@ class KindIrCollector:
                 identity = identities.get(f"kind:{material.kind_company_code}")
             if identity is not None:
                 selected.append((material, identity))
-        if max_materials_per_company is not None:
+        if (
+            max_materials_per_company is not None
+            and max_materials_per_company_per_year is not None
+        ):
+            raise ValueError(
+                "max_materials_per_company and "
+                "max_materials_per_company_per_year are mutually exclusive"
+            )
+        if max_years_per_company is not None and max_materials_per_company_per_year is None:
+            raise ValueError(
+                "max_years_per_company requires max_materials_per_company_per_year"
+            )
+        if max_materials_per_company_per_year is not None:
+            if max_materials_per_company_per_year <= 0:
+                raise ValueError(
+                    "max_materials_per_company_per_year must be positive"
+                )
+            if max_years_per_company is not None and max_years_per_company <= 0:
+                raise ValueError("max_years_per_company must be positive")
+            annual: list[tuple[KindIrMaterial, KindCompanyIdentity]] = []
+            per_ticker_year: dict[tuple[str, int], int] = {}
+            selected_years: dict[str, set[int]] = {}
+            for material, identity in reversed(selected):
+                year = material.listed_on.year
+                years = selected_years.setdefault(identity.ticker, set())
+                if (
+                    max_years_per_company is not None
+                    and year not in years
+                    and len(years) >= max_years_per_company
+                ):
+                    continue
+                key = (identity.ticker, year)
+                count = per_ticker_year.get(key, 0)
+                if count >= max_materials_per_company_per_year:
+                    continue
+                annual.append((material, identity))
+                per_ticker_year[key] = count + 1
+                years.add(year)
+            selected = sorted(
+                annual,
+                key=lambda item: (
+                    item[0].listed_on,
+                    int(item[0].ir_seq),
+                    item[0].attachment_index,
+                ),
+            )
+        elif max_materials_per_company is not None:
             if max_materials_per_company <= 0:
                 raise ValueError("max_materials_per_company must be positive")
             latest: list[tuple[KindIrMaterial, KindCompanyIdentity]] = []
@@ -357,6 +405,10 @@ class KindIrCollector:
                 "refresh": refresh,
                 "max_materials": max_materials,
                 "max_materials_per_company": max_materials_per_company,
+                "max_materials_per_company_per_year": (
+                    max_materials_per_company_per_year
+                ),
+                "max_years_per_company": max_years_per_company,
             },
             discovered_count=len(selected),
             filings=filings,

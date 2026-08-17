@@ -14,6 +14,7 @@ from moatrader.adapters import (
     RawDocument,
     enrich_ir_table_semantics,
 )
+from moatrader.adapters.pdf import PARSER_VERSION as IR_PDF_PARSER_VERSION
 from moatrader.ingestion import (
     BronzeFilingStore,
     KindCompanyIdentity,
@@ -23,9 +24,10 @@ from moatrader.ingestion import (
     normalize_company_name,
 )
 from moatrader.pipeline import CanonicalFinancialDocumentPipeline
+from moatrader.quality import assess_parser_quality
 
 
-SCHEMA_VERSION = "moatrader-source-ablation/1"
+SCHEMA_VERSION = "moatrader-source-ablation/2"
 MANIFEST_FIELDS = (
     "ticker",
     "source",
@@ -93,6 +95,16 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     base_manifest = Path(args.base_manifest).resolve()
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if args.materials_per_company_per_year <= 0:
+        raise ValueError("materials_per_company_per_year must be positive")
+    if args.max_years_per_company <= 0:
+        raise ValueError("max_years_per_company must be positive")
+    if args.minimum_years_per_company <= 0:
+        raise ValueError("minimum_years_per_company must be positive")
+    if args.minimum_years_per_company > args.max_years_per_company:
+        raise ValueError(
+            "minimum_years_per_company must not exceed max_years_per_company"
+        )
     base_rows = _read_csv(base_manifest)
     identity_rows = _identity_rows(base_rows)
     identities = {
@@ -129,20 +141,33 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         if identity is not None:
             by_ticker[identity.ticker].append(material)
     eligible = sorted(
-        by_ticker,
+        (
+            ticker
+            for ticker, ticker_materials in by_ticker.items()
+            if len({material.listed_on.year for material in ticker_materials})
+            >= args.minimum_years_per_company
+        ),
         key=lambda ticker: (_selection_key(args.seed, ticker), ticker),
     )
     if args.fixed_cohort:
         fixed_rows = _read_csv(Path(args.fixed_cohort).resolve())
-        selected = [_ticker(row.get("ticker")) for row in fixed_rows]
-        if len(selected) != len(set(selected)) or any(not ticker for ticker in selected):
+        fixed_selected = [_ticker(row.get("ticker")) for row in fixed_rows]
+        if len(fixed_selected) != len(set(fixed_selected)) or any(
+            not ticker for ticker in fixed_selected
+        ):
             raise ValueError("fixed cohort must contain unique nonblank tickers")
-        missing = sorted(set(selected) - set(eligible))
-        if missing:
+        missing = sorted(set(fixed_selected) - set(eligible))
+        if missing and not args.filter_fixed_cohort_by_ir_years:
             raise ValueError(f"fixed cohort lacks PIT-available KIND materials: {missing}")
+        selected = (
+            [ticker for ticker in fixed_selected if ticker in set(eligible)]
+            if args.filter_fixed_cohort_by_ir_years
+            else fixed_selected
+        )
         if len(selected) != args.sample_size:
             raise ValueError(
-                f"fixed cohort has {len(selected)} companies; sample_size={args.sample_size}"
+                f"fixed cohort selection has {len(selected)} companies after the "
+                f"availability rule; sample_size={args.sample_size}"
             )
     elif len(eligible) < args.sample_size:
         raise ValueError(
@@ -163,13 +188,30 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         end_date=args.end_date,
         companies=selected_identities,
         refresh=args.refresh,
-        max_materials_per_company=1,
+        max_materials_per_company=(
+            1 if args.ir_selection_mode == "latest" else None
+        ),
+        max_materials_per_company_per_year=(
+            args.materials_per_company_per_year
+            if args.ir_selection_mode == "annual-snapshots"
+            else None
+        ),
+        max_years_per_company=(
+            args.max_years_per_company
+            if args.ir_selection_mode == "annual-snapshots"
+            else None
+        ),
     )
     _write_json(output / "collection-result.json", collection.model_dump(mode="json"))
 
-    filing_by_ticker = {filing.ticker: filing for filing in collection.filings}
+    filings_by_ticker: dict[str, list[Any]] = defaultdict(list)
+    for filing in collection.filings:
+        filings_by_ticker[filing.ticker].append(filing)
+    material_by_document_id = {
+        material.source_document_id: material for material in materials
+    }
     parse_rows: list[dict[str, Any]] = []
-    prepared_metadata_by_ticker: dict[str, str] = {}
+    prepared_metadata_by_document_id: dict[str, str] = {}
     ocr_adapter = (
         PaddlePdfOcrAdapter(
             device=args.ir_ocr_device,
@@ -180,8 +222,8 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     )
     pipeline = CanonicalFinancialDocumentPipeline(ir_ocr_adapter=ocr_adapter)
     for ticker in selected:
-        filing = filing_by_ticker.get(ticker)
-        if filing is None:
+        filings = filings_by_ticker.get(ticker, [])
+        if not filings:
             parse_rows.append(
                 {
                     "ticker": ticker,
@@ -190,68 +232,106 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
             continue
-        metadata = json.loads(Path(filing.metadata_path).read_text(encoding="utf-8-sig"))
-        raw = RawDocument(
-            content=Path(filing.input_path).read_bytes(),
-            uri=str(metadata["primary_document_url"]),
-            media_type="application/pdf",
-            hints=metadata,
-        )
-        try:
-            parsed_dir = output / "parsed" / ticker
-            bundle_path = parsed_dir / "bundle.json"
-            if args.resume_prepared and bundle_path.is_file():
-                from moatrader.canonical.models import CanonicalDocumentBundle
+        for filing in filings:
+            metadata = json.loads(
+                Path(filing.metadata_path).read_text(encoding="utf-8-sig")
+            )
+            raw = RawDocument(
+                content=Path(filing.input_path).read_bytes(),
+                uri=str(metadata["primary_document_url"]),
+                media_type="application/pdf",
+                hints=metadata,
+            )
+            try:
+                parsed_dir = output / "parsed" / ticker / filing.source_document_id
+                bundle_path = parsed_dir / "bundle.json"
+                reuse_bundle = False
+                if args.resume_prepared and bundle_path.is_file():
+                    from moatrader.canonical.models import CanonicalDocumentBundle
 
-                bundle = CanonicalDocumentBundle.model_validate_json(
-                    bundle_path.read_text(encoding="utf-8-sig")
-                )
-                if bundle.metadata.raw_sha256 != hashlib.sha256(raw.content).hexdigest():
-                    raise ValueError(f"ticker {ticker}: prepared bundle raw hash mismatch")
-                bundle = enrich_ir_table_semantics(bundle)
-                _write_json(bundle_path, bundle.model_dump(mode="json"))
-            else:
-                bundle = pipeline.ingest(raw)
-                _write_json(bundle_path, bundle.model_dump(mode="json"))
-                parsed_dir.mkdir(parents=True, exist_ok=True)
-                (parsed_dir / "document.md").write_text(
-                    pipeline.renderer.render_document(bundle),
-                    encoding="utf-8",
-                )
-            run_metadata = {
-                **metadata,
-                "canonical_bundle_path": str(bundle_path.resolve()),
-                "canonical_bundle_raw_sha256": bundle.metadata.raw_sha256,
-                "canonical_bundle_parser_version": bundle.metadata.parser_version,
-            }
-            run_metadata_path = output / "run-metadata" / f"{ticker}-ir.json"
-            _write_json(run_metadata_path, run_metadata)
-            prepared_metadata_by_ticker[ticker] = str(run_metadata_path)
-            parse_rows.append(
-                {
-                    "ticker": ticker,
-                    "issuer_name": identities[ticker].issuer_name,
-                    "status": "PASS",
-                    "source_document_id": bundle.metadata.source_document_id,
-                    "page_count": bundle.metadata.source_specific.get("pdf_page_count"),
-                    "raw_visible_chars": bundle.quality.raw_visible_chars,
-                    "text_retention": bundle.quality.text_retention,
-                    "table_count": bundle.quality.ast_table_count,
-                    "numeric_cell_count": bundle.quality.numeric_cell_count,
-                    "numeric_retention": bundle.quality.numeric_retention,
-                    "warning_count": len(bundle.quality.warnings),
-                    "ocr_required": any("OCR_REQUIRED" in warning for warning in bundle.quality.warnings),
+                    bundle = CanonicalDocumentBundle.model_validate_json(
+                        bundle_path.read_text(encoding="utf-8-sig")
+                    )
+                    if bundle.metadata.raw_sha256 != hashlib.sha256(raw.content).hexdigest():
+                        raise ValueError(
+                            f"ticker {ticker}: prepared bundle raw hash mismatch"
+                        )
+                    reuse_bundle = (
+                        bundle.metadata.parser_version == IR_PDF_PARSER_VERSION
+                    )
+                if reuse_bundle:
+                    bundle = enrich_ir_table_semantics(bundle)
+                    _write_json(bundle_path, bundle.model_dump(mode="json"))
+                else:
+                    bundle = pipeline.ingest(raw)
+                    _write_json(bundle_path, bundle.model_dump(mode="json"))
+                    parsed_dir.mkdir(parents=True, exist_ok=True)
+                    (parsed_dir / "document.md").write_text(
+                        pipeline.renderer.render_document(bundle),
+                        encoding="utf-8",
+                    )
+                quality_assessment = assess_parser_quality(bundle)
+                run_metadata = {
+                    **metadata,
+                    "canonical_bundle_path": str(bundle_path.resolve()),
+                    "canonical_bundle_raw_sha256": bundle.metadata.raw_sha256,
+                    "canonical_bundle_parser_version": bundle.metadata.parser_version,
                 }
-            )
-        except Exception as exc:
-            parse_rows.append(
-                {
-                    "ticker": ticker,
-                    "issuer_name": identities[ticker].issuer_name,
-                    "status": "FAILED",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+                run_metadata_path = (
+                    output
+                    / "run-metadata"
+                    / f"{ticker}-{filing.source_document_id}-ir.json"
+                )
+                _write_json(run_metadata_path, run_metadata)
+                prepared_metadata_by_document_id[filing.source_document_id] = str(
+                    run_metadata_path
+                )
+                material = material_by_document_id.get(filing.source_document_id)
+                parse_rows.append(
+                    {
+                        "ticker": ticker,
+                        "issuer_name": identities[ticker].issuer_name,
+                        "status": "PASS",
+                        "source_document_id": bundle.metadata.source_document_id,
+                        "listed_on": (
+                            material.listed_on.isoformat() if material else ""
+                        ),
+                        "ir_year": material.listed_on.year if material else "",
+                        "page_count": bundle.metadata.source_specific.get("pdf_page_count"),
+                        "raw_visible_chars": bundle.quality.raw_visible_chars,
+                        "text_retention": bundle.quality.text_retention,
+                        "table_count": bundle.quality.ast_table_count,
+                        "numeric_cell_count": bundle.quality.numeric_cell_count,
+                        "numeric_retention": bundle.quality.numeric_retention,
+                        "quality_gate_passed": quality_assessment.passed,
+                        "quality_gate_failure_count": len(
+                            quality_assessment.failures
+                        ),
+                        "quality_gate_failures": " | ".join(
+                            quality_assessment.failures
+                        ),
+                        "warning_count": len(bundle.quality.warnings),
+                        "ocr_required": any(
+                            "OCR_REQUIRED" in warning
+                            for warning in bundle.quality.warnings
+                        ),
+                    }
+                )
+            except Exception as exc:
+                material = material_by_document_id.get(filing.source_document_id)
+                parse_rows.append(
+                    {
+                        "ticker": ticker,
+                        "issuer_name": identities[ticker].issuer_name,
+                        "status": "FAILED",
+                        "source_document_id": filing.source_document_id,
+                        "listed_on": (
+                            material.listed_on.isoformat() if material else ""
+                        ),
+                        "ir_year": material.listed_on.year if material else "",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
     _write_csv(
         output / "parse-audit.csv",
         parse_rows,
@@ -260,12 +340,17 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "issuer_name",
             "status",
             "source_document_id",
+            "listed_on",
+            "ir_year",
             "page_count",
             "raw_visible_chars",
             "text_retention",
             "table_count",
             "numeric_cell_count",
             "numeric_retention",
+            "quality_gate_passed",
+            "quality_gate_failure_count",
+            "quality_gate_failures",
             "warning_count",
             "ocr_required",
             "error",
@@ -280,23 +365,25 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     ]
     combined_rows = list(dart_rows)
     for ticker in selected:
-        filing = filing_by_ticker.get(ticker)
-        if filing is None:
-            continue
         identity = identity_rows[ticker]
-        combined_rows.append(
-            {
-                "ticker": ticker,
-                "source": "IR",
-                "input": filing.input_path,
-                "metadata": prepared_metadata_by_ticker.get(ticker, filing.metadata_path),
-                "issuer_id": filing.issuer_id,
-                "issuer_name": filing.issuer_name or identity.get("issuer_name", ""),
-                "current_price": identity.get("current_price", ""),
-                "price_as_of": identity.get("price_as_of", ""),
-                "dcf_assumptions": identity.get("dcf_assumptions", ""),
-            }
-        )
+        for filing in filings_by_ticker.get(ticker, []):
+            combined_rows.append(
+                {
+                    "ticker": ticker,
+                    "source": "IR",
+                    "input": filing.input_path,
+                    "metadata": prepared_metadata_by_document_id.get(
+                        filing.source_document_id,
+                        filing.metadata_path,
+                    ),
+                    "issuer_id": filing.issuer_id,
+                    "issuer_name": filing.issuer_name
+                    or identity.get("issuer_name", ""),
+                    "current_price": identity.get("current_price", ""),
+                    "price_as_of": identity.get("price_as_of", ""),
+                    "dcf_assumptions": identity.get("dcf_assumptions", ""),
+                }
+            )
     _write_csv(output / "dart-only.csv", dart_rows, MANIFEST_FIELDS)
     _write_csv(output / "dart-plus-ir.csv", combined_rows, MANIFEST_FIELDS)
     for shard_index, start in enumerate(range(0, len(selected), 5), start=1):
@@ -314,15 +401,38 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
 
     cohort_rows = []
     for ticker in selected:
+        selected_materials = [
+            material_by_document_id[filing.source_document_id]
+            for filing in filings_by_ticker.get(ticker, [])
+            if filing.source_document_id in material_by_document_id
+        ]
         latest = max(
-            by_ticker[ticker],
+            selected_materials or by_ticker[ticker],
             key=lambda material: (
                 material.listed_on,
                 int(material.ir_seq),
                 material.attachment_index,
             ),
         )
-        parse = next(row for row in parse_rows if row["ticker"] == ticker)
+        ticker_parse_rows = [row for row in parse_rows if row["ticker"] == ticker]
+        parse_status = (
+            "PASS"
+            if ticker_parse_rows
+            and all(row["status"] == "PASS" for row in ticker_parse_rows)
+            else "FAILED"
+        )
+        quality_pass_rows = [
+            row
+            for row in ticker_parse_rows
+            if row.get("quality_gate_passed") is True
+        ]
+        quality_usable_years = sorted(
+            {
+                int(row["ir_year"])
+                for row in quality_pass_rows
+                if row.get("ir_year") not in (None, "")
+            }
+        )
         cohort_rows.append(
             {
                 "ticker": ticker,
@@ -332,8 +442,39 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
                 "latest_ir_listed_on": latest.listed_on.isoformat(),
                 "latest_ir_seq": latest.ir_seq,
                 "latest_ir_filename": latest.attachment_name,
-                "parse_status": parse["status"],
-                "ocr_required": parse.get("ocr_required", ""),
+                "ir_document_count": len(selected_materials),
+                "ir_year_count": len(
+                    {material.listed_on.year for material in selected_materials}
+                ),
+                "ir_years": ";".join(
+                    str(year)
+                    for year in sorted(
+                        {material.listed_on.year for material in selected_materials}
+                    )
+                ),
+                "parse_status": parse_status,
+                "parse_pass_count": sum(
+                    row["status"] == "PASS" for row in ticker_parse_rows
+                ),
+                "parse_fail_count": sum(
+                    row["status"] != "PASS" for row in ticker_parse_rows
+                ),
+                "quality_gate_status": (
+                    "PASS"
+                    if ticker_parse_rows
+                    and len(quality_pass_rows) == len(ticker_parse_rows)
+                    else "FAILED"
+                ),
+                "quality_pass_count": len(quality_pass_rows),
+                "quality_fail_count": len(ticker_parse_rows)
+                - len(quality_pass_rows),
+                "quality_usable_year_count": len(quality_usable_years),
+                "quality_usable_years": ";".join(
+                    str(year) for year in quality_usable_years
+                ),
+                "ocr_required": any(
+                    row.get("ocr_required") is True for row in ticker_parse_rows
+                ),
             }
         )
     _write_csv(
@@ -347,7 +488,17 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "latest_ir_listed_on",
             "latest_ir_seq",
             "latest_ir_filename",
+            "ir_document_count",
+            "ir_year_count",
+            "ir_years",
             "parse_status",
+            "parse_pass_count",
+            "parse_fail_count",
+            "quality_gate_status",
+            "quality_pass_count",
+            "quality_fail_count",
+            "quality_usable_year_count",
+            "quality_usable_years",
             "ocr_required",
         ),
     )
@@ -355,7 +506,11 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
     protocol = {
         "schema_version": SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "experiment": "DART_ONLY_VS_DART_PLUS_IR",
+        "experiment": (
+            "DART_ONLY_VS_DART_PLUS_LONGITUDINAL_IR"
+            if args.ir_selection_mode == "annual-snapshots"
+            else "DART_ONLY_VS_DART_PLUS_IR"
+        ),
         "as_of": args.as_of,
         "ir_window": {
             "begin_date": args.begin_date.isoformat(),
@@ -365,12 +520,30 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
         "selection": {
             "policy": "KIND availability + exact normalized issuer identity + seeded SHA-256 only",
             "fixed_cohort": str(Path(args.fixed_cohort).resolve()) if args.fixed_cohort else None,
+            "fixed_cohort_filtered_by_ir_years": bool(
+                args.fixed_cohort and args.filter_fixed_cohort_by_ir_years
+            ),
+            "fixed_cohort_excluded_tickers": missing if args.fixed_cohort else [],
             "return_data_used": False,
             "seed": args.seed,
             "eligible_company_count": len(eligible),
             "sample_size": args.sample_size,
             "tickers": selected,
-            "latest_materials_per_company": 1,
+            "ir_selection_mode": args.ir_selection_mode,
+            "latest_materials_per_company": (
+                1 if args.ir_selection_mode == "latest" else None
+            ),
+            "materials_per_company_per_year": (
+                args.materials_per_company_per_year
+                if args.ir_selection_mode == "annual-snapshots"
+                else None
+            ),
+            "max_years_per_company": (
+                args.max_years_per_company
+                if args.ir_selection_mode == "annual-snapshots"
+                else None
+            ),
+            "minimum_years_per_company": args.minimum_years_per_company,
         },
         "frozen_controls": {
             "same_company_set": True,
@@ -378,9 +551,16 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             "same_prompt": True,
             "same_models": True,
             "same_reducer": True,
-            "only_treatment_difference": "addition of one latest PIT-available KIND IR PDF",
+            "only_treatment_difference": (
+                "addition of one annual PIT-available KIND IR PDF per year"
+                if args.ir_selection_mode == "annual-snapshots"
+                else "addition of one latest PIT-available KIND IR PDF"
+            ),
             "shard_size": 5,
             "incremental_ir_required": True,
+            "longitudinal_ir_required": (
+                args.ir_selection_mode == "annual-snapshots"
+            ),
             "dart_base_byte_identity_required": True,
             "treatment_requires_accepted_ir": True,
         },
@@ -410,6 +590,21 @@ def prepare(args: argparse.Namespace) -> dict[str, Any]:
             status: sum(row["status"] == status for row in parse_rows)
             for status in sorted({str(row["status"]) for row in parse_rows})
         },
+        "quality_gate": {
+            "passed_document_count": sum(
+                row.get("quality_gate_passed") is True for row in parse_rows
+            ),
+            "failed_document_count": sum(
+                row.get("status") == "PASS"
+                and row.get("quality_gate_passed") is not True
+                for row in parse_rows
+            ),
+            "company_count_with_minimum_usable_years": sum(
+                row["quality_usable_year_count"]
+                >= args.minimum_years_per_company
+                for row in cohort_rows
+            ),
+        },
         "ocr": {
             "engine": args.ir_ocr_engine,
             "device": args.ir_ocr_device,
@@ -438,7 +633,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--fixed-cohort",
         help="cohort CSV whose ticker order is preserved exactly",
     )
+    parser.add_argument(
+        "--filter-fixed-cohort-by-ir-years",
+        action="store_true",
+        help=(
+            "preserve fixed-cohort order but exclude companies that fail the "
+            "minimum-years-per-company availability rule"
+        ),
+    )
     parser.add_argument("--seed", default="source-ablation-v1")
+    parser.add_argument(
+        "--ir-selection-mode",
+        choices=["latest", "annual-snapshots"],
+        default="latest",
+        help="select one latest IR document or one latest document from each year",
+    )
+    parser.add_argument(
+        "--materials-per-company-per-year",
+        type=int,
+        default=1,
+    )
+    parser.add_argument("--max-years-per-company", type=int, default=5)
+    parser.add_argument(
+        "--minimum-years-per-company",
+        type=int,
+        default=1,
+        help="exclude companies with fewer distinct PIT-available IR years",
+    )
     parser.add_argument("--requests-per-second", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--retries", type=int, default=4)

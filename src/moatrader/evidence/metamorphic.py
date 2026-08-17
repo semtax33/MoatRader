@@ -144,6 +144,7 @@ def audit_company_metamorphs(
     issuer_id: str | None,
     maximum_atomic_units: int | None,
     maximum_ir_atomic_units: int | None = None,
+    preserve_ir_document_coverage: bool = False,
 ) -> dict[str, object]:
     directory = Path(company_directory)
     chunks = list(_read_jsonl(directory / "chunks.jsonl", SemanticChunk))
@@ -241,6 +242,7 @@ def audit_company_metamorphs(
                 *select_atomic_evidence_units(
                     transformed_ir_units,
                     maximum_ir_atomic_units,
+                    preserve_document_coverage=preserve_ir_document_coverage,
                 ),
             ]
         else:

@@ -388,6 +388,8 @@ def _moat_run(args: argparse.Namespace) -> int:
         maximum_atomic_evidence_units=args.maximum_atomic_evidence_units,
         maximum_ir_atomic_evidence_units=args.maximum_ir_atomic_evidence_units,
         incremental_ir_mode=args.incremental_ir,
+        longitudinal_ir_mode=args.longitudinal_ir,
+        minimum_longitudinal_ir_years=args.minimum_longitudinal_ir_years,
         consolidate_section_summaries=args.consolidate_section_summaries,
         ir_ocr_engine=args.ir_ocr_engine,
         ir_ocr_device=args.ir_ocr_device,
@@ -812,6 +814,18 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="freeze the DART assessment and evaluate IR only as a deterministic incremental delta",
+    )
+    moat_run.add_argument(
+        "--longitudinal-ir",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="preserve dated IR document coverage and require multi-year accepted evidence",
+    )
+    moat_run.add_argument(
+        "--minimum-longitudinal-ir-years",
+        type=int,
+        default=3,
+        help="minimum distinct usable IR years required for longitudinal treatment",
     )
     moat_run.add_argument(
         "--consolidate-section-summaries",

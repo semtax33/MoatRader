@@ -10,6 +10,7 @@ from moatrader.ingestion import (
     KindCompanyIdentity,
     KindIrClient,
     KindIrCollector,
+    KindIrMaterial,
 )
 
 
@@ -117,3 +118,61 @@ def test_kind_collector_selection_is_identity_only(tmp_path: Path) -> None:
     assert result.discovered_count == 0
     assert result.filings == []
     assert result.query["selection_policy"] == "availability-and-identity-only; no return data"
+
+
+class FakeMaterialClient:
+    search_url = "https://example.test/ir"
+
+    def __init__(self, materials: list[KindIrMaterial]) -> None:
+        self.materials = materials
+
+    def search_materials(self, **_kwargs: object) -> list[KindIrMaterial]:
+        return self.materials
+
+    @staticmethod
+    def download_pdf(_material: KindIrMaterial, *, max_bytes: int) -> bytes:
+        assert max_bytes > 0
+        return b"%PDF-1.7\nfixture"
+
+
+def test_kind_collector_selects_latest_material_from_each_recent_year(
+    tmp_path: Path,
+) -> None:
+    identity = KindCompanyIdentity(
+        ticker="123456",
+        issuer_id="issuer-1",
+        issuer_name="테스트",
+    )
+    materials = [
+        KindIrMaterial(
+            ir_seq=str(100 + index),
+            resoroom_type="1",
+            company_name="테스트",
+            listed_on=date(year, month, 1),
+            title=f"IR {year}-{month}",
+            attachment_index=1,
+            attachment_name=f"{year}-{month}.pdf",
+            attachment_url=f"https://example.test/{year}-{month}.pdf",
+        )
+        for index, (year, month) in enumerate(
+            [(2021, 6), (2022, 3), (2022, 11), (2023, 5), (2024, 8)]
+        )
+    ]
+    collector = KindIrCollector(
+        FakeMaterialClient(materials),  # type: ignore[arg-type]
+        BronzeFilingStore(tmp_path / "bronze"),
+    )
+
+    result = collector.collect(
+        begin_date=date(2021, 1, 1),
+        end_date=date(2024, 12, 31),
+        companies=[identity],
+        max_materials_per_company_per_year=1,
+        max_years_per_company=3,
+    )
+
+    assert [filing.source_document_id for filing in result.filings] == [
+        "KINDIR_102_1",
+        "KINDIR_103_1",
+        "KINDIR_104_1",
+    ]

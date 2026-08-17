@@ -9,7 +9,7 @@ from moatrader.runner.models import UniverseRunConfig
 from moatrader.evidence.atomic import ATOMIC_RUBRIC_VERSION, ATOMIC_SEGMENTATION_VERSION
 
 
-PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/5"
+PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/6"
 EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
@@ -31,6 +31,8 @@ EXECUTION_CONTRACT_FIELDS = (
     "maximum_atomic_evidence_units",
     "maximum_ir_atomic_evidence_units",
     "incremental_ir_mode",
+    "longitudinal_ir_mode",
+    "minimum_longitudinal_ir_years",
     "consolidate_section_summaries",
     "ir_ocr_engine",
     "ir_ocr_device",
@@ -56,7 +58,9 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["moat_rank_strategy"] = "PUBLIC_SCORE_THEN_STABLE_COMPONENTS_LEXICOGRAPHIC_V1"
     contract["raw_ordinal_global_rank_allowed"] = False
     contract["moat_architecture"] = (
-        "FROZEN_BASE_PLUS_IR_INCREMENTAL_ATOMIC_AUDIT"
+        "FROZEN_BASE_PLUS_LONGITUDINAL_IR_INCREMENTAL_ATOMIC_AUDIT"
+        if config.longitudinal_ir_mode
+        else "FROZEN_BASE_PLUS_IR_INCREMENTAL_ATOMIC_AUDIT"
         if config.incremental_ir_mode
         else "ATOMIC_AUDIT_PLUS_CONTEXTUAL_STRENGTH"
     )
@@ -73,7 +77,7 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["atomic_api_schema"] = "explicit-audit-fields/1"
     contract["atomic_output_token_cap"] = min(config.max_output_tokens, 2_000)
     contract["contextual_prompt_version"] = "contextual-moat-strength/2"
-    contract["ir_incremental_prompt_version"] = "ir-incremental-assessment/1"
+    contract["ir_incremental_prompt_version"] = "ir-incremental-assessment/2"
     contract["contextual_output_token_cap"] = min(config.max_output_tokens, 8_000)
     contract["prompt_cache_mode"] = "explicit"
     contract["prompt_cache_ttl"] = "30m"

@@ -749,6 +749,11 @@ def apply_ir_incremental_assessment(
     """
 
     known_ir_refs = {reference.ref_id for reference in ir_references}
+    ir_year_by_ref = {
+        reference.ref_id: reference.available_at.year
+        for reference in ir_references
+        if reference.available_at is not None
+    }
     actions: list[dict[str, object]] = []
 
     def refs(item: object, category: str) -> list[str]:
@@ -852,6 +857,20 @@ def apply_ir_incremental_assessment(
         valid_refs = refs(item, "outcome")
         if item.action == IrDeltaAction.NO_EFFECT or not valid_refs:
             continue
+        cited_years = sorted(
+            {ir_year_by_ref[reference_id] for reference_id in valid_refs if reference_id in ir_year_by_ref}
+        )
+        persistence_bucket = item.persistence_bucket
+        if persistence_bucket >= 2 and len(cited_years) < 2:
+            persistence_bucket = 1
+            actions.append(
+                {
+                    "category": "outcome",
+                    "type": item.evidence_type.value,
+                    "action": "CLAMP_SINGLE_PERIOD_PERSISTENCE",
+                    "cited_years": cited_years,
+                }
+            )
         key = item.evidence_type.value
         current = outcomes.get(key)
         if current is None and item.action not in {
@@ -863,7 +882,7 @@ def apply_ir_incremental_assessment(
             outcomes[key] = ContextualOutcomeAssessment(
                 evidence_type=item.evidence_type,
                 strength_bucket=item.strength_bucket,
-                persistence_bucket=item.persistence_bucket,
+                persistence_bucket=persistence_bucket,
                 reference_ids=valid_refs,
                 rationale=_qualitative_rationale(item.rationale),
             )
@@ -883,11 +902,11 @@ def apply_ir_incremental_assessment(
                         else min(current.strength_bucket, item.strength_bucket)
                     ),
                     "persistence_bucket": (
-                        max(current.persistence_bucket, item.persistence_bucket)
+                        max(current.persistence_bucket, persistence_bucket)
                         if strengthening
                         else 0
                         if contradiction
-                        else min(current.persistence_bucket, item.persistence_bucket)
+                        else min(current.persistence_bucket, persistence_bucket)
                     ),
                     "reference_ids": sorted(set(current.reference_ids) | set(valid_refs)),
                 }
@@ -959,7 +978,7 @@ def apply_ir_incremental_assessment(
         counterevidence=[counters[key] for key in sorted(counters)],
     )
     return merged, {
-        "schema_version": "ir-incremental-merge/1",
+        "schema_version": "ir-incremental-merge/2",
         "strategy": "FROZEN_DART_BASE_PLUS_VALIDATED_IR_DELTA",
         "material_delta_count": material_delta_count,
         "actions": actions,

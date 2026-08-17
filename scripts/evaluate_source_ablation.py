@@ -13,7 +13,7 @@ from typing import Any, Iterable
 from moatrader.runner.models import CompanyRunStatus, UniverseRunResult
 
 
-SCHEMA_VERSION = "moatrader-source-ablation-evaluation/2"
+SCHEMA_VERSION = "moatrader-source-ablation-evaluation/3"
 
 
 def _read_json(path: Path) -> Any:
@@ -218,6 +218,22 @@ def _company_metrics(company: Any) -> dict[str, Any]:
         "treatment_compliant": bool(treatment.get("treatment_compliant", False)),
         "ir_available": bool(treatment.get("IR_AVAILABLE", False)),
         "ir_usable": bool(treatment.get("IR_USABLE", False)),
+        "ir_document_count": int(treatment.get("ir_document_count", 0)),
+        "usable_ir_document_count": int(
+            treatment.get("usable_ir_document_count", 0)
+        ),
+        "available_ir_years": list(treatment.get("available_ir_years") or []),
+        "usable_ir_years": list(treatment.get("usable_ir_years") or []),
+        "accepted_ir_years": list(treatment.get("accepted_ir_years") or []),
+        "longitudinal_ir_mode": bool(
+            treatment.get("longitudinal_ir_mode", False)
+        ),
+        "longitudinal_ir_usable": bool(
+            treatment.get("longitudinal_ir_usable", False)
+        ),
+        "longitudinal_treatment_compliant": bool(
+            treatment.get("longitudinal_treatment_compliant", False)
+        ),
         "treatment_accepted_ir_item_count": int(
             treatment.get("accepted_ir_item_count", 0)
         ),
@@ -255,6 +271,24 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ir_atomic_card_count": sum(row["ir_atomic_card_count"] for row in rows),
         "ir_context_reference_count": sum(row["ir_context_reference_count"] for row in rows),
         "ir_quality_rejected_company_count": sum(row["ir_quality_rejection_count"] > 0 for row in rows),
+        "ir_document_count": _summary(
+            [row["ir_document_count"] for row in rows]
+        ),
+        "usable_ir_document_count": _summary(
+            [row["usable_ir_document_count"] for row in rows]
+        ),
+        "available_ir_year_count": _summary(
+            [len(row["available_ir_years"]) for row in rows]
+        ),
+        "usable_ir_year_count": _summary(
+            [len(row["usable_ir_years"]) for row in rows]
+        ),
+        "accepted_ir_year_count": _summary(
+            [len(row["accepted_ir_years"]) for row in rows]
+        ),
+        "longitudinal_treatment_compliant_company_count": sum(
+            row["longitudinal_treatment_compliant"] for row in rows
+        ),
         "audit_status": dict(Counter(row["audit_status"] for row in rows)),
         "usage": {
             "input_tokens": sum(row["input_tokens"] for row in rows),
@@ -355,8 +389,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         left_dart_ids = {value for value in left["source_document_ids"] if not value.startswith("KINDIR_")}
         right_dart_ids = {value for value in right["source_document_ids"] if not value.startswith("KINDIR_")}
         ir_ids = [value for value in right["source_document_ids"] if value.startswith("KINDIR_")]
-        if left_dart_ids != right_dart_ids or len(ir_ids) != 1:
-            raise ValueError(f"ticker {ticker}: treatment is not exactly one added IR document")
+        if left_dart_ids != right_dart_ids:
+            raise ValueError(f"ticker {ticker}: DART source document set changed")
+        if len(ir_ids) < args.minimum_ir_documents_per_company:
+            raise ValueError(
+                f"ticker {ticker}: only {len(ir_ids)} IR documents; "
+                f"minimum={args.minimum_ir_documents_per_company}"
+            )
+        if (
+            args.maximum_ir_documents_per_company is not None
+            and len(ir_ids) > args.maximum_ir_documents_per_company
+        ):
+            raise ValueError(
+                f"ticker {ticker}: {len(ir_ids)} IR documents; "
+                f"maximum={args.maximum_ir_documents_per_company}"
+            )
         paired.append(
             {
                 "ticker": ticker,
@@ -383,6 +430,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "ir_context_reference_count": right["ir_context_reference_count"],
                 "contextual_ir_item_count": right["contextual_ir_item_count"],
                 "accepted_ir_item_count": right["accepted_ir_item_count"],
+                "ir_document_count": right["ir_document_count"],
+                "usable_ir_document_count": right["usable_ir_document_count"],
+                "available_ir_year_count": len(right["available_ir_years"]),
+                "usable_ir_year_count": len(right["usable_ir_years"]),
+                "accepted_ir_year_count": len(right["accepted_ir_years"]),
+                "accepted_ir_years": right["accepted_ir_years"],
+                "longitudinal_ir_mode": right["longitudinal_ir_mode"],
+                "longitudinal_ir_usable": right["longitudinal_ir_usable"],
+                "longitudinal_treatment_compliant": right[
+                    "longitudinal_treatment_compliant"
+                ],
                 "ir_quality_rejected": right["ir_quality_rejection_count"] > 0,
                 "ir_available": right["ir_available"],
                 "ir_usable": right["ir_usable"],
@@ -465,6 +523,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "as_of": dart_result.as_of.isoformat(),
         "company_count": len(paired),
         "return_data_used": False,
+        "assignment_contract": {
+            "minimum_ir_documents_per_company": (
+                args.minimum_ir_documents_per_company
+            ),
+            "maximum_ir_documents_per_company": (
+                args.maximum_ir_documents_per_company
+            ),
+        },
         "treatment_contract_verified": True,
         "dart_only": _aggregate(list(dart_rows.values())),
         "dart_plus_ir": _aggregate(list(ir_rows.values())),
@@ -484,6 +550,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 row["treatment_compliant"] for row in paired
             ),
             "ir_usable_company_count": sum(row["ir_usable"] for row in paired),
+            "longitudinal_ir_usable_company_count": sum(
+                row["longitudinal_ir_usable"] for row in paired
+            ),
+            "longitudinal_treatment_compliant_company_count": sum(
+                row["longitudinal_treatment_compliant"] for row in paired
+            ),
+            "multi_year_accepted_ir_company_count": sum(
+                row["accepted_ir_year_count"] >= 2 for row in paired
+            ),
             "dart_base_input_identical_count": sum(
                 row["dart_base_input_identical"] for row in paired
             ),
@@ -525,10 +600,20 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     }
     output = Path(args.output).resolve()
     _write_json(output / "source-ablation-report.json", report)
-    fields = [key for key in paired[0] if key not in {"added_mechanism_types", "removed_mechanism_types", "added_outcome_types", "removed_outcome_types"}]
+    list_fields = {
+        "accepted_ir_years",
+        "added_mechanism_types",
+        "removed_mechanism_types",
+        "added_outcome_types",
+        "removed_outcome_types",
+    }
+    fields = [key for key in paired[0] if key not in list_fields]
     csv_rows = [
         {
             **row,
+            "accepted_ir_years": ";".join(
+                str(year) for year in row["accepted_ir_years"]
+            ),
             "added_mechanism_types": ";".join(row["added_mechanism_types"]),
             "removed_mechanism_types": ";".join(row["removed_mechanism_types"]),
             "added_outcome_types": ";".join(row["added_outcome_types"]),
@@ -539,7 +624,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     _write_csv(
         output / "source-ablation-paired.csv",
         csv_rows,
-        [*fields, "added_mechanism_types", "removed_mechanism_types", "added_outcome_types", "removed_outcome_types"],
+        [
+            *fields,
+            "accepted_ir_years",
+            "added_mechanism_types",
+            "removed_mechanism_types",
+            "added_outcome_types",
+            "removed_outcome_types",
+        ],
     )
     _write_markdown(output / "source-ablation-report.md", report)
     return report
@@ -551,13 +643,21 @@ def _pct(value: float | None) -> str:
 
 def _write_markdown(path: Path, report: dict[str, Any]) -> None:
     left, right, paired = report["dart_only"], report["dart_plus_ir"], report["paired"]
+    assignment = report["assignment_contract"]
+    minimum_ir = assignment["minimum_ir_documents_per_company"]
+    maximum_ir = assignment["maximum_ir_documents_per_company"]
+    assignment_text = (
+        f"회사별 PIT-가용 KIND IR PDF {minimum_ir}~{maximum_ir}건"
+        if maximum_ir is not None and maximum_ir != minimum_ir
+        else f"회사별 PIT-가용 KIND IR PDF {minimum_ir}건"
+    )
     lines = [
         "# DART-only vs DART+IR Source Ablation",
         "",
         f"- PIT 기준: {report['as_of']}",
         f"- 동일 표본: {report['company_count']}개사",
         "- 선택에 미래수익률 사용: 아니오",
-        "- Assignment: 회사별 최신 PIT-가용 KIND IR PDF 1건 추가",
+        f"- Assignment: {assignment_text} 추가",
         "- Treatment-compliant: accepted IR 근거가 score-producing claim까지 살아남은 경우만 인정",
         "- 비채택/품질탈락 IR: frozen DART score를 그대로 유지",
         "",
@@ -584,6 +684,9 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         f"- 최종 accepted item에 IR 근거가 남은 회사: {paired['accepted_ir_item_company_count']}개사",
         f"- Treatment-compliant 회사: {paired['treatment_compliant_company_count']}개사",
         f"- IR usable 회사: {paired['ir_usable_company_count']}개사",
+        f"- Longitudinal IR usable 회사: {paired['longitudinal_ir_usable_company_count']}개사",
+        f"- Longitudinal treatment-compliant 회사: {paired['longitudinal_treatment_compliant_company_count']}개사",
+        f"- 2개 이상 연도의 accepted IR 근거가 남은 회사: {paired['multi_year_accepted_ir_company_count']}개사",
         f"- DART base 입력 byte-identical: {paired['dart_base_input_identical_count']}/{report['company_count']}",
         f"- DART atomic selection 동일: {paired['dart_atomic_selection_identical_count']}/{report['company_count']}",
         f"- Treatment 미채택인데 점수가 변한 회사: {paired['noncompliant_score_change_count']}개사",
@@ -651,6 +754,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dart-only-repeat")
     parser.add_argument("--dart-plus-ir-repeat")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--minimum-ir-documents-per-company",
+        type=int,
+        default=1,
+        help="Minimum assigned PIT-available IR documents required per company.",
+    )
+    parser.add_argument(
+        "--maximum-ir-documents-per-company",
+        type=int,
+        default=1,
+        help=(
+            "Maximum assigned IR documents allowed per company. Set to 5 for "
+            "the longitudinal annual-snapshot experiment."
+        ),
+    )
     return parser
 
 

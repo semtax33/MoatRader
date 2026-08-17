@@ -43,6 +43,8 @@ class UniverseRunConfig(ContractModel):
     maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
     maximum_ir_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
     incremental_ir_mode: bool = False
+    longitudinal_ir_mode: bool = False
+    minimum_longitudinal_ir_years: int = Field(default=3, ge=2, le=10)
     consolidate_section_summaries: bool = True
     ir_ocr_engine: str = Field(default="none", pattern=r"^(none|paddle)$")
     ir_ocr_device: str = Field(default="cpu", min_length=1)
@@ -76,6 +78,8 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("evidence_ledger_directory requires experiment_id")
         if self.moat_model.lower().endswith("latest"):
             raise ValueError("moat_model must be an exact pinned model ID, not a -latest alias")
+        if self.longitudinal_ir_mode and not self.incremental_ir_mode:
+            raise ValueError("longitudinal_ir_mode requires incremental_ir_mode")
         return self
 
 

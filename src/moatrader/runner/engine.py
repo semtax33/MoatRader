@@ -118,7 +118,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.9.4"
+RUNNER_VERSION = "0.9.5"
 
 
 class MoatUniverseRunner:
@@ -296,13 +296,33 @@ class MoatUniverseRunner:
                 if source_type_by_document_id.get(assessment.source_document_id) != SourceType.IR
             ]
             ir_available = any(bundle.metadata.source_type == SourceType.IR for bundle in bundles)
+            available_ir_years = sorted(
+                {
+                    bundle.metadata.available_at.year
+                    for bundle in bundles
+                    if bundle.metadata.source_type == SourceType.IR
+                }
+            )
             usable_ir_bundles = [
                 bundle
                 for bundle in bundles
                 if bundle.metadata.source_type == SourceType.IR
                 and bundle.metadata.source_document_id not in rejected_ir_document_ids
             ]
-            ir_usable = bool(usable_ir_bundles)
+            usable_ir_years = sorted(
+                {bundle.metadata.available_at.year for bundle in usable_ir_bundles}
+            )
+            longitudinal_ir_available = (
+                len(available_ir_years) >= self.config.minimum_longitudinal_ir_years
+            )
+            longitudinal_ir_usable = (
+                len(usable_ir_years) >= self.config.minimum_longitudinal_ir_years
+            )
+            ir_usable = (
+                longitudinal_ir_usable
+                if self.config.longitudinal_ir_mode
+                else bool(usable_ir_bundles)
+            )
             quality_failure = rejected_base if self.config.incremental_ir_mode else rejected
             if quality_failure and not self.config.allow_low_quality:
                 details = "; ".join(
@@ -328,17 +348,49 @@ class MoatUniverseRunner:
                     not in rejected_ir_document_ids
                 ]
                 base_dedup = deduplicate_chunks(base_input_chunks)
-                ir_dedup = deduplicate_chunks(ir_input_chunks)
+                if self.config.longitudinal_ir_mode:
+                    ir_chunks = []
+                    ir_dedup_by_document: dict[str, object] = {}
+                    for document_id in sorted(
+                        {chunk.document_id for chunk in ir_input_chunks}
+                    ):
+                        document_dedup = deduplicate_chunks(
+                            [
+                                chunk
+                                for chunk in ir_input_chunks
+                                if chunk.document_id == document_id
+                            ]
+                        )
+                        ir_chunks.extend(document_dedup.kept)
+                        ir_dedup_by_document[document_id] = document_dedup
+                    ir_chunks.sort(
+                        key=lambda chunk: (
+                            str(chunk.metadata.get("available_at") or ""),
+                            chunk.document_id,
+                            chunk.chunk_id,
+                        )
+                    )
+                    ir_dedup_payload: object = {
+                        "schema_version": "longitudinal-ir-document-dedup/1",
+                        "by_document": ir_dedup_by_document,
+                        "cross_period_deduplication": False,
+                    }
+                else:
+                    ir_dedup = deduplicate_chunks(ir_input_chunks)
+                    ir_chunks = ir_dedup.kept
+                    ir_dedup_payload = ir_dedup
                 base_chunks = base_dedup.kept
-                ir_chunks = ir_dedup.kept
                 chunks = [*base_chunks, *ir_chunks]
                 self.store.write_json(
                     company_dir / "chunk-dedup.json",
                     {
                         "schema_version": "source-partitioned-chunk-dedup/1",
                         "base": base_dedup,
-                        "ir": ir_dedup,
+                        "ir": ir_dedup_payload,
                         "ir_cannot_displace_base": True,
+                        "longitudinal_periods_preserved": (
+                            self.config.longitudinal_ir_mode
+                        ),
                     },
                 )
             else:
@@ -351,7 +403,10 @@ class MoatUniverseRunner:
 
             issuer_id = company.issuer_id or bundles[0].metadata.issuer_id
             base_strength_context = self.strength_context_builder.build(base_chunks)
-            ir_strength_context = self.strength_context_builder.build(ir_chunks)
+            ir_strength_context = self.strength_context_builder.build(
+                ir_chunks,
+                preserve_document_coverage=self.config.longitudinal_ir_mode,
+            )
             strength_context = (
                 self._combine_strength_contexts(base_strength_context, ir_strength_context)
                 if self.config.incremental_ir_mode
@@ -413,6 +468,7 @@ class MoatUniverseRunner:
                 select_atomic_evidence_units(
                     ir_atomic_units,
                     self.config.maximum_ir_atomic_evidence_units,
+                    preserve_document_coverage=self.config.longitudinal_ir_mode,
                 )
                 if self.config.incremental_ir_mode
                 else []
@@ -634,7 +690,7 @@ class MoatUniverseRunner:
 
             ir_incremental_assessment: IrIncrementalAssessment | None = None
             ir_incremental_merge: dict[str, object] = {
-                "schema_version": "ir-incremental-merge/1",
+                "schema_version": "ir-incremental-merge/2",
                 "strategy": "FROZEN_DART_BASE_PLUS_VALIDATED_IR_DELTA",
                 "material_delta_count": 0,
                 "actions": [],
@@ -682,11 +738,19 @@ class MoatUniverseRunner:
                     )
                 )
             elif self.config.incremental_ir_mode:
-                ir_incremental_merge["reason"] = (
-                    "IR_QUALITY_GATE_FAILED"
-                    if ir_available and not ir_usable
-                    else "NO_USABLE_IR_CONTEXT"
-                )
+                if (
+                    self.config.longitudinal_ir_mode
+                    and not longitudinal_ir_usable
+                ):
+                    ir_incremental_merge["reason"] = (
+                        "INSUFFICIENT_LONGITUDINAL_IR_YEARS"
+                    )
+                else:
+                    ir_incremental_merge["reason"] = (
+                        "IR_QUALITY_GATE_FAILED"
+                        if ir_available and not ir_usable
+                        else "NO_USABLE_IR_CONTEXT"
+                    )
             self.store.write_json(
                 company_dir / "ir-incremental-merge.json",
                 ir_incremental_merge,
@@ -1168,9 +1232,35 @@ class MoatUniverseRunner:
             ir_reference_ids = {
                 reference.ref_id for reference in ir_strength_context.references
             }
+            ir_reference_by_id = {
+                reference.ref_id: reference
+                for reference in ir_strength_context.references
+            }
             ir_evidence_ids = {
                 card.evidence_id for card in cards if card.source_type == SourceType.IR
             }
+            ir_card_by_id = {
+                card.evidence_id: card
+                for card in cards
+                if card.source_type == SourceType.IR
+            }
+            atomic_unit_by_id = {unit.chunk_id: unit for unit in evidence_chunks}
+
+            def atomic_year(evidence_id: str) -> int | None:
+                card = ir_card_by_id.get(evidence_id)
+                unit = (
+                    atomic_unit_by_id.get(card.source_chunk_id)
+                    if card is not None
+                    else None
+                )
+                value = unit.metadata.get("available_at") if unit is not None else None
+                if not value:
+                    return None
+                try:
+                    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).year
+                except ValueError:
+                    return None
+
             accepted_ir_items: list[dict[str, object]] = []
             for category, items in (
                 ("mechanism", reconciled.mechanisms),
@@ -1183,19 +1273,72 @@ class MoatUniverseRunner:
                         set(item.atomic_evidence_ids) & ir_evidence_ids
                     )
                     if accepted_refs or accepted_evidence:
+                        accepted_documents = sorted(
+                            {
+                                ir_reference_by_id[reference_id].document_id
+                                for reference_id in accepted_refs
+                                if reference_id in ir_reference_by_id
+                            }
+                            | {
+                                atomic_unit_by_id[ir_card_by_id[evidence_id].source_chunk_id].document_id
+                                for evidence_id in accepted_evidence
+                                if evidence_id in ir_card_by_id
+                                and ir_card_by_id[evidence_id].source_chunk_id
+                                in atomic_unit_by_id
+                            }
+                        )
+                        accepted_years = sorted(
+                            {
+                                ir_reference_by_id[reference_id].available_at.year
+                                for reference_id in accepted_refs
+                                if reference_id in ir_reference_by_id
+                                and ir_reference_by_id[reference_id].available_at
+                                is not None
+                            }
+                            | {
+                                year
+                                for evidence_id in accepted_evidence
+                                if (year := atomic_year(evidence_id)) is not None
+                            }
+                        )
                         accepted_ir_items.append(
                             {
                                 "category": category,
                                 "evidence_type": item.evidence_type.value,
                                 "ir_reference_ids": accepted_refs,
                                 "ir_atomic_evidence_ids": accepted_evidence,
+                                "ir_document_ids": accepted_documents,
+                                "ir_years": accepted_years,
                             }
                         )
-            treatment_compliant = bool(
+            accepted_ir_document_ids = sorted(
+                {
+                    document_id
+                    for item in accepted_ir_items
+                    for document_id in item["ir_document_ids"]
+                }
+            )
+            accepted_ir_years = sorted(
+                {
+                    year
+                    for item in accepted_ir_items
+                    for year in item["ir_years"]
+                }
+            )
+            ordinary_treatment_compliant = bool(
                 self.config.incremental_ir_mode
                 and ir_available
                 and ir_usable
                 and accepted_ir_items
+            )
+            longitudinal_treatment_compliant = bool(
+                ordinary_treatment_compliant
+                and len(accepted_ir_years) >= 2
+            )
+            treatment_compliant = (
+                longitudinal_treatment_compliant
+                if self.config.longitudinal_ir_mode
+                else ordinary_treatment_compliant
             )
             score = combined_score if treatment_compliant else base_score
             rank_refinement, rank_refinement_status = derive_rank_refinement(
@@ -1217,12 +1360,34 @@ class MoatUniverseRunner:
                 combined_score,
             )
             treatment_audit = {
-                "schema_version": "ir-treatment-audit/1",
+                "schema_version": "ir-treatment-audit/2",
                 "IR_AVAILABLE": ir_available,
                 "IR_USABLE": ir_usable,
                 "incremental_ir_mode": self.config.incremental_ir_mode,
+                "longitudinal_ir_mode": self.config.longitudinal_ir_mode,
+                "minimum_longitudinal_ir_years": (
+                    self.config.minimum_longitudinal_ir_years
+                ),
+                "longitudinal_ir_available": longitudinal_ir_available,
+                "longitudinal_ir_usable": longitudinal_ir_usable,
+                "ir_document_count": len(
+                    [
+                        bundle
+                        for bundle in bundles
+                        if bundle.metadata.source_type == SourceType.IR
+                    ]
+                ),
+                "usable_ir_document_count": len(usable_ir_bundles),
+                "available_ir_years": available_ir_years,
+                "usable_ir_years": usable_ir_years,
                 "accepted_ir_item_count": len(accepted_ir_items),
                 "accepted_ir_items": accepted_ir_items,
+                "accepted_ir_document_ids": accepted_ir_document_ids,
+                "accepted_ir_years": accepted_ir_years,
+                "ordinary_treatment_compliant": ordinary_treatment_compliant,
+                "longitudinal_treatment_compliant": (
+                    longitudinal_treatment_compliant
+                ),
                 "treatment_compliant": treatment_compliant,
                 "frozen_base_input_sha256": strength_request.input_sha256,
                 "base_atomic_unit_set_sha256": atomic_unit_set_sha256(
@@ -1353,6 +1518,7 @@ class MoatUniverseRunner:
                 issuer_id=dossier.issuer_id,
                 maximum_atomic_units=self.config.maximum_atomic_evidence_units,
                 maximum_ir_atomic_units=self.config.maximum_ir_atomic_evidence_units,
+                preserve_ir_document_coverage=self.config.longitudinal_ir_mode,
             )
             self.store.write_json(company_dir / "metamorphic-audit.json", metamorphic_audit)
             if metamorphic_audit["passed"] is not True:
@@ -2345,6 +2511,10 @@ class MoatUniverseRunner:
                     "maximum_atomic_evidence_units": self.config.maximum_atomic_evidence_units,
                     "maximum_ir_atomic_evidence_units": self.config.maximum_ir_atomic_evidence_units,
                     "incremental_ir_mode": self.config.incremental_ir_mode,
+                    "longitudinal_ir_mode": self.config.longitudinal_ir_mode,
+                    "minimum_longitudinal_ir_years": (
+                        self.config.minimum_longitudinal_ir_years
+                    ),
                     "consolidate_section_summaries": self.config.consolidate_section_summaries,
                     "validation_attempts": self.config.validation_attempts,
                     "experiment_id": self.config.experiment_id,

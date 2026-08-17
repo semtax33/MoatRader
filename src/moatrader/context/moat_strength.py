@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import Field
 
 from moatrader.canonical.ids import stable_id
@@ -43,6 +45,7 @@ class ContextEvidenceReference(ContractModel):
     node_ids: list[str] = Field(min_length=1)
     raw_quote: str = Field(min_length=1)
     source_types: list[SourceType] = Field(default_factory=list)
+    available_at: datetime | None = None
 
 
 class MoatStrengthContext(ContractModel):
@@ -53,6 +56,9 @@ class MoatStrengthContext(ContractModel):
     selected_chunk_ids: list[str]
     dropped_chunk_ids: list[str]
     question_coverage: dict[str, int]
+    available_document_count: int = 0
+    selected_document_count: int = 0
+    selected_document_ids: list[str] = Field(default_factory=list)
     retrieval: ChunkRetrievalResult
     references: list[ContextEvidenceReference]
     markdown: str
@@ -83,7 +89,12 @@ class MoatStrengthContextBuilder:
             minimums=STRENGTH_ROLE_MINIMUMS,
         )
 
-    def build(self, chunks: list[SemanticChunk]) -> MoatStrengthContext:
+    def build(
+        self,
+        chunks: list[SemanticChunk],
+        *,
+        preserve_document_coverage: bool = False,
+    ) -> MoatStrengthContext:
         eligible = sorted(
             (
                 chunk
@@ -117,6 +128,25 @@ class MoatStrengthContextBuilder:
             relevance=balanced_relevance,
         )
         selected = list(allocation.selected)
+        protected_ids: set[str] = set()
+        if preserve_document_coverage:
+            by_document: dict[str, list[SemanticChunk]] = {}
+            for chunk in eligible:
+                by_document.setdefault(chunk.document_id, []).append(chunk)
+            for document_chunks in by_document.values():
+                anchor = max(
+                    document_chunks,
+                    key=lambda chunk: (
+                        balanced_relevance.get(chunk.chunk_id, 0.0),
+                        -chunk.token_count,
+                        chunk.chunk_id,
+                    ),
+                )
+                protected_ids.add(anchor.chunk_id)
+            selected_ids = {
+                chunk.chunk_id for chunk in [*selected, *eligible] if chunk.chunk_id in protected_ids
+            } | {chunk.chunk_id for chunk in selected}
+            selected = [chunk for chunk in eligible if chunk.chunk_id in selected_ids]
         references = self._references(selected)
         markdown = self._render(selected, references)
         token_count = self.tokens.count(markdown)
@@ -136,7 +166,10 @@ class MoatStrengthContextBuilder:
                     chunk.chunk_id,
                 )
 
-            removable = sorted(selected, key=keep_priority)
+            removable = sorted(
+                (chunk for chunk in selected if chunk.chunk_id not in protected_ids),
+                key=keep_priority,
+            )
             selected_ids = {chunk.chunk_id for chunk in selected}
             for chunk in removable:
                 if token_count <= allocation.token_budget:
@@ -146,6 +179,10 @@ class MoatStrengthContextBuilder:
                 references = self._references(selected)
                 markdown = self._render(selected, references)
                 token_count = self.tokens.count(markdown)
+            if token_count > allocation.token_budget and preserve_document_coverage:
+                raise ValueError(
+                    "document-balanced MOAT context cannot fit one chunk per document"
+                )
 
         selected_ids = {chunk.chunk_id for chunk in selected}
         selected_hit_coverage = {
@@ -164,6 +201,9 @@ class MoatStrengthContextBuilder:
                 chunk.chunk_id for chunk in eligible if chunk.chunk_id not in selected_ids
             ],
             question_coverage=selected_hit_coverage,
+            available_document_count=len({chunk.document_id for chunk in eligible}),
+            selected_document_count=len({chunk.document_id for chunk in selected}),
+            selected_document_ids=sorted({chunk.document_id for chunk in selected}),
             retrieval=retrieval,
             references=references,
             markdown=markdown,
@@ -188,6 +228,7 @@ class MoatStrengthContextBuilder:
                     {ref.source_type for ref in chunk.source_refs},
                     key=lambda value: value.value,
                 ),
+                available_at=chunk.metadata.get("available_at"),
             )
             for chunk in chunks
             for raw_quote in split_atomic_evidence_text(chunk.markdown)
@@ -221,6 +262,7 @@ class MoatStrengthContextBuilder:
                 [
                     "## SOURCE SECTION",
                     f"Source: {','.join(source_types) if source_types else 'OTHER'}",
+                    f"Available: {chunk.metadata.get('available_at') or 'UNKNOWN'}",
                     f"Role: {chunk.section_role.value if chunk.section_role else 'OTHER'}",
                     f"Section: {' > '.join(chunk.section_path) or '(root)'}",
                     "--- BEGIN UNTRUSTED SOURCE ---",
