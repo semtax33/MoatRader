@@ -209,6 +209,7 @@ Backtest가 편향을 자동으로 없애 주는 것도 아닙니다. 역사적 
 - [DART / SEC 수집과 Bronze 저장 계약](docs/ingestion.md)
 - [Universe manifest 형식](docs/universe-manifest.md)
 - [Expectation Analysis 계약](docs/expectation-analysis.md)
+- [Expectation GAP DART/IR/산업보고서 소스 ablation](docs/expectation-gap-source-ablation.md)
 - [요구사항별 구현 감사표](docs/requirements-audit.md)
 
 기본 screening은 다음의 연구 질문을 구현합니다.

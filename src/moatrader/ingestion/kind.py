@@ -162,7 +162,13 @@ class KindIrClient:
         }
 
     def _parse_list(self, content: bytes) -> list[KindIrMaterial]:
-        text = content.decode("euc-kr", errors="replace")
+        # KIND historically served EUC-KR but now also serves UTF-8.  Prefer a
+        # strict UTF-8 decode and retain the legacy fallback so company names
+        # remain joinable instead of silently becoming mojibake.
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = content.decode("euc-kr", errors="replace")
         root = html.fromstring(text)
         materials: list[KindIrMaterial] = []
         for row in root.xpath("//tr[td]"):

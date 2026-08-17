@@ -8,6 +8,15 @@ from moatrader.expectations.pipeline import (
     ExpectationAnalysisEngine,
     ExpectationAnalysisRequest,
 )
+from moatrader.expectations.scoring import (
+    ExpectationScoreStatus,
+    ExpectationThreeAxisScore,
+    FragilityComponents,
+    ThreeAxisPercentiles,
+    average_tie_percentiles,
+    build_three_axis_score,
+    weighted_geometric_score,
+)
 
 __all__ = [
     "ExpectationAnalysis",
@@ -16,4 +25,11 @@ __all__ = [
     "ExpectationGapDirection",
     "ExpectationGapEvaluation",
     "ExpectationGapEvaluator",
+    "ExpectationScoreStatus",
+    "ExpectationThreeAxisScore",
+    "FragilityComponents",
+    "ThreeAxisPercentiles",
+    "average_tie_percentiles",
+    "build_three_axis_score",
+    "weighted_geometric_score",
 ]

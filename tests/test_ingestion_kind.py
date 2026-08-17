@@ -72,6 +72,16 @@ def test_kind_client_parses_euc_kr_list_and_quotes_pdf_url() -> None:
     assert content.startswith(b"%PDF-")
 
 
+def test_kind_client_also_parses_current_utf8_list() -> None:
+    client = KindIrClient(FakeKindHttp())
+
+    materials = client._parse_list(LIST_HTML.encode("utf-8"))
+
+    assert len(materials) == 1
+    assert materials[0].company_name == "리노공업"
+    assert materials[0].title == "기업설명회(IR) 개최"
+
+
 def test_kind_collector_uses_conservative_day_level_pit_and_ir_namespace(tmp_path: Path) -> None:
     http = FakeKindHttp()
     store = BronzeFilingStore(tmp_path)
