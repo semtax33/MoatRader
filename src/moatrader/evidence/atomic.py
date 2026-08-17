@@ -7,11 +7,22 @@ from collections import defaultdict
 
 from moatrader.canonical.ids import stable_id
 from moatrader.canonical.models import SectionRole, SourceRef, SourceType
+from moatrader.evidence.models import (
+    CandidateAtomicAuditDecision,
+    CandidateAtomicAuditResult,
+    CandidateAuditReason,
+    CandidateMechanism,
+    CandidateSupportStatus,
+    ContextualMoatAssessment,
+    EconomicScope,
+    EvidenceCard,
+    EvidenceDirection,
+)
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
 
 
 ATOMIC_SEGMENTATION_VERSION = "atomic-evidence/2"
-ATOMIC_RUBRIC_VERSION = "structural-moat-rubric/3"
+ATOMIC_RUBRIC_VERSION = "structural-moat-rubric/9"
 
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 _HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
@@ -232,6 +243,11 @@ def build_atomic_evidence_units(
                     "atomic_rubric_version": ATOMIC_RUBRIC_VERSION,
                     "origin_chunk_ids": sorted({chunk.chunk_id for chunk in origin_chunks}),
                     "source_type": _source_type(canonical_origin).value,
+                    "source_document_id": canonical_origin.metadata.get(
+                        "source_document_id",
+                        document_id,
+                    ),
+                    "available_at": canonical_origin.metadata.get("available_at"),
                 },
             )
         )
@@ -241,15 +257,21 @@ def build_atomic_evidence_units(
 def select_atomic_evidence_units(
     units: list[SemanticChunk],
     maximum: int | None,
+    *,
+    preserve_document_coverage: bool = False,
 ) -> list[SemanticChunk]:
     """Content-ranked set selection with no presentation-order tie breaker."""
 
-    unique: dict[str, SemanticChunk] = {}
+    unique: dict[tuple[str, str | None], SemanticChunk] = {}
     for unit in units:
-        key = str(unit.metadata["atomic_evidence_key"])
+        key = (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id if preserve_document_coverage else None,
+        )
         current = unique.get(key)
         if current is None or (unit.document_id, unit.chunk_id) < (current.document_id, current.chunk_id):
             unique[key] = unit
+
     def relevance(unit: SemanticChunk) -> tuple[int, int]:
         keyword_count = min(20, len(_MOAT_TERMS_RE.findall(unit.markdown)))
         return _ROLE_WEIGHT.get(unit.section_role or SectionRole.OTHER, 1) + keyword_count, keyword_count
@@ -276,8 +298,211 @@ def select_atomic_evidence_units(
             str(unit.metadata["atomic_evidence_key"]),
         ),
     )
-    selected = ranked if maximum is None else ranked[:maximum]
-    return sorted(selected, key=lambda unit: str(unit.metadata["atomic_evidence_key"]))
+    if maximum is None or not preserve_document_coverage:
+        selected = ranked if maximum is None else ranked[:maximum]
+    else:
+        anchors_by_document: dict[str, SemanticChunk] = {}
+        for unit in ranked:
+            anchors_by_document.setdefault(unit.document_id, unit)
+        anchors = sorted(
+            anchors_by_document.values(),
+            key=lambda unit: (
+                -relevance(unit)[0],
+                -relevance(unit)[1],
+                unit.token_count,
+                unit.document_id,
+                str(unit.metadata["atomic_evidence_key"]),
+            ),
+        )
+        if len(anchors) > maximum:
+            raise ValueError(
+                "maximum atomic evidence units cannot preserve document coverage"
+            )
+        anchor_ids = {unit.chunk_id for unit in anchors}
+        remaining = [unit for unit in ranked if unit.chunk_id not in anchor_ids]
+        selected = [*anchors, *remaining[: maximum - len(anchors)]]
+    return sorted(
+        selected,
+        key=lambda unit: (
+            str(unit.metadata["atomic_evidence_key"]),
+            unit.document_id,
+            unit.chunk_id,
+        ),
+    )
+
+
+def select_context_cited_atomic_units(
+    units: list[SemanticChunk],
+    assessment: ContextualMoatAssessment,
+    *,
+    chunk_id_by_ref: dict[str, str],
+    raw_quote_by_ref: dict[str, str],
+) -> list[SemanticChunk]:
+    """Select every atomic unit needed to audit contextual source citations.
+
+    Exact quote overlap is preferred. If a cited source span cannot be mapped
+    to one atomic sentence/row, all units from that canonical chunk are kept;
+    correctness takes priority over a smaller audit request set.
+    """
+
+    reference_ids = [
+        reference_id
+        for item in [
+            *assessment.mechanisms,
+            *assessment.outcome_confirmation,
+            *assessment.counterevidence,
+        ]
+        for reference_id in item.reference_ids
+    ]
+    unit_ids_by_ref = map_context_references_to_atomic_units(
+        units,
+        chunk_id_by_ref=chunk_id_by_ref,
+        raw_quote_by_ref=raw_quote_by_ref,
+    )
+    unit_by_id = {unit.chunk_id: unit for unit in units}
+    selected = {
+        unit_id: unit_by_id[unit_id]
+        for reference_id in reference_ids
+        for unit_id in unit_ids_by_ref.get(reference_id, [])
+        if unit_id in unit_by_id
+    }
+    return sorted(
+        selected.values(),
+        key=lambda unit: str(unit.metadata["atomic_evidence_key"]),
+    )
+
+
+def map_context_references_to_atomic_units(
+    units: list[SemanticChunk],
+    *,
+    chunk_id_by_ref: dict[str, str],
+    raw_quote_by_ref: dict[str, str],
+) -> dict[str, list[str]]:
+    """Hydrate each opaque reference to its deterministic atomic source unit."""
+
+    result: dict[str, list[str]] = {}
+    for reference_id, origin_chunk_id in chunk_id_by_ref.items():
+        quote = normalize_atomic_text(raw_quote_by_ref.get(reference_id, "")).casefold()
+        origin_candidates = [
+            unit
+            for unit in units
+            if origin_chunk_id in set(unit.metadata.get("origin_chunk_ids") or [])
+        ]
+        exact = [
+            unit
+            for unit in origin_candidates
+            if (
+                quote
+                and (unit_text := normalize_atomic_text(unit.markdown).casefold())
+                and (unit_text == quote or unit_text in quote or quote in unit_text)
+            )
+        ]
+        # A reference generated by the same atomic splitter should always have
+        # an exact match. The origin fallback preserves audit completeness for
+        # legacy or externally constructed manifests.
+        result[reference_id] = sorted(
+            {unit.chunk_id for unit in (exact or origin_candidates)}
+        )
+    return result
+
+
+def build_candidate_atomic_evidence_allowlist(
+    candidates: list[CandidateMechanism],
+    evidence: list[EvidenceCard],
+    atomic_units: list[SemanticChunk],
+    *,
+    atomic_unit_ids_by_ref: dict[str, list[str]],
+) -> dict[str, list[str]]:
+    """Bind each contextual candidate to atomic evidence from its references.
+
+    This is an identity/grounding allowlist, not semantic matching. The LLM can
+    only judge whether a candidate is supported by evidence already mapped to
+    that candidate's Python-owned source references.
+    """
+
+    available_unit_ids = {unit.chunk_id for unit in atomic_units}
+    result: dict[str, list[str]] = {}
+    for candidate in candidates:
+        candidate_unit_ids = {
+            unit_id
+            for reference_id in candidate.reference_ids
+            for unit_id in atomic_unit_ids_by_ref.get(reference_id, [])
+            if unit_id in available_unit_ids
+        }
+        result[candidate.candidate_id] = sorted(
+            {
+                card.evidence_id
+                for card in evidence
+                if card.source_chunk_id in candidate_unit_ids
+            }
+        )
+    return result
+
+
+def build_candidate_targeted_atomic_audit(
+    candidates: list[CandidateMechanism],
+    evidence: list[EvidenceCard],
+    *,
+    allowed_evidence_ids: dict[str, list[str]],
+) -> CandidateAtomicAuditResult:
+    """Bind context candidates to prior atomic judgments by exact identity.
+
+    The atomic LLM has already classified each source span. A second semantic
+    LLM vote made exact positive evidence less stable, so Python now performs
+    only candidate/ref/type/scope allowlist checks and emits explicit candidate
+    decisions. There is no fuzzy post-hoc quote matching.
+    """
+
+    card_by_id = {card.evidence_id: card for card in evidence}
+    decisions: list[CandidateAtomicAuditDecision] = []
+    for candidate in candidates:
+        allowed = [
+            card_by_id[evidence_id]
+            for evidence_id in allowed_evidence_ids.get(candidate.candidate_id, [])
+            if evidence_id in card_by_id
+        ]
+        supporting = sorted(
+            card.evidence_id
+            for card in allowed
+            if card.direction == EvidenceDirection.MOAT_POSITIVE
+            and card.evidence_type == candidate.evidence_type
+            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+        )
+        contradicting = sorted(
+            card.evidence_id
+            for card in allowed
+            if card.direction == EvidenceDirection.MOAT_NEGATIVE
+            and card.economic_scope in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+        )
+        if supporting:
+            support = CandidateSupportStatus.SUPPORTED
+            reason = CandidateAuditReason.EXPLICIT_CAUSAL_BARRIER
+        elif contradicting:
+            support = CandidateSupportStatus.CONTRADICTED
+            reason = CandidateAuditReason.CONTRADICTED_BY_ATOMIC_EVIDENCE
+        elif any(
+            card.direction == EvidenceDirection.MOAT_POSITIVE
+            and card.economic_scope not in {EconomicScope.COMPANY, EconomicScope.SEGMENT}
+            for card in allowed
+        ):
+            support = CandidateSupportStatus.NOT_SUPPORTED
+            reason = CandidateAuditReason.INDUSTRY_OR_CATEGORY_ONLY
+        elif any(card.direction == EvidenceDirection.MOAT_POSITIVE for card in allowed):
+            support = CandidateSupportStatus.NOT_SUPPORTED
+            reason = CandidateAuditReason.TYPE_MISMATCH
+        else:
+            support = CandidateSupportStatus.INSUFFICIENT
+            reason = CandidateAuditReason.INSUFFICIENT_ATOMIC_EVIDENCE
+        decisions.append(
+            CandidateAtomicAuditDecision(
+                candidate_id=candidate.candidate_id,
+                support=support,
+                reason=reason,
+                supporting_atomic_evidence_ids=supporting,
+                contradicting_atomic_evidence_ids=contradicting,
+            )
+        )
+    return CandidateAtomicAuditResult(decisions=decisions)
 
 
 def atomic_unit_set_sha256(units: list[SemanticChunk]) -> str:

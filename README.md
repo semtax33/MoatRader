@@ -2,7 +2,7 @@
 
 비결정적인 LLM을 금융 의사결정에 사용할 때 생기는 **evidence instability**를 PIT(point-in-time), provenance, metamorphic testing, deterministic scoring으로 통제하는 투자 리서치 파이프라인입니다.
 
-MoatRader의 목표는 “LLM이 추천한 종목”을 만드는 것이 아닙니다. 같은 경제적 사실이 문장 순서, 중복, 요약문, formatting 변화 때문에 다른 점수로 바뀌지 않도록 **LLM의 역할을 atomic evidence 분류로 제한하고 최종 판단을 감사 가능한 Python 로직으로 옮기는 것**이 핵심입니다.
+MoatRader의 목표는 “LLM이 추천한 종목”을 만드는 것이 아닙니다. 같은 경제적 사실이 문장 순서, 중복, 요약문, formatting 변화 때문에 다른 점수로 바뀌지 않도록 **LLM은 atomic grounding과 contextual economic-strength attribute extraction을 담당하고, 최종 점수는 감사 가능한 Python reducer가 계산**합니다.
 
 | 문제 | MoatRader의 통제 방식 |
 | --- | --- |
@@ -11,7 +11,7 @@ MoatRader의 목표는 “LLM이 추천한 종목”을 만드는 것이 아닙�
 | 생성 요약이 원문처럼 다시 채점됨 | generated summary를 scoring candidate에서 제외 |
 | 인용과 숫자를 원문에서 확인하기 어려움 | Evidence ID → node/fact → raw quote provenance |
 | 미래 공시·가격이 과거 평가에 섞임 | timezone-aware `available_at`과 PIT filtering |
-| 모델 출력이 MOAT·가치평가를 직접 결정함 | LLM은 분류만 수행, MOAT와 DCF는 deterministic Python |
+| 모델 출력이 MOAT·가치평가를 직접 결정함 | LLM은 grounded attribute를 추출하고, MOAT와 DCF는 deterministic Python이 계산 |
 | 검증되지 않은 설정으로 대규모 비용이 발생함 | 5종목 초과 실행은 통과한 preflight report 없이는 차단 |
 
 ## 핵심 아이디어
@@ -26,18 +26,20 @@ CanonicalDocumentBundle ── AST · StructuredFact · Asset · Provenance
 Deterministic Atomic Evidence
           │
           ▼
-LLM: fixed-rubric classification only
+                 ┌─ Audit Lane: atomic fixed-rubric grounding
+Canonical chunks┤
+                 └─ Strength Lane: broad contextual attribute extraction
           │
           ▼
 Validation ── Canonical Claim Set ── Python Reducer
-                                      ├─ deterministic MOAT
+                                      ├─ reconciliation ─ deterministic MOAT
 PIT Financial Snapshot ───────────────└─ deterministic DCF
                                                   │
                                                   ▼
                                   value · quality · confidence ranking
 ```
 
-LLM에게 구조 복원, 요약 기반 재해석, DCF 산술, 최종 MOAT 채점을 맡기지 않습니다. 모델은 원문에서 결정론적으로 분리된 evidence 한 건을 고정 rubric으로 분류하며, 이후 단계는 검증된 claim과 명시적인 계산식만 사용합니다.
+LLM에게 구조 복원, 요약 기반 재해석, DCF 산술, 최종 MOAT 채점을 맡기지 않습니다. Atomic lane은 원문 evidence를 고정 rubric으로 검증하고, Strength lane은 모든 기업에서 넓은 canonical chunk 문맥으로 mechanism·outcome·persistence·counterevidence의 ordinal attribute를 추출합니다. Python은 두 lane을 reconciliation한 뒤 `economic_moat_score`와 `evidence_confidence`를 분리해 계산합니다.
 
 ## Reliability architecture
 
@@ -47,11 +49,11 @@ LLM에게 구조 복원, 요약 기반 재해석, DCF 산술, 최종 MOAT 채점
 - atomic evidence key: 동일한 원문 evidence의 replay/cache identity
 - `claim_id`: 의미가 같은 근거를 중복 제거하기 위한 scoring identity
 
-Replay는 full prompt나 배열 순서가 아니라 atomic evidence identity에 묶입니다. Canonical claim reducer는 교환·결합·멱등성을 갖도록 설계되어 입력 순서와 중복이 최종 점수를 바꾸지 않습니다.
+Replay는 full prompt나 배열 순서가 아니라 atomic evidence identity에 묶입니다. Atomic/canonical audit set은 교환·결합·멱등성을 유지하고, contextual strength attribute와 최종 점수의 반복 재현성은 별도 preflight gate에서 검사합니다.
 
 ### 2. Metamorphic invariance
 
-동일한 경제적 정보를 유지한 채 다음 변형을 가해도 selected atomic evidence, canonical claim, factor score가 같아야 합니다.
+동일한 경제적 정보를 유지한 채 다음 변형을 가해도 selected atomic audit evidence와 canonical claim이 같아야 합니다. Contextual strength score는 동일 broad-context 반복 실행 및 holdout 안정성으로 별도 검증합니다.
 
 - sentence / paragraph shuffle
 - evidence duplication
@@ -60,7 +62,7 @@ Replay는 full prompt나 배열 순서가 아니라 atomic evidence identity에 
 - irrelevant boilerplate 삽입
 - AST node order 변경
 
-Compact evidence pack에는 claim·factor score 불변성과 counterevidence recall 검사를 별도로 적용합니다. 관련 회귀 테스트는 [`tests/test_moat_metamorphic.py`](tests/test_moat_metamorphic.py)에 있습니다.
+Compact evidence pack은 audit용 claim·counterevidence 보존만 검사합니다. 경제적 강도 입력인 broad contextual pack은 초기 정확도 단계에서 압축하지 않습니다. 관련 회귀 테스트는 [`tests/test_moat_metamorphic.py`](tests/test_moat_metamorphic.py)와 [`tests/test_moat_strength.py`](tests/test_moat_strength.py)에 있습니다.
 
 ### 3. Fail-closed preflight
 
@@ -72,14 +74,28 @@ Compact evidence pack에는 claim·factor score 불변성과 counterevidence rec
 
 한국 주식 TTM은 동일한 CFS/OFS 범위에서 `직전 FY + 당기 YTD - 전년 동기 YTD`로 구성합니다. 필요한 누적값이 없으면 서로 다른 범위나 3개월 값을 임의로 혼합하지 않고 해당 DCF를 제외합니다.
 
+### 5. 정확도 보존형 token/cache 최적화
+
+LLM 요청은 고정 rubric·schema를 앞에, 기업별 원문 context를 뒤에 둡니다. GPT-5.6 요청은 고정 prefix 끝에 explicit cache breakpoint를 두고 `mode=explicit`, `ttl=30m`을 사용합니다. Cache key는 고정 prefix hash와 32개 stable shard로 구성해 한 key에 호출이 몰리는 것을 줄입니다. JSON schema는 key 순서와 whitespace를 canonical serialization하여 동일 prefix가 byte 수준에서 흔들리지 않게 합니다.
+
+회사별 `llm-token-budget.json`에는 다음을 함께 기록합니다.
+
+- full/compact context token estimate와 compression ratio
+- cacheable static prefix, dynamic suffix, output token cap
+- 실제 input/output/cached/cache-write token
+- cache read/write 비율과 provider tokens per call
+
+경제적 강도용 broad context는 정확도 검증 단계에서 압축하지 않습니다. Factor별 pruning, 축약 field alias, atomic reasoning 하향, small→large confidence escalation, canonical-state delta 재사용은 holdout 품질 동등성이 확인되기 전에는 production 기본값으로 쓰지 않습니다. `previous_response_id`나 opaque compaction도 PIT provenance/replay를 대신하지 않습니다.
+
 ## 구현 범위
 
 - OpenDART와 SEC EDGAR 원문 수집, immutable content-addressed Bronze 저장
 - DART XML/HTML, SEC HTML/iXBRL, IR HTML → source-neutral canonical model
 - section/table/inline XBRL parsing과 원문 provenance
 - semantic chunking, cross-filing dedup, 숫자가 바뀐 유사 문서 보존
-- atomic evidence 분류, schema validation/repair, evidence-level replay
-- canonical claim reducer, deterministic MOAT, unlevered DCF
+- atomic audit evidence 분류, schema validation/repair, evidence-level replay
+- broad canonical-chunk strength retrieval과 contextual grounding/reconciliation
+- economic strength와 evidence confidence를 분리한 deterministic MOAT reducer, unlevered DCF
 - 회사별 실패 격리, checkpoint/resume, 사용량·input hash·run manifest 기록
 - PIT backtest, 거래비용·슬리피지·거래 가능 여부·보수적 상장폐지 처리
 - raw/sector/factor-neutral IC와 비중첩 Q5–Q1 signal evaluation
@@ -152,7 +168,8 @@ moatrader moat run `
 
 | 검증 영역 | 대표 테스트 |
 | --- | --- |
-| 입력 변형 불변성·atomic replay·reducer 성질 | `test_moat_metamorphic.py` |
+| 입력 변형 불변성·atomic replay·audit reducer 성질 | `test_moat_metamorphic.py` |
+| contextual grounding·reconciliation·strength/confidence 분리 | `test_moat_strength.py` |
 | 반복 실행·입력 순서 재현성 | `test_moat_reproducibility.py` |
 | 대규모 실행 승인 계약 | `test_preflight.py` |
 | timezone-aware PIT와 TTM 구성 | `test_kr_dcf_pit.py` |
@@ -180,7 +197,7 @@ Backtest가 편향을 자동으로 없애 주는 것도 아닙니다. 역사적 
 ```text
 (MOAT / 10)
 × max(0, 1 - price / DCF fair value)
-× model confidence
+× evidence confidence
 × document coverage
 ```
 

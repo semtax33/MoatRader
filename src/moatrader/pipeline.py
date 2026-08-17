@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from moatrader.adapters import AdapterRegistry, DartHtmlAdapter, EdgarHtmlAdapter, IrHtmlAdapter, RawDocument
+from moatrader.adapters import (
+    AdapterRegistry,
+    DartHtmlAdapter,
+    EdgarHtmlAdapter,
+    IrHtmlAdapter,
+    IrPdfAdapter,
+    PdfOcrAdapter,
+    RawDocument,
+)
 from moatrader.canonical.models import CanonicalDocumentBundle
 from moatrader.context import AllocationResult, DynamicTokenBudgetAllocator
 from moatrader.financial import FinancialSnapshot, FinancialSnapshotBuilder
@@ -11,8 +19,15 @@ from moatrader.render import CanonicalMarkdownRenderer
 from moatrader.semantic import SemanticChunk, SemanticChunker
 
 
-def default_registry() -> AdapterRegistry:
-    return AdapterRegistry([DartHtmlAdapter(), EdgarHtmlAdapter(), IrHtmlAdapter()])
+def default_registry(*, ir_ocr_adapter: PdfOcrAdapter | None = None) -> AdapterRegistry:
+    return AdapterRegistry(
+        [
+            DartHtmlAdapter(),
+            EdgarHtmlAdapter(),
+            IrHtmlAdapter(),
+            IrPdfAdapter(ocr_adapter=ir_ocr_adapter),
+        ]
+    )
 
 
 @dataclass(slots=True)
@@ -32,8 +47,11 @@ class CanonicalFinancialDocumentPipeline:
         registry: AdapterRegistry | None = None,
         renderer: CanonicalMarkdownRenderer | None = None,
         chunker: SemanticChunker | None = None,
+        ir_ocr_adapter: PdfOcrAdapter | None = None,
     ) -> None:
-        self.registry = registry or default_registry()
+        if registry is not None and ir_ocr_adapter is not None:
+            raise ValueError("ir_ocr_adapter cannot be combined with an explicit registry")
+        self.registry = registry or default_registry(ir_ocr_adapter=ir_ocr_adapter)
         self.renderer = renderer or CanonicalMarkdownRenderer()
         self.chunker = chunker or SemanticChunker(renderer=self.renderer)
         self.snapshots = FinancialSnapshotBuilder()
@@ -67,4 +85,3 @@ class CanonicalFinancialDocumentPipeline:
             evidence_requests=requests,
             financial_snapshot=snapshot,
         )
-

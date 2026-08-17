@@ -36,6 +36,8 @@ def source_namespace(source_type: SourceType) -> str:
         return "dart"
     if source_type == SourceType.SEC_EDGAR:
         return "sec-edgar"
+    if source_type == SourceType.IR:
+        return "kind-ir"
     raise ValueError(f"Bronze API collector does not support source type {source_type.value}")
 
 
@@ -136,7 +138,7 @@ class BronzeFilingStore:
         return self._collected_from_metadata(saved_metadata, action)
 
     def iter_current(self, sources: set[SourceType] | None = None) -> list[CollectedFiling]:
-        selected = sources or {SourceType.DART, SourceType.SEC_EDGAR}
+        selected = sources or {SourceType.DART, SourceType.SEC_EDGAR, SourceType.IR}
         filings: list[CollectedFiling] = []
         for source_type in sorted(selected, key=lambda value: value.value):
             source_dir = self.root / source_namespace(source_type)

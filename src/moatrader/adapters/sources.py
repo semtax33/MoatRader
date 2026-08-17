@@ -36,5 +36,6 @@ class IrHtmlAdapter(BaseHtmlFinancialAdapter):
     default_zone = ZoneInfo("UTC")
 
     def detect(self, source: RawDocument) -> bool:
-        return _hint_source(source) in {"IR", "INVESTOR_RELATIONS"}
-
+        media_type = (source.media_type or "").casefold()
+        is_pdf = media_type == "application/pdf" or source.content.startswith(b"%PDF-")
+        return not is_pdf and _hint_source(source) in {"IR", "INVESTOR_RELATIONS"}

@@ -12,6 +12,48 @@ from moatrader.canonical.models import (
 )
 
 
+_PACKED_NUMERIC_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])[-(]?\d[\d,]*(?:\.\d+)?%?\)?"
+)
+
+
+def _collapsed_pdf_grid_failures(bundle: CanonicalDocumentBundle) -> list[str]:
+    """Detect table-finder grids that preserved text but destroyed cell relations."""
+
+    if bundle.metadata.source_type != SourceType.IR:
+        return []
+    failures: list[str] = []
+    for node in bundle.ast.walk():
+        if not isinstance(node, TableNode):
+            continue
+        if not node.attributes.get("table_extraction_strategy"):
+            continue
+        width = max((len(row.cells) for row in node.rows), default=0)
+        if width < 4 or len(node.rows) < 3:
+            continue
+        header_rows = max(1, node.header_row_count)
+        header = node.rows[0].cells
+        if sum(bool(cell.normalized_text.strip()) for cell in header) < 3:
+            continue
+        for row in node.rows[header_rows:]:
+            nonempty = [cell for cell in row.cells if cell.normalized_text.strip()]
+            if len(nonempty) > 2:
+                continue
+            for cell in nonempty:
+                text = cell.raw_text
+                line_count = len([line for line in text.splitlines() if line.strip()])
+                numeric_count = len(_PACKED_NUMERIC_TOKEN_RE.findall(text))
+                if line_count >= 2 and numeric_count >= 2 * (width - 1):
+                    failures.append(
+                        f"IR table {node.node_id} has a collapsed multi-column grid: "
+                        f"{numeric_count} numeric tokens are packed into one multiline cell"
+                    )
+                    break
+            if failures and node.node_id in failures[-1]:
+                break
+    return failures
+
+
 class ParserQualityGateConfig(ContractModel):
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
@@ -35,6 +77,7 @@ def assess_parser_quality(
     quality = bundle.quality
     failures: list[str] = []
     warnings = list(quality.warnings)
+    failures.extend(_collapsed_pdf_grid_failures(bundle))
     if quality.text_retention is None:
         failures.append("visible text retention is unavailable")
     elif quality.text_retention < config.minimum_text_retention:
@@ -69,15 +112,6 @@ def assess_parser_quality(
         if isinstance(node, TableNode)
         and (node.period is not None or re.search(r"20\d{2}", node.raw_text))
     }
-    section_has_explicit_unit_marker: dict[tuple[str, ...], bool] = {}
-    for item in bundle.ast.walk():
-        key = tuple(item.section_path)
-        has_marker = bool(
-            re.search(r"(?:\bunit\s*:|단위\s*:)", item.raw_text, re.IGNORECASE)
-        )
-        section_has_explicit_unit_marker[key] = (
-            section_has_explicit_unit_marker.get(key, False) or has_marker
-        )
     for node in bundle.ast.walk():
         if not isinstance(node, TableNode):
             continue
@@ -93,6 +127,14 @@ def assess_parser_quality(
             )
             and "주석" not in section_text
         )
+        ownership_or_structure_table = bool(
+            re.search(
+                r"지분구조|계열회사|주주\s*현황|ownership\s+structure|affiliates?",
+                node.raw_text,
+                re.IGNORECASE,
+            )
+        )
+        financial_context = financial_context and not ownership_or_structure_table
         table_width = max((len(row.cells) for row in node.rows), default=0)
         is_data_table = table_width >= 2 and len(node.rows) >= 2 and len(numeric_cells) >= 2
         nonempty_headers = [header for header in node.column_headers if any(item.strip() for item in header.path)]
@@ -112,7 +154,6 @@ def assess_parser_quality(
         source_omitted_dart_summary_unit = (
             bundle.metadata.source_type == SourceType.DART
             and "요약재무" in section_text
-            and not section_has_explicit_unit_marker.get(tuple(node.section_path), False)
         )
         if financial_context and is_data_table and config.require_financial_table_semantics:
             if not nonempty_headers:

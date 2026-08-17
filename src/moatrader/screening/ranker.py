@@ -6,6 +6,7 @@ from decimal import Decimal
 from pydantic import Field, model_validator
 
 from moatrader.canonical.models import ContractModel
+from moatrader.evidence.models import MoatRankRefinement, MoatRankRefinementStatus
 
 
 class CandidateInput(ContractModel):
@@ -14,6 +15,8 @@ class CandidateInput(ContractModel):
     current_price: Decimal = Field(gt=0)
     dcf_fair_value: Decimal = Field(gt=0)
     moat_score: Decimal = Field(ge=0, le=10)
+    rank_refinement: MoatRankRefinement | None = None
+    rank_refinement_status: MoatRankRefinementStatus | None = None
     model_confidence: Decimal = Field(ge=0, le=1)
     document_coverage: Decimal = Field(ge=0, le=1)
     valuation_as_of: datetime
@@ -48,11 +51,20 @@ class RankedCandidate(ContractModel):
     price_to_dcf: Decimal
     margin_of_safety: Decimal
     moat_score: Decimal
+    rank_refinement: MoatRankRefinement | None = None
+    rank_refinement_status: MoatRankRefinementStatus | None = None
+    moat_rank_key: tuple[Decimal, ...] = ()
     quality_value_score: Decimal
     moat_percentile: Decimal = Decimal(0)
     value_percentile: Decimal = Decimal(0)
     valuation_as_of: datetime
     price_as_of: datetime
+
+    @model_validator(mode="after")
+    def fill_legacy_rank_key(self) -> "RankedCandidate":
+        if not self.moat_rank_key:
+            self.moat_rank_key = (self.moat_score,)
+        return self
 
 
 class ValueMoatRanker:
@@ -76,11 +88,13 @@ class ValueMoatRanker:
                 continue
             eligible.append((candidate, price_to_dcf, margin))
 
-        moat_percentiles = self._percentiles([item[0].moat_score for item in eligible])
+        rank_keys = self._stable_rank_keys([item[0] for item in eligible])
+        moat_percentiles = self._percentiles(rank_keys)
         value_percentiles = self._percentiles([item[2] for item in eligible])
         ranked: list[RankedCandidate] = []
-        for (candidate, price_to_dcf, margin), moat_percentile, value_percentile in zip(
+        for (candidate, price_to_dcf, margin), rank_key, moat_percentile, value_percentile in zip(
             eligible,
+            rank_keys,
             moat_percentiles,
             value_percentiles,
             strict=True,
@@ -96,6 +110,9 @@ class ValueMoatRanker:
                     price_to_dcf=price_to_dcf,
                     margin_of_safety=margin,
                     moat_score=candidate.moat_score,
+                    rank_refinement=candidate.rank_refinement,
+                    rank_refinement_status=candidate.rank_refinement_status,
+                    moat_rank_key=rank_key,
                     quality_value_score=score,
                     moat_percentile=moat_percentile,
                     value_percentile=value_percentile,
@@ -106,7 +123,40 @@ class ValueMoatRanker:
         return sorted(ranked, key=lambda item: (item.quality_value_score, -item.price_to_dcf), reverse=True)
 
     @staticmethod
-    def _percentiles(values: list[Decimal]) -> list[Decimal]:
+    def _stable_rank_keys(
+        candidates: list[CandidateInput],
+    ) -> list[tuple[Decimal, ...]]:
+        """Use refinement only when every member of a public bucket has it."""
+
+        complete_by_public: dict[Decimal, bool] = {}
+        for candidate in candidates:
+            stable = bool(
+                candidate.rank_refinement is not None
+                and candidate.rank_refinement_status
+                == MoatRankRefinementStatus.STABLE_COMPONENTS
+            )
+            complete_by_public[candidate.moat_score] = (
+                complete_by_public.get(candidate.moat_score, True) and stable
+            )
+        result = []
+        for candidate in candidates:
+            refinement = candidate.rank_refinement
+            if complete_by_public[candidate.moat_score] and refinement is not None:
+                result.append(
+                    (
+                        candidate.moat_score,
+                        Decimal(str(refinement.mechanism_component)),
+                        Decimal(str(refinement.outcome_component)),
+                        Decimal(str(refinement.durability_component)),
+                        -Decimal(str(refinement.counter_component)),
+                    )
+                )
+            else:
+                result.append((candidate.moat_score,))
+        return result
+
+    @staticmethod
+    def _percentiles(values: list[object]) -> list[Decimal]:
         if not values:
             return []
         ordered = sorted(range(len(values)), key=lambda index: values[index])

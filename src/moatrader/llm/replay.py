@@ -39,6 +39,7 @@ class LLMReplayCache:
         summary_model: str,
         moat_model: str,
         summary_reasoning_effort: str,
+        atomic_reasoning_effort: str,
         moat_reasoning_effort: str,
         engine_version: str,
         lock_timeout_seconds: float = 600.0,
@@ -49,6 +50,7 @@ class LLMReplayCache:
         self.summary_model = summary_model
         self.moat_model = moat_model
         self.summary_reasoning_effort = summary_reasoning_effort
+        self.atomic_reasoning_effort = atomic_reasoning_effort
         self.moat_reasoning_effort = moat_reasoning_effort
         self.engine_version = engine_version
         self.lock_timeout_seconds = lock_timeout_seconds
@@ -78,6 +80,9 @@ class LLMReplayCache:
             "input_sha256": atomic_key or request.input_sha256,
             "prompt_version": request.metadata.get("prompt_version"),
             "rubric_version": request.metadata.get("rubric_version"),
+            "classification_vote": (
+                request.metadata.get("classification_vote") if atomic_key else None
+            ),
             "model": self._model_for(request.task),
             "reasoning_effort": self._effort_for(request.task),
             "temperature": request.temperature,
@@ -155,9 +160,29 @@ class LLMReplayCache:
             while True:
                 try:
                     descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    os.close(descriptor)
+                    try:
+                        os.write(
+                            descriptor,
+                            json.dumps(
+                                {
+                                    "pid": os.getpid(),
+                                    "created_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                        )
+                    finally:
+                        os.close(descriptor)
                     break
                 except FileExistsError:
+                    # A killed worker can leave an orphaned lock forever.  A
+                    # lock older than the same timeout after which we would
+                    # fail is no longer allowed to block later --resume runs.
+                    # The per-cache-key thread lock serializes reclaimers in a
+                    # process; the exclusive reclaim marker does the same
+                    # across processes.
+                    if self._reclaim_stale_lock(lock_path):
+                        continue
                     if time.monotonic() - started > self.lock_timeout_seconds:
                         raise TimeoutError(f"timed out waiting for LLM replay lock: {lock_path}")
                     time.sleep(0.1)
@@ -166,15 +191,52 @@ class LLMReplayCache:
             finally:
                 lock_path.unlink(missing_ok=True)
 
+    def _reclaim_stale_lock(self, lock_path: Path) -> bool:
+        try:
+            age_seconds = max(0.0, time.time() - lock_path.stat().st_mtime)
+        except FileNotFoundError:
+            return True
+        if age_seconds <= self.lock_timeout_seconds:
+            return False
+
+        reclaim_path = lock_path.with_name(f"{lock_path.name}.reclaim")
+        try:
+            descriptor = os.open(reclaim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(descriptor)
+        except FileExistsError:
+            return False
+        try:
+            try:
+                age_seconds = max(0.0, time.time() - lock_path.stat().st_mtime)
+            except FileNotFoundError:
+                return True
+            if age_seconds <= self.lock_timeout_seconds:
+                return False
+            lock_path.unlink(missing_ok=True)
+            return True
+        finally:
+            reclaim_path.unlink(missing_ok=True)
+
     def _record_path(self, task: LLMTask, cache_key: str) -> Path:
         return self.root / task.value.lower() / cache_key[:2] / f"{cache_key}.json"
 
     def _model_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_model
         return self.summary_model
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+            return self.atomic_reasoning_effort
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort

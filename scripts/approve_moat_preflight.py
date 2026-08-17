@@ -54,6 +54,26 @@ def _load_run(path: Path, date: str, sample: set[str]) -> UniverseRunResult:
     ]
     if incomplete:
         raise ValueError(f"preflight run has incomplete scores for {date}: {incomplete}")
+    failed_audits = [
+        company.ticker
+        for company in result.companies
+        if company.moat_score is not None and company.moat_score.audit_status.value == "FAIL"
+    ]
+    if failed_audits:
+        raise ValueError(
+            f"preflight run has failed MOAT reconciliation for {date}: {failed_audits}"
+        )
+    wrong_scorers = [
+        company.ticker
+        for company in result.companies
+        if company.moat_score is not None
+        and company.moat_score.scoring_method
+        != "DUAL_LANE_CONTEXTUAL_STRENGTH_REDUCER_V1"
+    ]
+    if wrong_scorers:
+        raise ValueError(
+            f"preflight run did not use the dual-lane reducer for {date}: {wrong_scorers}"
+        )
     versions = {company.runner_version for company in result.companies}
     if versions != {RUNNER_VERSION}:
         raise ValueError(f"preflight runner versions are not current: {versions}")
@@ -78,6 +98,8 @@ def _candidate_replay_audit(result: UniverseRunResult) -> tuple[int, int, list[s
         replayed += sum(call.get("replayed") is True for call in calls)
         if any(not call.get("replay_cache_key") for call in calls):
             failures.append(f"{company.ticker}: call missing replay cache key")
+        if not any(call.get("task") == "CONTEXTUAL_MOAT_STRENGTH" for call in calls):
+            failures.append(f"{company.ticker}: contextual strength call is missing")
     if total == 0:
         failures.append("candidate preflight contains no LLM calls")
     elif replayed != total:
@@ -137,11 +159,10 @@ def _compression_audit(result: UniverseRunResult) -> tuple[dict[str, Any], list[
             payload.get("passed") is not True
             or payload.get("claim_jaccard") != 1.0
             or payload.get("counterevidence_recall") != 1.0
-            or payload.get("moat_score_delta") != 0.0
-            or payload.get("factor_scores_equal") is not True
+            or payload.get("strength_context_compressed") is not False
         ):
             failures.append(
-                f"{company.ticker}: compression changed claims, counterevidence, or score"
+                f"{company.ticker}: audit pack changed claims/counterevidence or strength context was compressed"
             )
     return reports, failures
 
@@ -203,6 +224,8 @@ def main() -> int:
             minimum_score_spearman=args.minimum_repeat_spearman,
             minimum_mean_evidence_jaccard=args.minimum_evidence_jaccard,
             minimum_mean_claim_jaccard=args.minimum_claim_jaccard,
+            minimum_mean_context_jaccard=1.0,
+            minimum_strength_attribute_match=1.0,
             maximum_median_score_delta=0.0,
             maximum_company_score_delta=0.0,
         )

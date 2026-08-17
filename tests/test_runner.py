@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -12,13 +11,23 @@ import pytest
 from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
+    CandidateAtomicAuditDecision,
+    CandidateAtomicAuditResult,
+    CandidateAuditReason,
+    CandidateSupportStatus,
     CitedSummaryClaim,
+    ContextualMechanismAssessment,
+    ContextualMoatAssessment,
     CoverageMetrics,
     Durability,
+    EconomicScope,
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceType,
+    IrDeltaAction,
+    IrIncrementalAssessment,
+    IrMechanismDelta,
     MoatMechanismScore,
     MoatScore,
     SectionSummary,
@@ -42,6 +51,50 @@ def _fixture_handler(request: LLMRequest, _response_model: type[Any]) -> Any:
             claim_subject="customer workflow",
             claim_predicate="switching friction",
             claim_horizon="LONG",
+        )
+    if request.task == LLMTask.CONTEXTUAL_MOAT_STRENGTH:
+        return ContextualMoatAssessment(
+            evidence_sufficiency=3,
+            mechanisms=[
+                ContextualMechanismAssessment(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    strength_bucket=3,
+                    scope_materiality_bucket=4,
+                    durability_bucket=3,
+                    economic_scope=EconomicScope.COMPANY,
+                    reference_ids=[str(request.metadata["reference_ids"][0])],
+                    rationale="Grounded context indicates switching friction.",
+                )
+            ],
+        )
+    if request.task == LLMTask.IR_INCREMENTAL_ASSESSMENT:
+        return IrIncrementalAssessment(
+            evidence_sufficiency_delta=1,
+            mechanisms=[
+                IrMechanismDelta(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    action=IrDeltaAction.STRENGTHEN,
+                    strength_bucket=4,
+                    scope_materiality_bucket=4,
+                    durability_bucket=4,
+                    economic_scope=EconomicScope.COMPANY,
+                    reference_ids=[str(request.metadata["reference_ids"][0])],
+                    rationale="Additional company evidence strengthens switching friction.",
+                )
+            ],
+        )
+    if request.task == LLMTask.CANDIDATE_ATOMIC_AUDIT:
+        candidate_id = str(request.metadata["candidate_ids"][0])
+        evidence_ids = list(request.metadata["allowed_evidence_ids"][candidate_id])
+        return CandidateAtomicAuditResult(
+            decisions=[
+                CandidateAtomicAuditDecision(
+                    candidate_id=candidate_id,
+                    support=CandidateSupportStatus.SUPPORTED,
+                    reason=CandidateAuditReason.EXPLICIT_CAUSAL_BARRIER,
+                    supporting_atomic_evidence_ids=evidence_ids,
+                )
+            ]
         )
     if request.task == LLMTask.SECTION_SUMMARY:
         evidence_ids = list(request.metadata["evidence_ids"])
@@ -110,7 +163,10 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     company = result.companies[0]
     assert company.status == CompanyRunStatus.COMPLETE
     assert company.moat_score is not None
-    assert company.moat_score.economic_moat_score == 5.0
+    assert company.moat_score.economic_moat_score == 3.75
+    assert company.moat_score.rank_refinement_status.value == "STABLE_COMPONENTS"
+    assert company.moat_score.rank_refinement is not None
+    assert company.moat_score.rank_refinement.mechanism_component == 2
     assert company.moat_score.llm_proposed_score is None
     assert company.dcf is not None
     assert company.valuation_as_of == datetime.fromisoformat("2025-05-16T00:00:00+09:00")
@@ -123,6 +179,22 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert (company_dir / "compression-audit.json").is_file()
     assert (company_dir / "financial-feature-vector.json").is_file()
     assert (company_dir / "financial-feature-vector.md").is_file()
+    raw_strength = json.loads(
+        (company_dir / "contextual-moat-assessment-raw.json").read_text(encoding="utf-8")
+    )
+    public_strength = json.loads(
+        (company_dir / "contextual-moat-assessment.json").read_text(encoding="utf-8")
+    )
+    structural_strength = json.loads(
+        (company_dir / "contextual-moat-assessment-structural.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert raw_strength["mechanisms"][0]["strength_bucket"] == 3
+    assert structural_strength["mechanisms"][0]["strength_bucket"] == 3
+    assert public_strength["mechanisms"][0]["strength_bucket"] == 2
+    assert (company_dir / "contextual-moat-structural-repair.json").is_file()
+    assert (company_dir / "contextual-moat-ordinal-calibration.json").is_file()
     assert (company_dir / "section-summary-manifest.json").is_file()
     assert (company_dir / "llm-token-budget.json").is_file()
     assert (company_dir / "run-manifest.json").is_file()
@@ -139,7 +211,10 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     ]
     assert all(item.get("raw_response_sha256") for item in call_audit)
     assert all(Path(item["raw_response_path"]).is_file() for item in call_audit)
-    assert all(item["task"] == "LOCAL_EVIDENCE_EXTRACTION" for item in call_audit)
+    assert {item["task"] for item in call_audit} == {
+        "LOCAL_EVIDENCE_EXTRACTION",
+        "CONTEXTUAL_MOAT_STRENGTH",
+    }
     summary_manifest = json.loads(
         (company_dir / "section-summary-manifest.json").read_text(encoding="utf-8")
     )
@@ -150,8 +225,29 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert compression["claim_jaccard"] == 1.0
     assert compression["counterevidence_recall"] == 1.0
     token_budget = json.loads((company_dir / "llm-token-budget.json").read_text(encoding="utf-8"))
-    assert token_budget["schema_token_reduction_fraction"] > 0.5
+    assert token_budget["schema_version"] == "llm-token-budget/4"
+    assert token_budget["schema_token_reduction_fraction"] > 0
     assert token_budget["estimated_schema_tokens_avoided"] > 0
+    assert token_budget["prompt_cache_mode"] == "explicit"
+    assert token_budget["prompt_cache_breakpoint_count"] == (
+        token_budget["atomic_request_count"] + token_budget["strength_request_count"]
+    )
+    assert token_budget["estimated_cacheable_prefix_tokens_total"] >= 0
+    assert token_budget["estimated_dynamic_suffix_tokens_all_tasks"] > 0
+    assert token_budget["expected_output_token_cap_total"] >= 8_000
+    assert token_budget["strength_context_compression_ratio"] == 1.0
+    assert token_budget["actual_llm_call_count"] == len(call_audit)
+    assert token_budget["actual_provider_tokens_per_call"] >= 0
+    assert token_budget["atomic_reasoning_effort"] == "medium"
+    assert token_budget["atomic_max_output_tokens"] == 2_000
+    assert token_budget["strength_request_count"] == 1
+    assert token_budget["strength_compression_ablation_enabled"] is False
+    assert token_budget["atomic_selection_policy"] == "BASELINE_PLUS_CONTEXT_CITATION_AUDIT"
+    selection = json.loads(
+        (company_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    assert selection["method"] == "dual_lane_citation_audit/1"
+    assert selection["parent_fallback_enabled"] is False
     dcf_manifest = json.loads((company_dir / "dcf-manifest.json").read_text(encoding="utf-8"))
     assert dcf_manifest["calculation_mode"] == "deterministic_python"
     assert dcf_manifest["llm_model"] is None
@@ -163,10 +259,230 @@ def test_runner_completes_scores_dcf_ranking_and_manifest(tmp_path: Path) -> Non
     assert dcf_payload["assumptions"]["base_revenue"] == "1000"
     assert "terminal_value_share" in dcf_payload
     run_manifest = json.loads((company_dir / "run-manifest.json").read_text(encoding="utf-8"))
-    assert run_manifest["model"] == "deterministic-python"
+    assert run_manifest["model"] == "gpt-5.6-luna+deterministic-python"
     assert (company_dir / "moat-reducer-input.json").is_file()
-    assert not (company_dir / "moat-request.json").exists()
+    assert (company_dir / "moat-strength-context.md").is_file()
+    assert (company_dir / "contextual-moat-assessment.json").is_file()
+    assert (company_dir / "moat-reconciliation.json").is_file()
     assert all(item["task"] != "FINAL_MOAT_SCORING" for item in call_audit)
+
+
+def test_incremental_ir_keeps_dart_base_identical_and_requires_accepted_ir(
+    tmp_path: Path,
+) -> None:
+    source_manifest = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    sample = source_manifest.companies[0]
+    dart_input = Path(sample.documents[0].input_path)
+    dart_metadata = Path(sample.documents[0].metadata_path)
+    dcf = Path(sample.dcf_assumptions_path or "")
+    ir_input = tmp_path / "ir.html"
+    ir_input.write_text(
+        "<html><body><h1>Customer platform</h1><p>Customers integrate the platform "
+        "into recurring workflows and face a lengthy qualification process.</p></body></html>",
+        encoding="utf-8",
+    )
+    ir_metadata = tmp_path / "ir-metadata.json"
+    ir_metadata.write_text(
+        json.dumps(
+            {
+                "source_type": "IR",
+                "source_document_id": "IR-SAMPLE-1",
+                "available_at": "2025-05-15T12:00:00+09:00",
+                "document_type": "IR_PRESENTATION",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def write_manifest(path: Path, *, include_ir: bool) -> None:
+        rows = [
+            {
+                "ticker": "SAMPLE",
+                "source": "DART",
+                "input": str(dart_input),
+                "metadata": str(dart_metadata),
+                "issuer_id": "00126380",
+                "issuer_name": "Sample Company",
+                "current_price": "10",
+                "price_as_of": "2025-05-15T16:00:00+09:00",
+                "dcf_assumptions": str(dcf),
+            }
+        ]
+        if include_ir:
+            rows.append(
+                {
+                    "ticker": "SAMPLE",
+                    "source": "IR",
+                    "input": str(ir_input),
+                    "metadata": str(ir_metadata),
+                    "issuer_id": "00126380",
+                    "issuer_name": "Sample Company",
+                    "current_price": "10",
+                    "price_as_of": "2025-05-15T16:00:00+09:00",
+                    "dcf_assumptions": str(dcf),
+                }
+            )
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    dart_manifest_path = tmp_path / "dart-only.csv"
+    ir_manifest_path = tmp_path / "dart-ir.csv"
+    write_manifest(dart_manifest_path, include_ir=False)
+    write_manifest(ir_manifest_path, include_ir=True)
+    cache = tmp_path / "replay"
+    common = {
+        "as_of": datetime.fromisoformat("2025-05-16T00:00:00+09:00"),
+        "incremental_ir_mode": True,
+        "experiment_id": "paired-ir-test",
+        "llm_replay_cache_directory": str(cache),
+    }
+    for run_id, manifest_path in (
+        ("paired-dart", dart_manifest_path),
+        ("paired-ir", ir_manifest_path),
+    ):
+        manifest = load_universe_manifest(manifest_path)
+        result = MoatUniverseRunner(
+            config=UniverseRunConfig(run_id=run_id, **common),
+            output_directory=tmp_path / "runs",
+            transport=FunctionTransport(_fixture_handler),
+        ).run(manifest, manifest.companies)
+        assert result.companies[0].status == CompanyRunStatus.COMPLETE
+
+    dart_dir = tmp_path / "runs" / "paired-dart" / "companies" / "SAMPLE"
+    ir_dir = tmp_path / "runs" / "paired-ir" / "companies" / "SAMPLE"
+    dart_request = json.loads(
+        (dart_dir / "moat-strength-request-base.json").read_text(encoding="utf-8")
+    )
+    ir_request = json.loads(
+        (ir_dir / "moat-strength-request-base.json").read_text(encoding="utf-8")
+    )
+    assert dart_request["input_sha256"] == ir_request["input_sha256"]
+    dart_selection = json.loads(
+        (dart_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    ir_selection = json.loads(
+        (ir_dir / "evidence-chunk-selection.json").read_text(encoding="utf-8")
+    )
+    assert (
+        dart_selection["baseline_base_atomic_unit_set_sha256"]
+        == ir_selection["baseline_base_atomic_unit_set_sha256"]
+    )
+    dart_audit = json.loads(
+        (dart_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    ir_audit = json.loads(
+        (ir_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    assert dart_audit["treatment_compliant"] is False
+    assert dart_audit["final_score"] == dart_audit["frozen_base_score"]
+    assert ir_audit["IR_AVAILABLE"] is True
+    assert ir_audit["IR_USABLE"] is True
+    assert ir_audit["treatment_compliant"] is True
+
+
+def test_longitudinal_ir_requires_multi_year_accepted_evidence(
+    tmp_path: Path,
+) -> None:
+    source_manifest = load_universe_manifest(ROOT / "examples" / "universe.csv")
+    sample = source_manifest.companies[0]
+    dart_input = Path(sample.documents[0].input_path)
+    dart_metadata = Path(sample.documents[0].metadata_path)
+    dcf = Path(sample.dcf_assumptions_path or "")
+    rows = [
+        {
+            "ticker": "SAMPLE",
+            "source": "DART",
+            "input": str(dart_input),
+            "metadata": str(dart_metadata),
+            "issuer_id": "00126380",
+            "issuer_name": "Sample Company",
+            "current_price": "10",
+            "price_as_of": "2025-05-15T16:00:00+09:00",
+            "dcf_assumptions": str(dcf),
+        }
+    ]
+    for year in (2022, 2023, 2024):
+        ir_input = tmp_path / f"ir-{year}.html"
+        ir_input.write_text(
+            f"<html><body><h1>{year} customer platform</h1>"
+            "<p>Customers integrate the platform into recurring workflows "
+            "and face a lengthy annual qualification process.</p></body></html>",
+            encoding="utf-8",
+        )
+        ir_metadata = tmp_path / f"ir-{year}-metadata.json"
+        ir_metadata.write_text(
+            json.dumps(
+                {
+                    "source_type": "IR",
+                    "source_document_id": f"IR-SAMPLE-{year}",
+                    "available_at": f"{year}-05-15T12:00:00+09:00",
+                    "document_type": "IR_PRESENTATION",
+                }
+            ),
+            encoding="utf-8",
+        )
+        rows.append(
+            {
+                **rows[0],
+                "source": "IR",
+                "input": str(ir_input),
+                "metadata": str(ir_metadata),
+            }
+        )
+    manifest_path = tmp_path / "longitudinal.csv"
+    with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    def handler(request: LLMRequest, response_model: type[Any]) -> Any:
+        if request.task != LLMTask.IR_INCREMENTAL_ASSESSMENT:
+            return _fixture_handler(request, response_model)
+        references = [str(item) for item in request.metadata["reference_ids"]]
+        return IrIncrementalAssessment(
+            evidence_sufficiency_delta=1,
+            mechanisms=[
+                IrMechanismDelta(
+                    evidence_type=EvidenceType.SWITCHING_COST,
+                    action=IrDeltaAction.STRENGTHEN,
+                    strength_bucket=4,
+                    scope_materiality_bucket=4,
+                    durability_bucket=4,
+                    economic_scope=EconomicScope.COMPANY,
+                    reference_ids=[references[0], references[-1]],
+                    rationale="Repeated annual evidence strengthens switching friction.",
+                )
+            ],
+        )
+
+    manifest = load_universe_manifest(manifest_path)
+    result = MoatUniverseRunner(
+        config=UniverseRunConfig(
+            run_id="longitudinal-ir",
+            as_of=datetime.fromisoformat("2025-05-16T00:00:00+09:00"),
+            incremental_ir_mode=True,
+            longitudinal_ir_mode=True,
+            minimum_longitudinal_ir_years=3,
+        ),
+        output_directory=tmp_path / "runs",
+        transport=FunctionTransport(handler),
+    ).run(manifest, manifest.companies)
+
+    assert result.companies[0].status == CompanyRunStatus.COMPLETE
+    company_dir = tmp_path / "runs" / "longitudinal-ir" / "companies" / "SAMPLE"
+    audit = json.loads(
+        (company_dir / "ir-treatment-audit.json").read_text(encoding="utf-8")
+    )
+    context = json.loads(
+        (company_dir / "moat-strength-context-ir.json").read_text(encoding="utf-8")
+    )
+    assert audit["usable_ir_years"] == [2022, 2023, 2024]
+    assert len(audit["accepted_ir_years"]) >= 2
+    assert audit["longitudinal_treatment_compliant"] is True
+    assert audit["treatment_compliant"] is True
+    assert context["selected_document_count"] == 3
 
 
 def test_runner_preserves_official_primary_document_url_in_provenance(tmp_path: Path) -> None:
@@ -402,7 +718,9 @@ def test_partial_evidence_checkpoints_resume_per_chunk(tmp_path: Path) -> None:
     ).run(universe, universe.companies)
 
     assert resumed.companies[0].status == CompanyRunStatus.COMPLETE
-    assert successful_chunk[0] not in resumed_local_chunks
+    # The completed vote is reused; only the two unfinished consensus votes
+    # for that atomic unit are executed after resume.
+    assert resumed_local_chunks.count(successful_chunk[0]) == 2
     assert resumed_local_chunks
 
 

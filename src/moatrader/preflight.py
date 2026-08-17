@@ -9,14 +9,17 @@ from moatrader.runner.models import UniverseRunConfig
 from moatrader.evidence.atomic import ATOMIC_RUBRIC_VERSION, ATOMIC_SEGMENTATION_VERSION
 
 
-PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/3"
+PREFLIGHT_SCHEMA_VERSION = "moatrader-moat-preflight/9"
 EXECUTION_CONTRACT_FIELDS = (
     "summary_model",
     "moat_model",
     "summary_reasoning_effort",
+    "atomic_reasoning_effort",
     "moat_reasoning_effort",
     "context_tokens",
     "prompt_reserve_tokens",
+    "strength_context_tokens",
+    "strength_prompt_reserve_tokens",
     "max_output_tokens",
     "minimum_text_retention",
     "minimum_numeric_retention",
@@ -26,7 +29,15 @@ EXECUTION_CONTRACT_FIELDS = (
     "allow_low_quality",
     "maximum_price_age_days",
     "maximum_atomic_evidence_units",
+    "maximum_ir_atomic_evidence_units",
+    "atomic_classification_votes",
+    "incremental_ir_mode",
+    "longitudinal_ir_mode",
+    "minimum_longitudinal_ir_years",
     "consolidate_section_summaries",
+    "ir_ocr_engine",
+    "ir_ocr_device",
+    "ir_ocr_cpu_threads",
     "validation_attempts",
     "experiment_id",
 )
@@ -44,13 +55,38 @@ def execution_contract(config: UniverseRunConfig) -> dict[str, Any]:
     contract["evidence_ledger_enabled"] = bool(config.evidence_ledger_directory)
     contract["atomic_segmentation_version"] = ATOMIC_SEGMENTATION_VERSION
     contract["atomic_rubric_version"] = ATOMIC_RUBRIC_VERSION
-    contract["scoring_reducer_version"] = "canonical-claim-reducer/1"
+    contract["scoring_reducer_version"] = "dual-lane-strength-reducer/4"
+    contract["moat_rank_strategy"] = "PUBLIC_SCORE_THEN_STABLE_COMPONENTS_LEXICOGRAPHIC_V1"
+    contract["raw_ordinal_global_rank_allowed"] = False
+    contract["moat_architecture"] = (
+        "FROZEN_BASE_PLUS_LONGITUDINAL_IR_INCREMENTAL_ATOMIC_AUDIT"
+        if config.longitudinal_ir_mode
+        else "FROZEN_BASE_PLUS_IR_INCREMENTAL_ATOMIC_AUDIT"
+        if config.incremental_ir_mode
+        else "ATOMIC_AUDIT_PLUS_CONTEXTUAL_STRENGTH"
+    )
+    contract["contextual_strength_required_for_every_company"] = True
+    contract["strength_context_compression_ablation_enabled"] = False
+    contract["economic_strength_separate_from_evidence_confidence"] = True
     contract["generated_summary_in_judge_context"] = False
     contract["section_summary_generator"] = "deterministic-python"
     contract["compact_factor_pack_version"] = "compact-factor-pack/1"
     contract["compression_invariance_gate_required"] = True
     contract["metamorphic_gate_required"] = True
     contract["moat_model_snapshot_policy"] = "EXACT_ID_NO_LATEST_ALIAS"
+    contract["atomic_prompt_version"] = "atomic-evidence-classifier/10"
+    contract["atomic_api_schema"] = "closed-moat-role-and-subtype/2"
+    contract["atomic_consensus"] = "strict-majority-fail-closed/1"
+    contract["atomic_output_token_cap"] = min(config.max_output_tokens, 2_000)
+    contract["contextual_prompt_version"] = "contextual-moat-strength/2"
+    contract["ir_incremental_prompt_version"] = "ir-incremental-assessment/2"
+    contract["contextual_output_token_cap"] = min(config.max_output_tokens, 8_000)
+    contract["prompt_cache_mode"] = "explicit"
+    contract["prompt_cache_ttl"] = "30m"
+    contract["prompt_cache_breakpoint"] = "STATIC_SYSTEM_PREFIX_END"
+    contract["prompt_cache_key_routing"] = "STATIC_PREFIX_HASH_PLUS_STABLE_32_SHARDS_V1"
+    contract["canonical_schema_serialization"] = True
+    contract["token_budget_audit_schema"] = "llm-token-budget/4"
     return contract
 
 

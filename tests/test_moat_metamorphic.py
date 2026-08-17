@@ -133,6 +133,7 @@ def test_atomic_replay_identity_uses_evidence_key_not_full_prompt(tmp_path) -> N
         summary_model="gpt-5-nano",
         moat_model="gpt-5.6-luna",
         summary_reasoning_effort="low",
+        atomic_reasoning_effort="low",
         moat_reasoning_effort="medium",
         engine_version="0.8.0",
     )
@@ -143,11 +144,60 @@ def test_atomic_replay_identity_uses_evidence_key_not_full_prompt(tmp_path) -> N
     )[0]
 
 
-def test_atomic_api_schema_uses_compact_readable_aliases_without_changing_internal_fields() -> None:
+def test_atomic_request_exposes_issuer_identity_for_third_party_guard() -> None:
+    unit = build_atomic_evidence_units(
+        [_chunk("C1", "GLOBAL BLUE / 글로벌 1위 사업자")],
+        issuer_id="204620",
+    )[0]
+
+    request = build_atomic_evidence_request(
+        unit,
+        issuer_id="204620",
+        issuer_name="글로벌텍스프리",
+    )
+
+    assert "Issuer ID: 204620" in request.user
+    assert "Issuer name: 글로벌텍스프리" in request.user
+    assert request.metadata["issuer_name"] == "글로벌텍스프리"
+
+
+def test_atomic_request_prioritizes_explicit_observable_outcome_anchors() -> None:
+    unit = build_atomic_evidence_units(
+        [_chunk("C1", "회사의 제품은 시장점유율 1위이다.")],
+        issuer_id="ISSUER-1",
+    )[0]
+
+    request = build_atomic_evidence_request(
+        unit,
+        issuer_id="ISSUER-1",
+        issuer_name="Issuer",
+    )
+
+    assert request.metadata["prompt_version"] == "atomic-evidence-classifier/10"
+    assert request.metadata["rubric_version"] == "structural-moat-rubric/9"
+    assert "Positive routing priority" in request.system
+    assert "does not mean an observable outcome should be returned as NONE" in request.system
+    assert "issuer-owned product, brand, or platform outcome belongs to COMPANY" in request.system
+    assert "Do not use PRODUCT_CATEGORY for an issuer-owned product's market share" in request.system
+
+
+def test_atomic_api_schema_uses_explicit_aliases_without_changing_internal_fields() -> None:
     schema = AtomicEvidenceExtraction.model_json_schema()
     properties = schema["properties"]
 
-    assert {"relevant", "type", "direction", "fact", "mechanism", "scope", "subject", "predicate", "horizon", "metric"} <= set(properties)
+    assert {
+        "relevant",
+        "type",
+        "direction",
+        "fact",
+        "mechanism",
+        "scope",
+        "segment",
+        "subject",
+        "predicate",
+        "horizon",
+        "metric",
+    } <= set(properties)
     assert "is_investment_relevant" not in properties
     parsed = AtomicEvidenceExtraction.model_validate(
         {

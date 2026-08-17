@@ -44,6 +44,16 @@ def _openai_compatible_schema(value: Any) -> Any:
     return value
 
 
+def _canonical_json_object(value: Any) -> Any:
+    """Return a recursively key-sorted JSON value for byte-stable API input."""
+
+    if isinstance(value, dict):
+        return {key: _canonical_json_object(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_canonical_json_object(item) for item in value]
+    return value
+
+
 class TransportUsage(ContractModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
@@ -73,6 +83,7 @@ class OpenAIResponsesTransport:
         summary_model: str = "gpt-5-nano",
         moat_model: str = "gpt-5.6-luna",
         summary_reasoning_effort: str = "low",
+        atomic_reasoning_effort: str = "medium",
         moat_reasoning_effort: str = "medium",
         max_output_tokens: int = 8_000,
         max_retries: int = 4,
@@ -88,25 +99,37 @@ class OpenAIResponsesTransport:
             moat_model = model
         if reasoning_effort is not None:
             summary_reasoning_effort = reasoning_effort
+            atomic_reasoning_effort = reasoning_effort
             moat_reasoning_effort = reasoning_effort
         self.summary_model = summary_model
         self.moat_model = moat_model
         self.summary_reasoning_effort = summary_reasoning_effort
+        self.atomic_reasoning_effort = atomic_reasoning_effort
         self.moat_reasoning_effort = moat_reasoning_effort
         self.max_output_tokens = max_output_tokens
         self.max_retries = max_retries
-        if client is None:
+        self.timeout_seconds = timeout_seconds
+        self.client = client
+
+    def _client(self) -> Any:
+        """Initialize the SDK only when a cache miss needs a live request.
+
+        A fully populated replay cache is intentionally usable offline and
+        without exposing an API credential to a reproducibility run.
+        """
+
+        if self.client is None:
             try:
                 from openai import OpenAI
             except ImportError as exc:
                 raise RuntimeError('OpenAI support is optional; install with: pip install -e ".[llm]"') from exc
             try:
-                client = OpenAI(timeout=timeout_seconds, max_retries=0)
+                self.client = OpenAI(timeout=self.timeout_seconds, max_retries=0)
             except Exception as exc:
                 raise RuntimeError(
                     "failed to initialize OpenAI client; verify OPENAI_API_KEY and client configuration"
                 ) from exc
-        self.client = client
+        return self.client
 
     def execute(self, request: LLMRequest, response_model: type[ResponseT]) -> TransportResult[ResponseT]:
         last_error: Exception | None = None
@@ -117,11 +140,20 @@ class OpenAIResponsesTransport:
                     from openai.lib._pydantic import to_strict_json_schema
                 except ImportError as exc:
                     raise RuntimeError("installed OpenAI SDK cannot build a strict response schema") from exc
+                static_content: dict[str, Any] = {
+                    "type": "input_text",
+                    "text": request.system,
+                }
+                if request_model.startswith("gpt-5.6") and request.prompt_cache_breakpoint:
+                    static_content["prompt_cache_breakpoint"] = {"mode": "explicit"}
                 create_kwargs: dict[str, Any] = dict(
                     model=request_model,
                     input=[
-                        {"role": "system", "content": request.system},
-                        {"role": "user", "content": request.user},
+                        {"role": "system", "content": [static_content]},
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": request.user}],
+                        },
                     ],
                     text={
                         "verbosity": "low",
@@ -129,8 +161,10 @@ class OpenAIResponsesTransport:
                             "type": "json_schema",
                             "name": response_model.__name__,
                             "strict": True,
-                            "schema": _openai_compatible_schema(
-                                to_strict_json_schema(response_model)
+                            "schema": _canonical_json_object(
+                                _openai_compatible_schema(
+                                    to_strict_json_schema(response_model)
+                                )
                             ),
                         }
                     },
@@ -141,13 +175,14 @@ class OpenAIResponsesTransport:
                 if request.prompt_cache_key:
                     create_kwargs["prompt_cache_key"] = request.prompt_cache_key
                 if request_model.startswith("gpt-5.6"):
-                    # The stable atomic instruction block is below GPT-5.6's
-                    # 1,024-token cache minimum. Explicit-only mode with no
-                    # breakpoint prevents a cache write for every changing
-                    # source unit; exact unchanged units use the local replay
-                    # cache instead.
-                    create_kwargs["prompt_cache_options"] = {"mode": "explicit"}
-                response = self.client.responses.create(**create_kwargs)
+                    # Explicit-only mode prevents one-off company/source
+                    # suffixes from becoming paid cache writes. Prefixes below
+                    # GPT-5.6's 1,024-token minimum simply remain uncached.
+                    cache_options: dict[str, str] = {"mode": "explicit"}
+                    if request.prompt_cache_breakpoint:
+                        cache_options["ttl"] = request.prompt_cache_ttl
+                    create_kwargs["prompt_cache_options"] = cache_options
+                response = self._client().responses.create(**create_kwargs)
                 output_text = str(getattr(response, "output_text", "") or "")
                 if not output_text:
                     refusal = self._refusal_text(response)
@@ -188,7 +223,13 @@ class OpenAIResponsesTransport:
         raise RuntimeError(f"OpenAI request failed after {self.max_retries + 1} attempt(s): {last_error}") from last_error
 
     def _model_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task in {
+            LLMTask.LOCAL_EVIDENCE_EXTRACTION,
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_model
         return self.summary_model
 
@@ -371,7 +412,13 @@ class OpenAIResponsesTransport:
                 return repair_json(candidate, return_objects=True)
 
     def _effort_for(self, task: LLMTask) -> str:
-        if task in {LLMTask.LOCAL_EVIDENCE_EXTRACTION, LLMTask.FINAL_MOAT_SCORING}:
+        if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+            return self.atomic_reasoning_effort
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.CANDIDATE_ATOMIC_AUDIT,
+            LLMTask.FINAL_MOAT_SCORING,
+        }:
             return self.moat_reasoning_effort
         return self.summary_reasoning_effort
 
@@ -380,6 +427,13 @@ class OpenAIResponsesTransport:
         # company-level answer budget. Caps prevent malformed verbose outputs
         # while the configured global maximum remains a compatibility ceiling.
         if task == LLMTask.LOCAL_EVIDENCE_EXTRACTION:
+            return min(self.max_output_tokens, 2_000)
+        if task in {
+            LLMTask.CONTEXTUAL_MOAT_STRENGTH,
+            LLMTask.IR_INCREMENTAL_ASSESSMENT,
+        }:
+            return min(self.max_output_tokens, 8_000)
+        if task == LLMTask.CANDIDATE_ATOMIC_AUDIT:
             return min(self.max_output_tokens, 2_000)
         if task == LLMTask.SECTION_SUMMARY:
             return min(self.max_output_tokens, 3_000)

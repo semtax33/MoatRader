@@ -11,32 +11,52 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
-from moatrader.adapters import RawDocument
+from moatrader.adapters import RawDocument, enrich_ir_table_semantics
 from moatrader.audit import RunManifest
 from moatrader.canonical.ids import stable_id
-from moatrader.canonical.models import CanonicalDocumentBundle, SectionNode, TableNode
+from moatrader.canonical.models import (
+    CanonicalDocumentBundle,
+    SectionNode,
+    SourceType,
+    TableNode,
+)
 from moatrader.context import (
     DynamicTokenBudgetAllocator,
     EvidencePackBuilder,
+    MoatStrengthContext,
+    MoatStrengthContextBuilder,
     build_financial_feature_vector,
 )
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
     AtomicEvidenceJudgment,
     CompanyDossier,
+    ContextualMoatAssessment,
+    IrIncrementalAssessment,
+    CandidateAtomicAuditResult,
     CoverageMetrics,
     EvidenceCard,
     EvidenceDirection,
     EvidenceExtractionResult,
     EvidenceRelation,
     MoatScore,
+    ReconciledMoatAssessment,
     OUTCOME_CORROBORATION_TYPES,
     STRUCTURAL_MOAT_TYPES,
     SectionSummary,
 )
 from moatrader.evidence.ledger import EvidenceLedgerStore
 from moatrader.evidence.validation import (
-    derive_moat_score,
+    build_candidate_manifest,
+    apply_ir_incremental_assessment,
+    derive_audited_moat_score,
+    derive_rank_refinement,
+    reconcile_context_and_claims,
+    calibrate_contextual_moat_ordinals,
+    normalize_candidate_atomic_audit,
+    normalize_contextual_moat_assessment,
+    repair_contextual_moat_structure,
+    validate_contextual_moat_assessment,
     validate_evidence_result,
     validate_moat_score,
 )
@@ -44,18 +64,24 @@ from moatrader.evidence.processing import (
     assign_canonical_claim_identity,
     atomic_extraction_to_judgment,
     atomic_judgment_to_card,
+    build_atomic_classification_consensus,
     build_canonical_claim_set,
     build_evidence_relations,
     build_evidence_preserving_summaries,
     build_forward_driver_cards,
     cluster_duplicate_evidence,
+    normalize_atomic_extraction,
 )
 from moatrader.evidence.atomic import (
     ATOMIC_RUBRIC_VERSION,
     ATOMIC_SEGMENTATION_VERSION,
     atomic_unit_set_sha256,
     build_atomic_evidence_units,
+    build_candidate_atomic_evidence_allowlist,
+    build_candidate_targeted_atomic_audit,
+    map_context_references_to_atomic_units,
     select_atomic_evidence_units,
+    select_context_cited_atomic_units,
 )
 from moatrader.evidence.metamorphic import audit_company_metamorphs
 from moatrader.financial import (
@@ -70,6 +96,9 @@ from moatrader.llm import (
     LLMRequest,
     LLMTransport,
     build_atomic_evidence_request,
+    build_candidate_atomic_audit_request,
+    build_contextual_moat_strength_request,
+    build_ir_incremental_assessment_request,
     build_section_summary_request,
 )
 from moatrader.llm.transport import TransportResult, TransportUsage
@@ -90,7 +119,7 @@ from moatrader.universe import CompanyInput, UniverseManifest
 
 
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
-RUNNER_VERSION = "0.8.0"
+RUNNER_VERSION = "0.9.5"
 
 
 class MoatUniverseRunner:
@@ -111,6 +140,10 @@ class MoatUniverseRunner:
         self.snapshots = FinancialSnapshotBuilder()
         self.retriever = EvidenceRetriever()
         self.pack_builder = EvidencePackBuilder()
+        self.strength_context_builder = MoatStrengthContextBuilder(
+            model_context_tokens=config.strength_context_tokens,
+            prompt_reserve_tokens=config.strength_prompt_reserve_tokens,
+        )
         self.replay_cache = (
             LLMReplayCache(
                 config.llm_replay_cache_directory,
@@ -118,6 +151,7 @@ class MoatUniverseRunner:
                 summary_model=config.summary_model,
                 moat_model=config.moat_model,
                 summary_reasoning_effort=config.summary_reasoning_effort,
+                atomic_reasoning_effort=config.atomic_reasoning_effort,
                 moat_reasoning_effort=config.moat_reasoning_effort,
                 engine_version=RUNNER_VERSION,
             )
@@ -248,10 +282,53 @@ class MoatUniverseRunner:
             ]
             self.store.write_json(company_dir / "quality-gate.json", quality_assessments)
             rejected = [assessment for assessment in quality_assessments if not assessment.passed]
-            if rejected and not self.config.allow_low_quality:
+            source_type_by_document_id = {
+                bundle.metadata.source_document_id: bundle.metadata.source_type
+                for bundle in bundles
+            }
+            rejected_ir_document_ids = {
+                assessment.source_document_id
+                for assessment in rejected
+                if source_type_by_document_id.get(assessment.source_document_id) == SourceType.IR
+            }
+            rejected_base = [
+                assessment
+                for assessment in rejected
+                if source_type_by_document_id.get(assessment.source_document_id) != SourceType.IR
+            ]
+            ir_available = any(bundle.metadata.source_type == SourceType.IR for bundle in bundles)
+            available_ir_years = sorted(
+                {
+                    bundle.metadata.available_at.year
+                    for bundle in bundles
+                    if bundle.metadata.source_type == SourceType.IR
+                }
+            )
+            usable_ir_bundles = [
+                bundle
+                for bundle in bundles
+                if bundle.metadata.source_type == SourceType.IR
+                and bundle.metadata.source_document_id not in rejected_ir_document_ids
+            ]
+            usable_ir_years = sorted(
+                {bundle.metadata.available_at.year for bundle in usable_ir_bundles}
+            )
+            longitudinal_ir_available = (
+                len(available_ir_years) >= self.config.minimum_longitudinal_ir_years
+            )
+            longitudinal_ir_usable = (
+                len(usable_ir_years) >= self.config.minimum_longitudinal_ir_years
+            )
+            ir_usable = (
+                longitudinal_ir_usable
+                if self.config.longitudinal_ir_mode
+                else bool(usable_ir_bundles)
+            )
+            quality_failure = rejected_base if self.config.incremental_ir_mode else rejected
+            if quality_failure and not self.config.allow_low_quality:
                 details = "; ".join(
                     f"{assessment.source_document_id}: {', '.join(assessment.failures)}"
-                    for assessment in rejected
+                    for assessment in quality_failure
                 )
                 raise ValueError(f"parser quality gate failed: {details}")
             snapshot = self.snapshots.build(bundles, as_of=self.config.as_of)
@@ -262,34 +339,176 @@ class MoatUniverseRunner:
             self.store.write_text(company_dir / "financial-feature-vector.md", feature_vector.markdown)
             dcf = self._calculate_dcf(company, company_dir, snapshot)
 
-            dedup = deduplicate_chunks(chunks)
-            chunks = dedup.kept
-            self.store.write_json(company_dir / "chunk-dedup.json", dedup)
+            if self.config.incremental_ir_mode:
+                base_input_chunks = [chunk for chunk in chunks if not self._is_ir_chunk(chunk)]
+                ir_input_chunks = [
+                    chunk
+                    for chunk in chunks
+                    if self._is_ir_chunk(chunk)
+                    and str(chunk.metadata.get("source_document_id"))
+                    not in rejected_ir_document_ids
+                ]
+                base_dedup = deduplicate_chunks(base_input_chunks)
+                if self.config.longitudinal_ir_mode:
+                    ir_chunks = []
+                    ir_dedup_by_document: dict[str, object] = {}
+                    for document_id in sorted(
+                        {chunk.document_id for chunk in ir_input_chunks}
+                    ):
+                        document_dedup = deduplicate_chunks(
+                            [
+                                chunk
+                                for chunk in ir_input_chunks
+                                if chunk.document_id == document_id
+                            ]
+                        )
+                        ir_chunks.extend(document_dedup.kept)
+                        ir_dedup_by_document[document_id] = document_dedup
+                    ir_chunks.sort(
+                        key=lambda chunk: (
+                            str(chunk.metadata.get("available_at") or ""),
+                            chunk.document_id,
+                            chunk.chunk_id,
+                        )
+                    )
+                    ir_dedup_payload: object = {
+                        "schema_version": "longitudinal-ir-document-dedup/1",
+                        "by_document": ir_dedup_by_document,
+                        "cross_period_deduplication": False,
+                    }
+                else:
+                    ir_dedup = deduplicate_chunks(ir_input_chunks)
+                    ir_chunks = ir_dedup.kept
+                    ir_dedup_payload = ir_dedup
+                base_chunks = base_dedup.kept
+                chunks = [*base_chunks, *ir_chunks]
+                self.store.write_json(
+                    company_dir / "chunk-dedup.json",
+                    {
+                        "schema_version": "source-partitioned-chunk-dedup/1",
+                        "base": base_dedup,
+                        "ir": ir_dedup_payload,
+                        "ir_cannot_displace_base": True,
+                        "longitudinal_periods_preserved": (
+                            self.config.longitudinal_ir_mode
+                        ),
+                    },
+                )
+            else:
+                dedup = deduplicate_chunks(chunks)
+                chunks = dedup.kept
+                base_chunks = list(chunks)
+                ir_chunks = []
+                self.store.write_json(company_dir / "chunk-dedup.json", dedup)
             self.store.write_jsonl(company_dir / "chunks.jsonl", chunks)
 
             issuer_id = company.issuer_id or bundles[0].metadata.issuer_id
-            all_atomic_units = build_atomic_evidence_units(chunks, issuer_id=issuer_id)
-            evidence_chunks = select_atomic_evidence_units(
-                all_atomic_units,
+            base_strength_context = self.strength_context_builder.build(base_chunks)
+            ir_strength_context = self.strength_context_builder.build(
+                ir_chunks,
+                preserve_document_coverage=self.config.longitudinal_ir_mode,
+            )
+            strength_context = (
+                self._combine_strength_contexts(base_strength_context, ir_strength_context)
+                if self.config.incremental_ir_mode
+                else base_strength_context
+            )
+            selected_strength_chunk_ids = set(strength_context.selected_chunk_ids)
+            strength_chunks = [
+                chunk
+                for chunk in chunks
+                if chunk.chunk_id in selected_strength_chunk_ids
+            ]
+            strength_request = build_contextual_moat_strength_request(
+                base_strength_context,
+                issuer_id=issuer_id,
+                as_of=self.config.as_of.date(),
+            )
+            self.store.write_json(
+                company_dir / "moat-strength-context-base.json",
+                base_strength_context,
+            )
+            self.store.write_text(
+                company_dir / "moat-strength-context-base.md",
+                base_strength_context.markdown,
+            )
+            self.store.write_json(
+                company_dir / "moat-strength-request-base.json",
+                strength_request,
+            )
+            if self.config.incremental_ir_mode:
+                self.store.write_json(
+                    company_dir / "moat-strength-context-ir.json",
+                    ir_strength_context,
+                )
+                self.store.write_text(
+                    company_dir / "moat-strength-context-ir.md",
+                    ir_strength_context.markdown,
+                )
+            self.store.write_json(company_dir / "moat-strength-context.json", strength_context)
+            self.store.write_text(
+                company_dir / "moat-strength-context.md",
+                strength_context.markdown,
+            )
+            self.store.write_json(
+                company_dir / "moat-strength-retrieval.json",
+                strength_context.retrieval,
+            )
+            self.store.write_json(
+                company_dir / "moat-strength-request.json",
+                strength_request,
+            )
+            base_atomic_units = build_atomic_evidence_units(base_chunks, issuer_id=issuer_id)
+            ir_atomic_units = build_atomic_evidence_units(ir_chunks, issuer_id=issuer_id)
+            all_atomic_units = [*base_atomic_units, *ir_atomic_units]
+            base_evidence_chunks = select_atomic_evidence_units(
+                base_atomic_units,
                 self.config.maximum_atomic_evidence_units,
             )
+            ir_evidence_chunks = (
+                select_atomic_evidence_units(
+                    ir_atomic_units,
+                    self.config.maximum_ir_atomic_evidence_units,
+                    preserve_document_coverage=self.config.longitudinal_ir_mode,
+                )
+                if self.config.incremental_ir_mode
+                else []
+            )
+            evidence_chunks = [*base_evidence_chunks, *ir_evidence_chunks]
             self.store.write_jsonl(company_dir / "atomic-evidence-units.jsonl", evidence_chunks)
             self.store.write_json(
                 company_dir / "evidence-chunk-selection.json",
                 {
-                    "method": "atomic_content_set/1",
+                    "method": (
+                        "source_partitioned_atomic_content_set/1"
+                        if self.config.incremental_ir_mode
+                        else "atomic_content_set/1"
+                    ),
                     "segmentation_version": ATOMIC_SEGMENTATION_VERSION,
                     "rubric_version": ATOMIC_RUBRIC_VERSION,
                     "available_chunk_count": len(chunks),
                     "available_atomic_unit_count": len(all_atomic_units),
                     "selected_atomic_unit_count": len(evidence_chunks),
                     "atomic_unit_set_sha256": atomic_unit_set_sha256(evidence_chunks),
+                    "base_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                        base_evidence_chunks
+                    ),
+                    "ir_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                        ir_evidence_chunks
+                    ),
+                    "base_selected_atomic_unit_count": len(base_evidence_chunks),
+                    "ir_selected_atomic_unit_count": len(ir_evidence_chunks),
+                    "ir_cannot_displace_base": self.config.incremental_ir_mode,
                     "selected_chunk_ids": [chunk.chunk_id for chunk in evidence_chunks],
                 },
             )
 
             evidence_requests = [
-                build_atomic_evidence_request(chunk, issuer_id=issuer_id)
+                build_atomic_evidence_request(
+                    chunk,
+                    issuer_id=issuer_id,
+                    issuer_name=company.issuer_name,
+                )
                 for chunk in evidence_chunks
             ]
             self.store.write_jsonl(company_dir / "evidence-requests.jsonl", evidence_requests)
@@ -308,21 +527,67 @@ class MoatUniverseRunner:
             )
             minimal_schema_tokens = token_counter.count(minimal_schema_json)
             prior_schema_tokens = token_counter.count(prior_schema_json)
+            static_prefix_tokens = (
+                token_counter.count(evidence_requests[0].system + minimal_schema_json)
+                if evidence_requests
+                else 0
+            )
+            dynamic_suffix_tokens = sum(
+                token_counter.count(request.user) for request in evidence_requests
+            )
+            source_evidence_tokens = sum(
+                token_counter.count(chunk.markdown) for chunk in evidence_chunks
+            )
+            estimated_atomic_input_tokens = (
+                static_prefix_tokens * len(evidence_requests) + dynamic_suffix_tokens
+            )
+            strength_schema_json = json.dumps(
+                ContextualMoatAssessment.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            strength_static_prefix_tokens = token_counter.count(
+                strength_request.system + strength_schema_json
+            )
+            strength_dynamic_suffix_tokens = token_counter.count(strength_request.user)
+            estimated_strength_input_tokens = (
+                strength_static_prefix_tokens + strength_dynamic_suffix_tokens
+            )
+            estimated_cacheable_prefix_tokens = (
+                (static_prefix_tokens * len(evidence_requests) if static_prefix_tokens >= 1_024 else 0)
+                + (
+                    strength_static_prefix_tokens
+                    if strength_static_prefix_tokens >= 1_024
+                    else 0
+                )
+            )
+            estimated_dynamic_suffix_tokens = (
+                dynamic_suffix_tokens + strength_dynamic_suffix_tokens
+            )
+            expected_output_token_cap = (
+                len(evidence_requests) * min(self.config.max_output_tokens, 2_000)
+                + min(self.config.max_output_tokens, 8_000)
+            )
             token_budget_audit = {
-                "schema_version": "llm-token-budget/1",
+                "schema_version": "llm-token-budget/4",
+                "optimization_priority": "CORRECTNESS_THEN_COST",
+                "full_context_tokens_estimated": strength_context.token_count,
+                "compact_context_tokens_estimated": strength_context.token_count,
+                "strength_context_compression_ratio": 1.0,
+                "strength_context_compressed": False,
+                "estimated_cacheable_prefix_tokens_total": estimated_cacheable_prefix_tokens,
+                "estimated_dynamic_suffix_tokens_all_tasks": estimated_dynamic_suffix_tokens,
+                "expected_output_token_cap_total": expected_output_token_cap,
                 "atomic_request_count": len(evidence_requests),
-                "estimated_atomic_input_tokens": sum(
-                    token_counter.count(
-                        request.system
-                        + request.user
-                        + json.dumps(
-                            request.response_schema,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        )
-                    )
-                    for request in evidence_requests
+                "estimated_atomic_input_tokens": estimated_atomic_input_tokens,
+                "estimated_static_prefix_tokens_per_request": static_prefix_tokens,
+                "estimated_dynamic_suffix_tokens_total": dynamic_suffix_tokens,
+                "estimated_source_evidence_tokens_total": source_evidence_tokens,
+                "estimated_useful_source_token_ratio": (
+                    source_evidence_tokens / estimated_atomic_input_tokens
+                    if estimated_atomic_input_tokens
+                    else 0.0
                 ),
                 "minimal_atomic_schema_tokens": minimal_schema_tokens,
                 "prior_full_atomic_schema_tokens": prior_schema_tokens,
@@ -335,8 +600,33 @@ class MoatUniverseRunner:
                     0,
                     (prior_schema_tokens - minimal_schema_tokens) * len(evidence_requests),
                 ),
+                "atomic_reasoning_effort": self.config.atomic_reasoning_effort,
                 "atomic_max_output_tokens": min(self.config.max_output_tokens, 2_000),
+                "strength_request_count": 1,
+                "strength_selected_chunk_count": len(strength_context.selected_chunk_ids),
+                "strength_context_token_budget": strength_context.token_budget,
+                "strength_context_tokens_estimated": strength_context.token_count,
+                "estimated_strength_input_tokens": estimated_strength_input_tokens,
+                "estimated_strength_static_prefix_tokens": strength_static_prefix_tokens,
+                "estimated_strength_dynamic_suffix_tokens": strength_dynamic_suffix_tokens,
+                "strength_reasoning_effort": self.config.moat_reasoning_effort,
+                "strength_max_output_tokens": min(self.config.max_output_tokens, 8_000),
+                "strength_context_policy": "ALWAYS_ON_BROAD_BALANCED_CANONICAL_CHUNKS",
+                "strength_compression_ablation_enabled": False,
+                "canonical_schema_serialization": True,
+                "prompt_cache_mode": "explicit",
+                "prompt_cache_ttl": "30m",
+                "prompt_cache_breakpoint_count": sum(
+                    request.prompt_cache_breakpoint for request in evidence_requests
+                ) + int(strength_request.prompt_cache_breakpoint),
+                "prompt_cache_minimum_prefix_tokens": 1_024,
+                "estimated_prefix_cache_eligible": static_prefix_tokens >= 1_024,
+                "cache_eligibility_note": (
+                    "heuristic only; provider-rendered prefix length controls eligibility"
+                ),
+                "context_strategy": "DUAL_LANE_ATOMIC_AUDIT_PLUS_BROAD_CONTEXTUAL_STRENGTH",
                 "exact_usage_source": "llm-calls.jsonl provider response usage",
+                "exact_counting_endpoint": "POST /v1/responses/input_tokens",
             }
             self.store.write_json(company_dir / "llm-token-budget.json", token_budget_audit)
             if self.config.dry_run:
@@ -348,6 +638,8 @@ class MoatUniverseRunner:
                     run_signature=signature,
                     source_document_ids=source_document_ids,
                     chunk_count=len(chunks),
+                    selected_chunk_count=len(evidence_chunks),
+                    strength_context_chunk_count=len(strength_context.selected_chunk_ids),
                     dcf=dcf,
                     current_price=company.current_price,
                     price_as_of=company.price_as_of,
@@ -359,6 +651,267 @@ class MoatUniverseRunner:
                 self._checkpoint(checkpoint_path, signature, "PREPARED")
                 return result
 
+            self._checkpoint(checkpoint_path, signature, "ASSESSING_MOAT_STRENGTH")
+            strength_assessment_path = company_dir / "contextual-moat-assessment.json"
+            raw_strength_assessment_path = (
+                company_dir / "contextual-moat-assessment-raw.json"
+            )
+            raw_base_assessment_path = (
+                company_dir / "contextual-moat-assessment-base-raw.json"
+            )
+            if self.config.resume and raw_base_assessment_path.is_file():
+                raw_base_assessment = ContextualMoatAssessment.model_validate(
+                    self.store.read_json(raw_base_assessment_path)
+                )
+            else:
+                # The base request is byte-identical in DART-only and DART+IR.
+                # The experiment replay cache therefore removes one entire
+                # source of paired model variance.
+                raw_base_assessment = self._execute_validated(
+                    strength_request,
+                    ContextualMoatAssessment,
+                    lambda _value: [],
+                    audits,
+                    company_dir,
+                )
+                self.store.write_json(
+                    raw_base_assessment_path,
+                    raw_base_assessment,
+                )
+            base_strength_assessment, base_strength_repair = (
+                normalize_contextual_moat_assessment(
+                    raw_base_assessment,
+                    base_strength_context.references,
+                )
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-assessment-base.json",
+                base_strength_assessment,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-assessment-base-repair.json",
+                base_strength_repair,
+            )
+
+            ir_incremental_assessment: IrIncrementalAssessment | None = None
+            ir_incremental_merge: dict[str, object] = {
+                "schema_version": "ir-incremental-merge/2",
+                "strategy": "FROZEN_DART_BASE_PLUS_VALIDATED_IR_DELTA",
+                "material_delta_count": 0,
+                "actions": [],
+                "reason": "IR_INCREMENTAL_MODE_DISABLED",
+            }
+            raw_strength_assessment = (
+                base_strength_assessment
+                if self.config.incremental_ir_mode
+                else raw_base_assessment
+            )
+            if (
+                self.config.incremental_ir_mode
+                and ir_usable
+                and ir_strength_context.selected_chunk_ids
+            ):
+                ir_request = build_ir_incremental_assessment_request(
+                    base_strength_assessment,
+                    ir_strength_context,
+                    issuer_id=issuer_id,
+                    as_of=self.config.as_of.date(),
+                )
+                self.store.write_json(
+                    company_dir / "moat-strength-request-ir-delta.json",
+                    ir_request,
+                )
+                ir_raw_path = company_dir / "ir-incremental-assessment-raw.json"
+                if self.config.resume and ir_raw_path.is_file():
+                    ir_incremental_assessment = IrIncrementalAssessment.model_validate(
+                        self.store.read_json(ir_raw_path)
+                    )
+                else:
+                    ir_incremental_assessment = self._execute_validated(
+                        ir_request,
+                        IrIncrementalAssessment,
+                        lambda _value: [],
+                        audits,
+                        company_dir,
+                    )
+                    self.store.write_json(ir_raw_path, ir_incremental_assessment)
+                raw_strength_assessment, ir_incremental_merge = (
+                    apply_ir_incremental_assessment(
+                        base_strength_assessment,
+                        ir_incremental_assessment,
+                        ir_strength_context.references,
+                    )
+                )
+            elif self.config.incremental_ir_mode:
+                if (
+                    self.config.longitudinal_ir_mode
+                    and not longitudinal_ir_usable
+                ):
+                    ir_incremental_merge["reason"] = (
+                        "INSUFFICIENT_LONGITUDINAL_IR_YEARS"
+                    )
+                else:
+                    ir_incremental_merge["reason"] = (
+                        "IR_QUALITY_GATE_FAILED"
+                        if ir_available and not ir_usable
+                        else "NO_USABLE_IR_CONTEXT"
+                    )
+            self.store.write_json(
+                company_dir / "ir-incremental-merge.json",
+                ir_incremental_merge,
+            )
+            self.store.write_json(
+                raw_strength_assessment_path,
+                raw_strength_assessment,
+            )
+            structural_strength_assessment, structural_strength_repair = (
+                repair_contextual_moat_structure(
+                    raw_strength_assessment,
+                    strength_context.references,
+                )
+            )
+            strength_assessment, ordinal_calibration = (
+                calibrate_contextual_moat_ordinals(
+                    structural_strength_assessment,
+                )
+            )
+            strength_repair_actions = [
+                *structural_strength_repair["actions"],
+                *ordinal_calibration["actions"],
+            ]
+            strength_repair = {
+                "schema_version": "contextual-field-repair/2",
+                "strategy": "STRUCTURAL_REPAIR_THEN_PUBLIC_ORDINAL_CALIBRATION",
+                "action_count": len(strength_repair_actions),
+                "actions": strength_repair_actions,
+                "structural_repair": structural_strength_repair,
+                "ordinal_calibration": ordinal_calibration,
+            }
+            strength_errors = validate_contextual_moat_assessment(
+                strength_assessment,
+                strength_context.references,
+            )
+            if strength_errors:
+                raise ValueError(
+                    "normalized contextual assessment failed validation: "
+                    + "; ".join(strength_errors)
+                )
+            self.store.write_json(strength_assessment_path, strength_assessment)
+            self.store.write_json(
+                company_dir / "contextual-moat-assessment-structural.json",
+                structural_strength_assessment,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-field-repair.json",
+                strength_repair,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-structural-repair.json",
+                structural_strength_repair,
+            )
+            self.store.write_json(
+                company_dir / "contextual-moat-ordinal-calibration.json",
+                ordinal_calibration,
+            )
+            candidate_manifest = build_candidate_manifest(strength_assessment)
+            base_candidate_manifest = build_candidate_manifest(base_strength_assessment)
+            self.store.write_json(
+                company_dir / "moat-candidate-manifest.json",
+                candidate_manifest,
+            )
+            self.store.write_json(
+                company_dir / "moat-candidate-manifest-base.json",
+                base_candidate_manifest,
+            )
+
+            baseline_atomic_units = list(evidence_chunks)
+            baseline_base_atomic_units = list(base_evidence_chunks)
+            baseline_ir_atomic_units = list(ir_evidence_chunks)
+            chunk_id_by_ref = {
+                reference.ref_id: reference.chunk_id
+                for reference in strength_context.references
+            }
+            raw_quote_by_ref = {
+                reference.ref_id: reference.raw_quote
+                for reference in strength_context.references
+            }
+            atomic_unit_ids_by_ref = map_context_references_to_atomic_units(
+                all_atomic_units,
+                chunk_id_by_ref=chunk_id_by_ref,
+                raw_quote_by_ref=raw_quote_by_ref,
+            )
+            cited_atomic_units = select_context_cited_atomic_units(
+                all_atomic_units,
+                strength_assessment,
+                chunk_id_by_ref=chunk_id_by_ref,
+                raw_quote_by_ref=raw_quote_by_ref,
+            )
+            units_by_id = {
+                unit.chunk_id: unit
+                for unit in [*baseline_atomic_units, *cited_atomic_units]
+            }
+            evidence_chunks = sorted(
+                units_by_id.values(),
+                key=lambda unit: str(unit.metadata["atomic_evidence_key"]),
+            )
+            self.store.write_jsonl(
+                company_dir / "atomic-audit-baseline-units.jsonl",
+                baseline_atomic_units,
+            )
+            self.store.write_jsonl(
+                company_dir / "atomic-audit-baseline-base-units.jsonl",
+                baseline_base_atomic_units,
+            )
+            self.store.write_jsonl(
+                company_dir / "atomic-audit-baseline-ir-units.jsonl",
+                baseline_ir_atomic_units,
+            )
+            self.store.write_jsonl(
+                company_dir / "atomic-evidence-units.jsonl",
+                evidence_chunks,
+            )
+            self.store.write_json(
+                company_dir / "evidence-chunk-selection.json",
+                {
+                    "method": "dual_lane_citation_audit/1",
+                    "segmentation_version": ATOMIC_SEGMENTATION_VERSION,
+                    "rubric_version": ATOMIC_RUBRIC_VERSION,
+                    "available_chunk_count": len(chunks),
+                    "available_atomic_unit_count": len(all_atomic_units),
+                    "baseline_atomic_unit_count": len(baseline_atomic_units),
+                    "baseline_base_atomic_unit_count": len(baseline_base_atomic_units),
+                    "baseline_ir_atomic_unit_count": len(baseline_ir_atomic_units),
+                    "baseline_base_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                        baseline_base_atomic_units
+                    ),
+                    "baseline_ir_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                        baseline_ir_atomic_units
+                    ),
+                    "context_cited_atomic_unit_count": len(cited_atomic_units),
+                    "selected_atomic_unit_count": len(evidence_chunks),
+                    "atomic_unit_set_sha256": atomic_unit_set_sha256(evidence_chunks),
+                    "selected_chunk_ids": [unit.chunk_id for unit in evidence_chunks],
+                    "parent_fallback_enabled": False,
+                },
+            )
+            evidence_requests = [
+                build_atomic_evidence_request(
+                    chunk,
+                    issuer_id=issuer_id,
+                    issuer_name=company.issuer_name,
+                )
+                for chunk in evidence_chunks
+            ]
+            self.store.write_jsonl(
+                company_dir / "evidence-requests.jsonl",
+                evidence_requests,
+            )
+            self._refresh_atomic_token_budget(
+                company_dir,
+                evidence_requests,
+                evidence_chunks,
+            )
+
             self._checkpoint(checkpoint_path, signature, "EXTRACTING_EVIDENCE")
             current_cards = self._load_or_extract_evidence(
                 company_dir,
@@ -366,6 +919,7 @@ class MoatUniverseRunner:
                 bundles,
                 audits,
                 issuer_id=issuer_id,
+                issuer_name=company.issuer_name,
             )
             self.store.write_jsonl(company_dir / "current-evidence.jsonl", current_cards)
             ledger_merge = None
@@ -387,6 +941,100 @@ class MoatUniverseRunner:
                 for card in cards
             ]
             self.store.write_jsonl(company_dir / "evidence.jsonl", cards)
+
+            final_base_atomic_units = [
+                unit for unit in evidence_chunks if not self._is_ir_chunk(unit)
+            ]
+            final_ir_atomic_units = [
+                unit for unit in evidence_chunks if self._is_ir_chunk(unit)
+            ]
+            base_cards = [card for card in cards if card.source_type != SourceType.IR]
+            base_allowed_candidate_evidence = build_candidate_atomic_evidence_allowlist(
+                base_candidate_manifest,
+                base_cards,
+                final_base_atomic_units,
+                atomic_unit_ids_by_ref=atomic_unit_ids_by_ref,
+            )
+            base_candidate_audit = build_candidate_targeted_atomic_audit(
+                base_candidate_manifest,
+                base_cards,
+                allowed_evidence_ids=base_allowed_candidate_evidence,
+            )
+            base_candidate_audit, base_candidate_audit_repair = (
+                normalize_candidate_atomic_audit(
+                    base_candidate_audit,
+                    base_candidate_manifest,
+                    base_cards,
+                    allowed_evidence_ids=base_allowed_candidate_evidence,
+                )
+            )
+            base_reconciled = reconcile_context_and_claims(
+                base_strength_assessment,
+                base_cards,
+                contextual_chunks=[
+                    chunk
+                    for chunk in strength_chunks
+                    if not self._is_ir_chunk(chunk)
+                ],
+                atomic_units=final_base_atomic_units,
+                references=base_strength_context.references,
+                candidate_manifest=base_candidate_manifest,
+                candidate_audit=base_candidate_audit,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-allowlist-base.json",
+                base_allowed_candidate_evidence,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-base.json",
+                base_candidate_audit,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-base-repair.json",
+                base_candidate_audit_repair,
+            )
+            self.store.write_json(
+                company_dir / "moat-reconciliation-base.json",
+                base_reconciled,
+            )
+
+            allowed_candidate_evidence = build_candidate_atomic_evidence_allowlist(
+                candidate_manifest,
+                cards,
+                evidence_chunks,
+                atomic_unit_ids_by_ref=atomic_unit_ids_by_ref,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-allowlist.json",
+                allowed_candidate_evidence,
+            )
+            candidate_audit = build_candidate_targeted_atomic_audit(
+                candidate_manifest,
+                cards,
+                allowed_evidence_ids=allowed_candidate_evidence,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-method.json",
+                {
+                    "schema_version": "candidate-targeted-atomic-audit/1",
+                    "method": "PYTHON_EXACT_CANDIDATE_REF_TYPE_SCOPE_BINDING",
+                    "additional_llm_calls": 0,
+                },
+            )
+            candidate_audit, candidate_audit_repair = normalize_candidate_atomic_audit(
+                candidate_audit,
+                candidate_manifest,
+                cards,
+                allowed_evidence_ids=allowed_candidate_evidence,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit.json",
+                candidate_audit,
+            )
+            self.store.write_json(
+                company_dir / "candidate-atomic-audit-repair.json",
+                candidate_audit_repair,
+            )
             self.store.write_json(
                 company_dir / "forward-driver-cards.json",
                 build_forward_driver_cards(current_cards),
@@ -431,6 +1079,20 @@ class MoatUniverseRunner:
                     for card in cards
                     if card.evidence_type in OUTCOME_CORROBORATION_TYPES
                 ],
+            )
+
+            reconciled = reconcile_context_and_claims(
+                strength_assessment,
+                cards,
+                contextual_chunks=strength_chunks,
+                atomic_units=evidence_chunks,
+                references=strength_context.references,
+                candidate_manifest=candidate_manifest,
+                candidate_audit=candidate_audit,
+            )
+            self.store.write_json(
+                company_dir / "moat-reconciliation.json",
+                reconciled,
             )
 
             self._checkpoint(checkpoint_path, signature, "SUMMARIZING")
@@ -489,9 +1151,25 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "SCORING")
             score_path = company_dir / "moat-score.json"
             reducer_payload = {
-                "schema_version": "canonical-claim-reducer/1",
+                "schema_version": "dual-lane-strength-reducer/4",
                 "issuer_id": dossier.issuer_id,
                 "as_of": self.config.as_of.date().isoformat(),
+                "contextual_assessment": strength_assessment.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "structurally_repaired_assessment": structural_strength_assessment.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "candidate_manifest": [
+                    item.model_dump(mode="json", exclude_none=True)
+                    for item in candidate_manifest
+                ],
+                "candidate_atomic_audit": candidate_audit.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "reconciled_attributes": reconciled.model_dump(
+                    mode="json", exclude_none=True
+                ),
                 "canonical_claims": [
                     card.model_dump(mode="json", exclude_none=True)
                     for card in sorted(
@@ -512,21 +1190,242 @@ class MoatUniverseRunner:
             score_coverage = self._coverage(
                 bundles,
                 chunks,
-                selected_scoring_units,
+                strength_chunks,
                 total_evidence=len(structural_score_ids),
                 selected_evidence=len(scoring_dossier.evidence),
             )
-            if self.config.resume and score_path.is_file():
-                score = MoatScore.model_validate(self.store.read_json(score_path))
-            else:
-                score = derive_moat_score(
-                    None,
-                    scoring_dossier.evidence,
-                    issuer_id=dossier.issuer_id,
-                    as_of=self.config.as_of.date(),
-                    document_coverage=score_coverage,
+            base_structural_score_ids = {
+                card.evidence_id
+                for card in base_cards
+                if (
+                    (
+                        card.direction == EvidenceDirection.MOAT_POSITIVE
+                        and card.evidence_type in STRUCTURAL_MOAT_TYPES
+                    )
+                    or card.direction == EvidenceDirection.MOAT_NEGATIVE
                 )
-                self.store.write_json(score_path, score)
+            }
+            base_strength_chunks = [
+                chunk for chunk in strength_chunks if not self._is_ir_chunk(chunk)
+            ]
+            base_coverage = self._coverage(
+                [bundle for bundle in bundles if bundle.metadata.source_type != SourceType.IR],
+                base_chunks,
+                base_strength_chunks,
+                total_evidence=len(base_structural_score_ids),
+                selected_evidence=len(base_structural_score_ids),
+            )
+            base_score = derive_audited_moat_score(
+                base_reconciled,
+                base_cards,
+                issuer_id=dossier.issuer_id,
+                as_of=self.config.as_of.date(),
+                document_coverage=base_coverage,
+            )
+            base_rank_refinement, base_rank_refinement_status = derive_rank_refinement(
+                base_reconciled,
+                score_eligible=base_score.score_eligible,
+            )
+            base_score = base_score.model_copy(
+                update={
+                    "rank_refinement": base_rank_refinement,
+                    "rank_refinement_status": base_rank_refinement_status,
+                }
+            )
+            combined_score = derive_audited_moat_score(
+                reconciled,
+                cards,
+                issuer_id=dossier.issuer_id,
+                as_of=self.config.as_of.date(),
+                document_coverage=score_coverage,
+            )
+            ir_reference_ids = {
+                reference.ref_id for reference in ir_strength_context.references
+            }
+            ir_reference_by_id = {
+                reference.ref_id: reference
+                for reference in ir_strength_context.references
+            }
+            ir_evidence_ids = {
+                card.evidence_id for card in cards if card.source_type == SourceType.IR
+            }
+            ir_card_by_id = {
+                card.evidence_id: card
+                for card in cards
+                if card.source_type == SourceType.IR
+            }
+            atomic_unit_by_id = {unit.chunk_id: unit for unit in evidence_chunks}
+
+            def atomic_year(evidence_id: str) -> int | None:
+                card = ir_card_by_id.get(evidence_id)
+                unit = (
+                    atomic_unit_by_id.get(card.source_chunk_id)
+                    if card is not None
+                    else None
+                )
+                value = unit.metadata.get("available_at") if unit is not None else None
+                if not value:
+                    return None
+                try:
+                    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).year
+                except ValueError:
+                    return None
+
+            accepted_ir_items: list[dict[str, object]] = []
+            for category, items in (
+                ("mechanism", reconciled.mechanisms),
+                ("outcome", reconciled.outcomes),
+                ("counterevidence", reconciled.counterevidence),
+            ):
+                for item in items:
+                    accepted_refs = sorted(set(item.reference_ids) & ir_reference_ids)
+                    accepted_evidence = sorted(
+                        set(item.atomic_evidence_ids) & ir_evidence_ids
+                    )
+                    if accepted_refs or accepted_evidence:
+                        accepted_documents = sorted(
+                            {
+                                ir_reference_by_id[reference_id].document_id
+                                for reference_id in accepted_refs
+                                if reference_id in ir_reference_by_id
+                            }
+                            | {
+                                atomic_unit_by_id[ir_card_by_id[evidence_id].source_chunk_id].document_id
+                                for evidence_id in accepted_evidence
+                                if evidence_id in ir_card_by_id
+                                and ir_card_by_id[evidence_id].source_chunk_id
+                                in atomic_unit_by_id
+                            }
+                        )
+                        accepted_years = sorted(
+                            {
+                                ir_reference_by_id[reference_id].available_at.year
+                                for reference_id in accepted_refs
+                                if reference_id in ir_reference_by_id
+                                and ir_reference_by_id[reference_id].available_at
+                                is not None
+                            }
+                            | {
+                                year
+                                for evidence_id in accepted_evidence
+                                if (year := atomic_year(evidence_id)) is not None
+                            }
+                        )
+                        accepted_ir_items.append(
+                            {
+                                "category": category,
+                                "evidence_type": item.evidence_type.value,
+                                "ir_reference_ids": accepted_refs,
+                                "ir_atomic_evidence_ids": accepted_evidence,
+                                "ir_document_ids": accepted_documents,
+                                "ir_years": accepted_years,
+                            }
+                        )
+            accepted_ir_document_ids = sorted(
+                {
+                    document_id
+                    for item in accepted_ir_items
+                    for document_id in item["ir_document_ids"]
+                }
+            )
+            accepted_ir_years = sorted(
+                {
+                    year
+                    for item in accepted_ir_items
+                    for year in item["ir_years"]
+                }
+            )
+            ordinary_treatment_compliant = bool(
+                self.config.incremental_ir_mode
+                and ir_available
+                and ir_usable
+                and accepted_ir_items
+            )
+            longitudinal_treatment_compliant = bool(
+                ordinary_treatment_compliant
+                and len(accepted_ir_years) >= 2
+            )
+            treatment_compliant = (
+                longitudinal_treatment_compliant
+                if self.config.longitudinal_ir_mode
+                else ordinary_treatment_compliant
+            )
+            score = combined_score if treatment_compliant else base_score
+            rank_refinement, rank_refinement_status = derive_rank_refinement(
+                reconciled if treatment_compliant else base_reconciled,
+                score_eligible=score.score_eligible,
+            )
+            score = score.model_copy(
+                update={
+                    "rank_refinement": rank_refinement,
+                    "rank_refinement_status": rank_refinement_status,
+                }
+            )
+            self.store.write_json(
+                company_dir / "moat-score-frozen-base.json",
+                base_score,
+            )
+            self.store.write_json(
+                company_dir / "moat-score-combined-candidate.json",
+                combined_score,
+            )
+            treatment_audit = {
+                "schema_version": "ir-treatment-audit/2",
+                "IR_AVAILABLE": ir_available,
+                "IR_USABLE": ir_usable,
+                "incremental_ir_mode": self.config.incremental_ir_mode,
+                "longitudinal_ir_mode": self.config.longitudinal_ir_mode,
+                "minimum_longitudinal_ir_years": (
+                    self.config.minimum_longitudinal_ir_years
+                ),
+                "longitudinal_ir_available": longitudinal_ir_available,
+                "longitudinal_ir_usable": longitudinal_ir_usable,
+                "ir_document_count": len(
+                    [
+                        bundle
+                        for bundle in bundles
+                        if bundle.metadata.source_type == SourceType.IR
+                    ]
+                ),
+                "usable_ir_document_count": len(usable_ir_bundles),
+                "available_ir_years": available_ir_years,
+                "usable_ir_years": usable_ir_years,
+                "accepted_ir_item_count": len(accepted_ir_items),
+                "accepted_ir_items": accepted_ir_items,
+                "accepted_ir_document_ids": accepted_ir_document_ids,
+                "accepted_ir_years": accepted_ir_years,
+                "ordinary_treatment_compliant": ordinary_treatment_compliant,
+                "longitudinal_treatment_compliant": (
+                    longitudinal_treatment_compliant
+                ),
+                "treatment_compliant": treatment_compliant,
+                "frozen_base_input_sha256": strength_request.input_sha256,
+                "base_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                    baseline_base_atomic_units
+                ),
+                "ir_atomic_unit_set_sha256": atomic_unit_set_sha256(
+                    baseline_ir_atomic_units
+                ),
+                "frozen_base_score": base_score.economic_moat_score,
+                "combined_candidate_score": combined_score.economic_moat_score,
+                "final_score": score.economic_moat_score,
+                "noncompliant_score_invariant_passed": (
+                    treatment_compliant
+                    or score.model_dump(mode="json") == base_score.model_dump(mode="json")
+                ),
+                "quality_rejected_ir_document_ids": sorted(
+                    rejected_ir_document_ids
+                ),
+            }
+            if treatment_audit["noncompliant_score_invariant_passed"] is not True:
+                raise ValueError(
+                    "IR treatment invariant failed: non-compliant treatment changed the score"
+                )
+            self.store.write_json(
+                company_dir / "ir-treatment-audit.json",
+                treatment_audit,
+            )
+            self.store.write_json(score_path, score)
 
             expected_claim_ids = {
                 card.claim_id for card in scoring_dossier.evidence if card.claim_id
@@ -549,41 +1448,48 @@ class MoatUniverseRunner:
                 if expected_counter_ids
                 else 1.0
             )
-            compressed_cards = [
-                card
-                for card in scoring_dossier.evidence
-                if card.claim_id in packed_claim_ids
-            ]
-            compressed_score = derive_moat_score(
-                None,
-                compressed_cards,
-                issuer_id=dossier.issuer_id,
-                as_of=self.config.as_of.date(),
-                document_coverage=score_coverage,
-            )
-            score_delta = compressed_score.economic_moat_score - score.economic_moat_score
-            factor_scores = {
-                item.evidence_type.value: item.score for item in score.mechanisms
-            }
-            compressed_factor_scores = {
-                item.evidence_type.value: item.score for item in compressed_score.mechanisms
-            }
             semantic_passed = (
                 claim_jaccard == 1.0
                 and counter_recall == 1.0
-                and score_delta == 0.0
-                and factor_scores == compressed_factor_scores
             )
             summary_manifest = self.store.read_json(company_dir / "section-summary-manifest.json")
             token_budget_audit = self.store.read_json(company_dir / "llm-token-budget.json")
             usage_so_far = self._sum_usage(audits)
+            actual_provider_tokens = usage_so_far.input_tokens + usage_so_far.output_tokens
+            token_budget_audit.update(
+                {
+                    "actual_llm_call_count": len(audits),
+                    "actual_input_tokens": usage_so_far.input_tokens,
+                    "actual_output_tokens": usage_so_far.output_tokens,
+                    "actual_provider_tokens": actual_provider_tokens,
+                    "actual_cached_input_tokens": usage_so_far.cached_input_tokens,
+                    "actual_cache_write_tokens": usage_so_far.cache_write_tokens,
+                    "actual_cache_read_fraction_of_input": (
+                        usage_so_far.cached_input_tokens / usage_so_far.input_tokens
+                        if usage_so_far.input_tokens
+                        else 0.0
+                    ),
+                    "actual_cache_write_fraction_of_input": (
+                        usage_so_far.cache_write_tokens / usage_so_far.input_tokens
+                        if usage_so_far.input_tokens
+                        else 0.0
+                    ),
+                    "actual_provider_tokens_per_call": (
+                        actual_provider_tokens / len(audits) if audits else 0.0
+                    ),
+                }
+            )
+            self.store.write_json(company_dir / "llm-token-budget.json", token_budget_audit)
             compression_audit = {
                 "schema_version": "compression-invariance/1",
                 "passed": semantic_passed,
                 "claim_jaccard": claim_jaccard,
                 "counterevidence_recall": counter_recall,
-                "moat_score_delta": score_delta,
-                "factor_scores_equal": factor_scores == compressed_factor_scores,
+                "moat_score_delta": None,
+                "factor_scores_equal": None,
+                "score_invariance_not_applicable": (
+                    "economic strength is derived from the uncompressed broad contextual lane"
+                ),
                 "expected_claim_ids": sorted(expected_claim_ids),
                 "packed_claim_ids": sorted(packed_claim_ids),
                 "expected_counterevidence_ids": sorted(expected_counter_ids),
@@ -591,6 +1497,9 @@ class MoatUniverseRunner:
                 "compact_pack_tokens_estimated": pack.token_count,
                 "expanded_context_tokens_estimated": pack.expanded_context_token_count,
                 "pack_token_reduction_fraction": pack.token_reduction_fraction,
+                "strength_context_compressed": False,
+                "strength_context_tokens_estimated": strength_context.token_count,
+                "strength_selected_chunk_count": len(strength_context.selected_chunk_ids),
                 "summary_llm_calls_avoided": summary_manifest["llm_calls_avoided"],
                 "summary_input_tokens_avoided_estimated": summary_manifest[
                     "estimated_llm_input_tokens_avoided"
@@ -611,13 +1520,15 @@ class MoatUniverseRunner:
             self.store.write_json(company_dir / "compression-audit.json", compression_audit)
             if not semantic_passed:
                 raise ValueError(
-                    "compression invariance gate failed: claims, factor scores, or counterevidence changed"
+                    "audit-lane compression gate failed: claims or counterevidence changed"
                 )
 
             metamorphic_audit = audit_company_metamorphs(
                 company_dir,
                 issuer_id=dossier.issuer_id,
                 maximum_atomic_units=self.config.maximum_atomic_evidence_units,
+                maximum_ir_atomic_units=self.config.maximum_ir_atomic_evidence_units,
+                preserve_ir_document_coverage=self.config.longitudinal_ir_mode,
             )
             self.store.write_json(company_dir / "metamorphic-audit.json", metamorphic_audit)
             if metamorphic_audit["passed"] is not True:
@@ -632,12 +1543,15 @@ class MoatUniverseRunner:
                     run_id=f"{self.config.run_id}:{company.ticker}",
                     signal_at=self.config.as_of,
                     evidence_cutoff=self.config.as_of,
-                    model="deterministic-python",
+                    model=f"{self.config.moat_model}+deterministic-python",
                     parser_version=",".join(sorted({bundle.metadata.parser_version for bundle in bundles})),
                     renderer_version="canonical-markdown/1",
-                    prompt_version="canonical-claim-reducer/1",
-                    token_budget=self.config.context_tokens,
-                    input_tokens=min(pack.token_count, self.config.context_tokens),
+                    prompt_version="dual-lane-moat/1",
+                    token_budget=self.config.strength_context_tokens,
+                    input_tokens=min(
+                        strength_context.token_count,
+                        self.config.strength_context_tokens,
+                    ),
                     input_sha256=reducer_sha256,
                     temperature=0.0,
                     created_at=datetime.now(timezone.utc),
@@ -656,6 +1570,7 @@ class MoatUniverseRunner:
                 evidence_count=len(cards),
                 chunk_count=len(chunks),
                 selected_chunk_count=len(evidence_chunks),
+                strength_context_chunk_count=len(strength_context.selected_chunk_ids),
                 moat_score=score,
                 dcf=dcf,
                 current_price=company.current_price,
@@ -685,6 +1600,47 @@ class MoatUniverseRunner:
             self._checkpoint(checkpoint_path, signature, "FAILED", error=error)
             return result
 
+    @staticmethod
+    def _is_ir_chunk(chunk: SemanticChunk) -> bool:
+        return any(reference.source_type == SourceType.IR for reference in chunk.source_refs)
+
+    @staticmethod
+    def _combine_strength_contexts(
+        base: MoatStrengthContext,
+        ir: MoatStrengthContext,
+    ) -> MoatStrengthContext:
+        """Join already-selected source lanes without allowing cross-source eviction."""
+
+        references = [*base.references, *ir.references]
+        markdown = base.markdown.rstrip() + "\n\n" + ir.markdown.lstrip()
+        counter = HeuristicTokenCounter()
+        lanes = set(base.question_coverage) | set(ir.question_coverage)
+        return base.model_copy(
+            update={
+                "schema_version": "moat-strength-context/source-partitioned-1",
+                "token_budget": base.token_budget + ir.token_budget,
+                "token_count": counter.count(markdown),
+                "available_chunk_count": (
+                    base.available_chunk_count + ir.available_chunk_count
+                ),
+                "selected_chunk_ids": [
+                    *base.selected_chunk_ids,
+                    *ir.selected_chunk_ids,
+                ],
+                "dropped_chunk_ids": [
+                    *base.dropped_chunk_ids,
+                    *ir.dropped_chunk_ids,
+                ],
+                "question_coverage": {
+                    lane: base.question_coverage.get(lane, 0)
+                    + ir.question_coverage.get(lane, 0)
+                    for lane in sorted(lanes)
+                },
+                "references": references,
+                "markdown": markdown,
+            }
+        )
+
     def _ingest_company(
         self,
         company: CompanyInput,
@@ -704,6 +1660,8 @@ class MoatUniverseRunner:
                 if input_path.suffix.lower() == ".xml"
                 else "application/xhtml+xml"
                 if input_path.suffix.lower() == ".xhtml"
+                else "application/pdf"
+                if input_path.suffix.lower() == ".pdf"
                 else "text/html"
             )
             raw = RawDocument(
@@ -713,7 +1671,34 @@ class MoatUniverseRunner:
                 media_type=media_type,
                 hints=metadata,
             )
-            bundle = self.pipeline.ingest(raw)
+            prepared_bundle_path = metadata.get("canonical_bundle_path")
+            if prepared_bundle_path:
+                bundle_path = Path(str(prepared_bundle_path)).resolve()
+                bundle = CanonicalDocumentBundle.model_validate_json(
+                    bundle_path.read_text(encoding="utf-8-sig")
+                )
+                raw_sha256 = hashlib.sha256(raw.content).hexdigest()
+                if bundle.metadata.raw_sha256 != raw_sha256:
+                    raise ValueError(
+                        f"prepared canonical bundle raw hash mismatch: {bundle_path}"
+                    )
+                declared_hash = metadata.get("canonical_bundle_raw_sha256")
+                if declared_hash and declared_hash != raw_sha256:
+                    raise ValueError(
+                        f"prepared canonical bundle declared hash mismatch: {bundle_path}"
+                    )
+                declared_parser = metadata.get("canonical_bundle_parser_version")
+                if declared_parser and declared_parser != bundle.metadata.parser_version:
+                    raise ValueError(
+                        f"prepared canonical bundle parser mismatch: {bundle_path}"
+                    )
+                if bundle.metadata.source_type != document.source:
+                    raise ValueError(
+                        f"prepared canonical bundle source mismatch: {bundle_path}"
+                    )
+                bundle = enrich_ir_table_semantics(bundle)
+            else:
+                bundle = self.pipeline.ingest(raw)
             if bundle.metadata.available_at <= self.config.as_of:
                 bundles.append(bundle)
         bundles.sort(key=lambda bundle: bundle.metadata.available_at, reverse=True)
@@ -742,6 +1727,7 @@ class MoatUniverseRunner:
         audits: list[LLMCallAudit],
         *,
         issuer_id: str | None,
+        issuer_name: str | None,
     ) -> list[EvidenceCard]:
         path = company_dir / "evidence.jsonl"
         checkpoint_dir = company_dir / "atomic-judgment-by-key"
@@ -762,20 +1748,79 @@ class MoatUniverseRunner:
                 if not validation_errors:
                     judgment = candidate
             if judgment is None:
-                request = build_atomic_evidence_request(chunk, issuer_id=issuer_id)
-                extraction = self._execute_validated(
-                    request,
-                    AtomicEvidenceExtraction,
-                    lambda value, c=chunk: self._validate_atomic_judgment(
-                        atomic_extraction_to_judgment(value, c),
-                        c,
-                        bundle_by_document[c.document_id],
-                        issuer_id=issuer_id,
-                    ),
-                    audits,
-                    company_dir,
+                votes: list[AtomicEvidenceExtraction] = []
+                vote_repairs: list[dict[str, object]] = []
+                vote_checkpoint_dir = company_dir / "atomic-classification-votes-by-key" / atomic_key
+                for vote_index in range(1, self.config.atomic_classification_votes + 1):
+                    vote_checkpoint = vote_checkpoint_dir / f"vote-{vote_index:02d}.json"
+                    extraction: AtomicEvidenceExtraction | None = None
+                    if self.config.resume and vote_checkpoint.is_file():
+                        extraction = AtomicEvidenceExtraction.model_validate(
+                            self.store.read_json(vote_checkpoint)
+                        )
+                    if extraction is None:
+                        request = build_atomic_evidence_request(
+                            chunk,
+                            issuer_id=issuer_id,
+                            issuer_name=issuer_name,
+                            classification_vote=vote_index,
+                        )
+                        extraction = self._execute_validated(
+                            request,
+                            AtomicEvidenceExtraction,
+                            lambda _value: [],
+                            audits,
+                            company_dir,
+                        )
+                    extraction, repair_actions = normalize_atomic_extraction(
+                        extraction,
+                        source_text=chunk.markdown,
+                    )
+                    self.store.write_json(vote_checkpoint, extraction)
+                    votes.append(extraction)
+                    vote_repairs.append(
+                        {
+                            "vote": vote_index,
+                            "actions": repair_actions,
+                        }
+                    )
+                extraction, consensus = build_atomic_classification_consensus(
+                    votes,
+                    source_text=chunk.markdown,
+                )
+                consensus["atomic_evidence_key"] = atomic_key
+                consensus["vote_repairs"] = vote_repairs
+                self.store.write_json(
+                    company_dir / "atomic-classification-consensus-by-key" / f"{atomic_key}.json",
+                    consensus,
                 )
                 judgment = atomic_extraction_to_judgment(extraction, chunk)
+                validation_errors = self._validate_atomic_judgment(
+                    judgment,
+                    chunk,
+                    bundle_by_document[chunk.document_id],
+                    issuer_id=issuer_id,
+                )
+                repair_payload: dict[str, object] = {
+                    "schema_version": "atomic-field-repair/2",
+                    "atomic_evidence_key": atomic_key,
+                    "strategy": "CLOSED_ONTOLOGY_MAJORITY_CONSENSUS_FAIL_CLOSED",
+                    "vote_repairs": vote_repairs,
+                    "consensus_status": consensus["status"],
+                    "validation_errors": validation_errors,
+                    "item_accepted": not validation_errors,
+                }
+                if validation_errors:
+                    judgment = AtomicEvidenceJudgment(
+                        is_investment_relevant=False,
+                        fact="Atomic item excluded after deterministic validation.",
+                    )
+                    repair_payload["fallback"] = "EXCLUDE_INVALID_ATOMIC_ITEM"
+                if any(item["actions"] for item in vote_repairs) or validation_errors:
+                    self.store.write_json(
+                        company_dir / "atomic-repair-by-key" / f"{atomic_key}.json",
+                        repair_payload,
+                    )
             self.store.write_json(checkpoint, judgment)
             if judgment.is_investment_relevant:
                 cards.append(
@@ -1080,7 +2125,14 @@ class MoatUniverseRunner:
             raw_response_sha256 = hashlib.sha256(raw_output.encode("utf-8")).hexdigest()
             normalized_output_sha256 = hashlib.sha256(normalized_output.encode("utf-8")).hexdigest()
             raw_path = company_dir / "llm-raw" / (
-                stable_id("LLM", current.task.value, current.input_sha256, attempt) + ".json"
+                stable_id(
+                    "LLM",
+                    current.task.value,
+                    current.input_sha256,
+                    attempt,
+                    raw_response_sha256,
+                )
+                + ".json"
             )
             self.store.write_json(
                 raw_path,
@@ -1447,16 +2499,29 @@ class MoatUniverseRunner:
             inspect.getsource(builder)
             for builder in (
                 build_atomic_evidence_request,
+                build_contextual_moat_strength_request,
+                build_ir_incremental_assessment_request,
                 build_section_summary_request,
                 build_evidence_preserving_summaries,
                 EvidencePackBuilder.build,
+                MoatStrengthContextBuilder.build,
                 build_financial_feature_vector,
+                normalize_contextual_moat_assessment,
+                repair_contextual_moat_structure,
+                calibrate_contextual_moat_ordinals,
+                apply_ir_incremental_assessment,
+                reconcile_context_and_claims,
+                derive_rank_refinement,
+                derive_audited_moat_score,
             )
         )
         schema_contract = json.dumps(
             {
                 "atomic_extraction": AtomicEvidenceExtraction.model_json_schema(),
                 "atomic_judgment": AtomicEvidenceJudgment.model_json_schema(),
+                "contextual_moat_assessment": ContextualMoatAssessment.model_json_schema(),
+                "ir_incremental_assessment": IrIncrementalAssessment.model_json_schema(),
+                "reconciled_moat_assessment": ReconciledMoatAssessment.model_json_schema(),
                 "section_summary": SectionSummary.model_json_schema(),
                 "moat_score": MoatScore.model_json_schema(),
             },
@@ -1476,9 +2541,14 @@ class MoatUniverseRunner:
                     "summary_model": self.config.summary_model,
                     "moat_model": self.config.moat_model,
                     "summary_reasoning_effort": self.config.summary_reasoning_effort,
+                    "atomic_reasoning_effort": self.config.atomic_reasoning_effort,
                     "moat_reasoning_effort": self.config.moat_reasoning_effort,
                     "context_tokens": self.config.context_tokens,
                     "prompt_reserve_tokens": self.config.prompt_reserve_tokens,
+                    "strength_context_tokens": self.config.strength_context_tokens,
+                    "strength_prompt_reserve_tokens": (
+                        self.config.strength_prompt_reserve_tokens
+                    ),
                     "max_output_tokens": self.config.max_output_tokens,
                     "minimum_text_retention": self.config.minimum_text_retention,
                     "minimum_numeric_retention": self.config.minimum_numeric_retention,
@@ -1488,6 +2558,12 @@ class MoatUniverseRunner:
                     "allow_low_quality": self.config.allow_low_quality,
                     "maximum_price_age_days": self.config.maximum_price_age_days,
                     "maximum_atomic_evidence_units": self.config.maximum_atomic_evidence_units,
+                    "maximum_ir_atomic_evidence_units": self.config.maximum_ir_atomic_evidence_units,
+                    "incremental_ir_mode": self.config.incremental_ir_mode,
+                    "longitudinal_ir_mode": self.config.longitudinal_ir_mode,
+                    "minimum_longitudinal_ir_years": (
+                        self.config.minimum_longitudinal_ir_years
+                    ),
                     "consolidate_section_summaries": self.config.consolidate_section_summaries,
                     "validation_attempts": self.config.validation_attempts,
                     "experiment_id": self.config.experiment_id,
@@ -1517,6 +2593,64 @@ class MoatUniverseRunner:
                 "error": error,
             },
         )
+
+    def _refresh_atomic_token_budget(
+        self,
+        company_dir: Path,
+        requests: list[LLMRequest],
+        units: list[SemanticChunk],
+    ) -> None:
+        path = company_dir / "llm-token-budget.json"
+        payload = self.store.read_json(path)
+        counter = HeuristicTokenCounter()
+        schema_json = json.dumps(
+            AtomicEvidenceExtraction.model_json_schema(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        static_tokens = (
+            counter.count(requests[0].system + schema_json) if requests else 0
+        )
+        dynamic_tokens = sum(counter.count(request.user) for request in requests)
+        source_tokens = sum(counter.count(unit.markdown) for unit in units)
+        total_tokens = static_tokens * len(requests) + dynamic_tokens
+        strength_static_tokens = int(
+            payload.get("estimated_strength_static_prefix_tokens", 0)
+        )
+        strength_dynamic_tokens = int(
+            payload.get("estimated_strength_dynamic_suffix_tokens", 0)
+        )
+        strength_breakpoints = int(payload.get("strength_request_count", 0))
+        payload.update(
+            {
+                "atomic_request_count": len(requests),
+                "estimated_atomic_input_tokens": total_tokens,
+                "estimated_static_prefix_tokens_per_request": static_tokens,
+                "estimated_dynamic_suffix_tokens_total": dynamic_tokens,
+                "estimated_source_evidence_tokens_total": source_tokens,
+                "estimated_useful_source_token_ratio": (
+                    source_tokens / total_tokens if total_tokens else 0.0
+                ),
+                "prompt_cache_breakpoint_count": sum(
+                    request.prompt_cache_breakpoint for request in requests
+                ) + strength_breakpoints,
+                "estimated_prefix_cache_eligible": static_tokens >= 1_024,
+                "estimated_cacheable_prefix_tokens_total": (
+                    static_tokens * len(requests) if static_tokens >= 1_024 else 0
+                )
+                + (strength_static_tokens if strength_static_tokens >= 1_024 else 0),
+                "estimated_dynamic_suffix_tokens_all_tasks": (
+                    dynamic_tokens + strength_dynamic_tokens
+                ),
+                "expected_output_token_cap_total": (
+                    len(requests) * min(self.config.max_output_tokens, 2_000)
+                    + min(self.config.max_output_tokens, 8_000)
+                ),
+                "atomic_selection_policy": "BASELINE_PLUS_CONTEXT_CITATION_AUDIT",
+            }
+        )
+        self.store.write_json(path, payload)
 
     @staticmethod
     def _sum_usage(audits: list[LLMCallAudit]) -> TransportUsage:

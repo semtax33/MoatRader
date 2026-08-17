@@ -14,6 +14,25 @@ from moatrader.runner.engine import RUNNER_VERSION
 from moatrader.preflight import PREFLIGHT_SCHEMA_VERSION, ticker_set_sha256
 
 
+MOAT_RANK_VALIDATION_SCHEMA_VERSION = "moatrader-moat-rank-shadow/2"
+MOAT_RANK_STRATEGY = "PUBLIC_PLUS_STABLE_COMPONENT_KEY"
+
+
+def load_validated_moat_rank_report(path: Path) -> dict[str, object]:
+    report = json.loads(path.resolve().read_text(encoding="utf-8-sig"))
+    if (
+        report.get("schema_version") != MOAT_RANK_VALIDATION_SCHEMA_VERSION
+        or report.get("runner_version") != RUNNER_VERSION
+        or (report.get("candidate_selection") or {}).get("selected")
+        != MOAT_RANK_STRATEGY
+        or (report.get("production_gate") or {}).get("passed") is not True
+    ):
+        raise RuntimeError(
+            "MOAT rank validation report has not approved the stable public-first RankKey"
+        )
+    return report
+
+
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         return list(csv.DictReader(stream))
@@ -35,7 +54,7 @@ def moat_coverage(company: object) -> Decimal:
     return Decimal(str(coverage.moat_evidence_coverage or 0))
 
 
-def _average_ranks(values: list[float]) -> list[float]:
+def _average_ranks(values: list[object]) -> list[float]:
     ordered = sorted(range(len(values)), key=lambda index: values[index])
     result = [0.0] * len(values)
     cursor = 0
@@ -72,6 +91,46 @@ def decimal_percentiles(values: list[Decimal]) -> list[Decimal]:
     return [Decimal(str(rank)) / Decimal(len(values)) for rank in ranks] if values else []
 
 
+def rank_key_percentiles(values: list[tuple[Decimal, ...]]) -> list[Decimal]:
+    ranks = _average_ranks(values)
+    return [Decimal(str(rank)) / Decimal(len(values)) for rank in ranks] if values else []
+
+
+def stable_moat_rank_keys(rows: list[dict[str, object]]) -> list[tuple[Decimal, ...]]:
+    complete_by_public: dict[Decimal, bool] = {}
+    for row in rows:
+        public = Decimal(str(row["moat_score"]))
+        stable = bool(
+            row["rank_refinement_status"] == "STABLE_COMPONENTS"
+            and all(
+                row[field] != ""
+                for field in (
+                    "rank_mechanism_component",
+                    "rank_outcome_component",
+                    "rank_durability_component",
+                    "rank_counter_component",
+                )
+            )
+        )
+        complete_by_public[public] = complete_by_public.get(public, True) and stable
+    keys = []
+    for row in rows:
+        public = Decimal(str(row["moat_score"]))
+        if complete_by_public[public]:
+            keys.append(
+                (
+                    public,
+                    Decimal(str(row["rank_mechanism_component"])),
+                    Decimal(str(row["rank_outcome_component"])),
+                    Decimal(str(row["rank_durability_component"])),
+                    -Decimal(str(row["rank_counter_component"])),
+                )
+            )
+        else:
+            keys.append((public,))
+    return keys
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", required=True, type=Path)
@@ -81,6 +140,11 @@ def main() -> int:
         "--preflight-report",
         type=Path,
         help="passed 3..5-company preflight report; defaults to WORKSPACE/diagnostics/moat-preflight.json",
+    )
+    parser.add_argument(
+        "--moat-rank-validation-report",
+        type=Path,
+        help="API-zero raw-rank shadow report with a passed repeat-stability production gate",
     )
     parser.add_argument("--minimum-adjacent-moat-spearman", type=float, default=0.50)
     parser.add_argument("--minimum-stability-companies", type=int, default=20)
@@ -106,6 +170,7 @@ def main() -> int:
         raise ValueError("dates input contains duplicate or blank dates")
     preflight_path = (args.preflight_report or workspace / "diagnostics" / "moat-preflight.json").resolve()
     preflight: dict[str, object] | None = None
+    rank_validation: dict[str, object] | None = None
     if len(tickers) > 5:
         if not preflight_path.is_file():
             raise RuntimeError(f"production merge requires a passed preflight report: {preflight_path}")
@@ -118,6 +183,12 @@ def main() -> int:
             or list(preflight.get("dates") or []) != dates
         ):
             raise RuntimeError("preflight report does not approve this runner, universe, and date set")
+        if args.moat_rank_validation_report is None:
+            raise RuntimeError(
+                "production merge requires a passed MOAT rank validation report"
+            )
+        rank_validation_path = args.moat_rank_validation_report.resolve()
+        rank_validation = load_validated_moat_rank_report(rank_validation_path)
     run_paths: dict[str, list[Path]] = {}
     for value in args.run:
         date, separator, path = value.partition("=")
@@ -167,6 +238,14 @@ def main() -> int:
                         "moat_percentile": "",
                         "value_percentile": "",
                         "moat_score": "",
+                        "moat_rank_key": "",
+                        "rank_refinement_status": "",
+                        "rank_mechanism_component": "",
+                        "rank_outcome_component": "",
+                        "rank_durability_component": "",
+                        "rank_counter_component": "",
+                        "audit_status": "",
+                        "evidence_confidence": "",
                         "model_confidence": "",
                         "document_coverage": "",
                         "dcf_fair_value": "",
@@ -183,20 +262,30 @@ def main() -> int:
             ratio = price / fair_value if price is not None and fair_value is not None and fair_value > 0 else None
             margin = Decimal(1) - ratio if ratio is not None else None
             coverage = moat_coverage(company)
+            evidence_confidence = (
+                score.evidence_confidence
+                if score is not None and score.evidence_confidence is not None
+                else (score.model_confidence if score is not None else None)
+            )
             reasons = []
             if company.status != CompanyRunStatus.COMPLETE:
                 reasons.append(company.status.value)
             if score is None:
                 reasons.append("NO_MOAT_SCORE")
-            elif Decimal(str(score.economic_moat_score)) < Decimal("5"):
-                reasons.append("MOAT_BELOW_5")
+            else:
+                if not score.score_eligible:
+                    reasons.append(f"MOAT_SCORE_{score.eligibility_status.value}")
+                if Decimal(str(score.economic_moat_score)) < Decimal("5"):
+                    reasons.append("MOAT_BELOW_5")
+                if score.audit_status.value == "FAIL":
+                    reasons.append("MOAT_AUDIT_FAIL")
             if ratio is None or margin is None:
                 reasons.append("NO_POSITIVE_DCF")
             elif margin < Decimal("0.20"):
                 reasons.append("MARGIN_BELOW_20PCT")
             if company.dcf is not None and not company.dcf.screening_eligible:
                 reasons.extend(company.dcf.screening_exclusion_reasons)
-            if score is not None and Decimal(str(score.model_confidence)) < Decimal("0.50"):
+            if evidence_confidence is not None and Decimal(str(evidence_confidence)) < Decimal("0.50"):
                 reasons.append("CONFIDENCE_BELOW_0_50")
             if score is not None and coverage < Decimal("0.50"):
                 reasons.append("MOAT_COVERAGE_BELOW_0_50")
@@ -217,6 +306,34 @@ def main() -> int:
                     "moat_percentile": "",
                     "value_percentile": "",
                     "moat_score": score.economic_moat_score if score else "",
+                    "moat_rank_key": "",
+                    "rank_refinement_status": (
+                        score.rank_refinement_status.value
+                        if score and score.rank_refinement_status
+                        else ""
+                    ),
+                    "rank_mechanism_component": (
+                        score.rank_refinement.mechanism_component
+                        if score and score.rank_refinement
+                        else ""
+                    ),
+                    "rank_outcome_component": (
+                        score.rank_refinement.outcome_component
+                        if score and score.rank_refinement
+                        else ""
+                    ),
+                    "rank_durability_component": (
+                        score.rank_refinement.durability_component
+                        if score and score.rank_refinement
+                        else ""
+                    ),
+                    "rank_counter_component": (
+                        score.rank_refinement.counter_component
+                        if score and score.rank_refinement
+                        else ""
+                    ),
+                    "audit_status": score.audit_status.value if score else "",
+                    "evidence_confidence": evidence_confidence if score else "",
                     "model_confidence": score.model_confidence if score else "",
                     "document_coverage": coverage if score else "",
                     "dcf_fair_value": fair_value or "",
@@ -269,15 +386,18 @@ def main() -> int:
 
     for date in dates:
         ranked = [row for row in rows if row["date"] == date and row["signal_eligible"]]
-        moat_percentiles = decimal_percentiles([Decimal(str(row["moat_score"])) for row in ranked])
+        moat_rank_keys = stable_moat_rank_keys(ranked)
+        moat_percentiles = rank_key_percentiles(moat_rank_keys)
         value_percentiles = decimal_percentiles([Decimal(str(row["margin_of_safety"])) for row in ranked])
-        for row, moat_percentile, value_percentile in zip(
+        for row, moat_rank_key, moat_percentile, value_percentile in zip(
             ranked,
+            moat_rank_keys,
             moat_percentiles,
             value_percentiles,
             strict=True,
         ):
             row["moat_percentile"] = moat_percentile
+            row["moat_rank_key"] = "|".join(str(value) for value in moat_rank_key)
             row["value_percentile"] = value_percentile
             row["signal"] = (moat_percentile + value_percentile) / Decimal(2)
         ranked.sort(key=lambda row: (-Decimal(str(row["signal"])), str(row["ticker"])))
@@ -288,7 +408,9 @@ def main() -> int:
         "date", "ticker", "issuer_name", "market", "size_bucket", "sector",
         "status", "signal_eligible", "eligibility_reason", "signal",
         "signal_rank", "moat_percentile", "value_percentile",
-        "moat_score", "model_confidence", "document_coverage",
+        "moat_score", "moat_rank_key", "rank_refinement_status",
+        "rank_mechanism_component", "rank_outcome_component", "rank_durability_component", "rank_counter_component",
+        "audit_status", "evidence_confidence", "model_confidence", "document_coverage",
         "dcf_fair_value", "current_price", "price_to_dcf", "margin_of_safety",
     ]
     output = args.output.resolve()
@@ -309,8 +431,8 @@ def main() -> int:
         )
     write_csv(output.with_name("signal-coverage.csv"), coverage_rows, list(coverage_rows[0]))
     manifest = {
-        "schema_version": "moatrader-moat-dcf-signal/2",
-        "signal_formula": "0.5 * cross_sectional_percentile(moat_score) + 0.5 * cross_sectional_percentile(margin_of_safety); confidence and MOAT coverage are eligibility gates",
+        "schema_version": "moatrader-moat-dcf-signal/5",
+        "signal_formula": "0.5 * cross_sectional_percentile(lexicographic(economic_moat_score, stable_public_component_refinement)) + 0.5 * cross_sectional_percentile(margin_of_safety); refinement is disabled for an entire public-score bucket when incomplete and can never reverse different public-score buckets",
         "fallback_signal": None,
         "row_count": len(rows),
         "expected_row_count": len(tickers) * len(dates),
@@ -327,6 +449,15 @@ def main() -> int:
         "preflight_required": len(tickers) > 5,
         "preflight_report": str(preflight_path) if preflight is not None else None,
         "preflight_passed": bool(preflight and preflight.get("passed")),
+        "moat_rank_validation_report": (
+            str(args.moat_rank_validation_report.resolve())
+            if rank_validation is not None
+            else None
+        ),
+        "moat_rank_validation_passed": bool(
+            rank_validation
+            and (rank_validation.get("production_gate") or {}).get("passed")
+        ),
         "universe_source_as_of": sorted({row.get("as_of", "") for row in universe if row.get("as_of")}),
         "universe_reconstitution": False,
         "status_counts": dict(Counter(str(row["status"]) for row in rows)),

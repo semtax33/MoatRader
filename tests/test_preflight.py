@@ -41,7 +41,12 @@ def _score(ticker: str, as_of: str) -> MoatScore:
         ],
         durability=Durability.MEDIUM,
         model_confidence=0.8,
+        evidence_confidence=0.8,
         document_coverage=CoverageMetrics(moat_evidence_coverage=1),
+        audit_status="PASS",
+        scoring_method="DUAL_LANE_CONTEXTUAL_STRENGTH_REDUCER_V1",
+        context_chunk_ids=[f"C-{ticker}"],
+        atomic_evidence_ids=[f"E-{ticker}"],
         llm_proposed_score=7,
     )
 
@@ -61,14 +66,20 @@ def _write_run(
         artifact.mkdir(parents=True)
         if replayed:
             (artifact / "llm-calls.jsonl").write_text(
-                json.dumps(
-                    {
-                        "task": "LOCAL_EVIDENCE_EXTRACTION",
-                        "model": "fixture",
-                        "replayed": True,
-                        "replay_cache_key": f"cache-{as_of}-{ticker}",
-                        "normalized_output_sha256": f"output-{as_of}-{ticker}",
-                    }
+                "\n".join(
+                    json.dumps(
+                        {
+                            "task": task,
+                            "model": "fixture",
+                            "replayed": True,
+                            "replay_cache_key": f"cache-{task}-{as_of}-{ticker}",
+                            "normalized_output_sha256": f"output-{task}-{as_of}-{ticker}",
+                        }
+                    )
+                    for task in (
+                        "LOCAL_EVIDENCE_EXTRACTION",
+                        "CONTEXTUAL_MOAT_STRENGTH",
+                    )
                 )
                 + "\n",
                 encoding="utf-8",
@@ -111,6 +122,7 @@ def _write_run(
                     "counterevidence_recall": 1.0,
                     "moat_score_delta": 0.0,
                     "factor_scores_equal": True,
+                    "strength_context_compressed": False,
                     "pack_token_reduction_fraction": 0.5,
                 }
             ),
@@ -236,8 +248,8 @@ def test_preflight_approval_requires_replayed_repeat_runs_and_approves_full_univ
     assert approve_main() == 0
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["passed"] is True
-    assert report["candidate_replay_calls"] == 12
-    assert report["candidate_replay_hits"] == 12
+    assert report["candidate_replay_calls"] == 24
+    assert report["candidate_replay_hits"] == 24
 
     full_config = UniverseRunConfig(
         run_id="full",

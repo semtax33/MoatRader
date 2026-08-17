@@ -26,9 +26,12 @@ class UniverseRunConfig(ContractModel):
     summary_model: str = Field(default="gpt-5-nano", min_length=1)
     moat_model: str = Field(default="gpt-5.6-luna", min_length=1)
     summary_reasoning_effort: str = Field(default="low", min_length=1)
+    atomic_reasoning_effort: str = Field(default="medium", min_length=1)
     moat_reasoning_effort: str = Field(default="medium", min_length=1)
     context_tokens: int = Field(default=64_000, gt=8_000)
     prompt_reserve_tokens: int = Field(default=8_000, ge=1_000)
+    strength_context_tokens: int = Field(default=100_000, gt=16_000)
+    strength_prompt_reserve_tokens: int = Field(default=12_000, ge=4_000)
     max_output_tokens: int = Field(default=8_000, ge=1_000, le=100_000)
     minimum_text_retention: float = Field(default=0.95, ge=0.0, le=1.0)
     minimum_numeric_retention: float = Field(default=0.99, ge=0.0, le=1.0)
@@ -38,7 +41,15 @@ class UniverseRunConfig(ContractModel):
     allow_low_quality: bool = False
     maximum_price_age_days: int = Field(default=7, ge=0, le=366)
     maximum_atomic_evidence_units: int | None = Field(default=24, ge=1, le=1000)
+    maximum_ir_atomic_evidence_units: int | None = Field(default=12, ge=1, le=1000)
+    atomic_classification_votes: int = Field(default=3, ge=1, le=9)
+    incremental_ir_mode: bool = False
+    longitudinal_ir_mode: bool = False
+    minimum_longitudinal_ir_years: int = Field(default=3, ge=2, le=10)
     consolidate_section_summaries: bool = True
+    ir_ocr_engine: str = Field(default="none", pattern=r"^(none|paddle)$")
+    ir_ocr_device: str = Field(default="cpu", min_length=1)
+    ir_ocr_cpu_threads: int = Field(default=6, ge=1, le=64)
     workers: int = Field(default=1, ge=1, le=32)
     resume: bool = False
     dry_run: bool = False
@@ -56,6 +67,10 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("as_of must be timezone-aware")
         if self.context_tokens <= self.prompt_reserve_tokens:
             raise ValueError("context_tokens must exceed prompt_reserve_tokens")
+        if self.strength_context_tokens <= self.strength_prompt_reserve_tokens:
+            raise ValueError(
+                "strength_context_tokens must exceed strength_prompt_reserve_tokens"
+            )
         if bool(self.experiment_id) != bool(self.llm_replay_cache_directory):
             raise ValueError(
                 "experiment_id and llm_replay_cache_directory must be configured together"
@@ -64,6 +79,10 @@ class UniverseRunConfig(ContractModel):
             raise ValueError("evidence_ledger_directory requires experiment_id")
         if self.moat_model.lower().endswith("latest"):
             raise ValueError("moat_model must be an exact pinned model ID, not a -latest alias")
+        if self.longitudinal_ir_mode and not self.incremental_ir_mode:
+            raise ValueError("longitudinal_ir_mode requires incremental_ir_mode")
+        if self.atomic_classification_votes % 2 == 0:
+            raise ValueError("atomic_classification_votes must be odd")
         return self
 
 
@@ -93,6 +112,7 @@ class CompanyRunResult(ContractModel):
     evidence_count: int = Field(default=0, ge=0)
     chunk_count: int = Field(default=0, ge=0)
     selected_chunk_count: int = Field(default=0, ge=0)
+    strength_context_chunk_count: int = Field(default=0, ge=0)
     moat_score: MoatScore | None = None
     dcf: DcfValuation | None = None
     current_price: Decimal | None = None

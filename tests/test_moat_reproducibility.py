@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from moatrader.evidence.models import CoverageMetrics, Durability, EvidenceType, MoatMechanismScore, MoatScore
+from moatrader.evidence.models import (
+    CoverageMetrics,
+    Durability,
+    EvidenceType,
+    MoatMechanismScore,
+    MoatRankRefinement,
+    MoatRankRefinementStatus,
+    MoatScore,
+)
 from moatrader.runner.models import CompanyRunResult, CompanyRunStatus, UniverseRunResult
 from scripts.audit_moat_reproducibility import compare_runs
 
@@ -10,7 +18,11 @@ from scripts.audit_moat_reproducibility import compare_runs
 NOW = datetime.fromisoformat("2025-01-01T00:00:00+00:00")
 
 
-def _run(run_id: str, scores: dict[str, float]) -> UniverseRunResult:
+def _run(
+    run_id: str,
+    scores: dict[str, float],
+    refinements: dict[str, float] | None = None,
+) -> UniverseRunResult:
     companies = []
     for ticker, score in scores.items():
         companies.append(
@@ -22,6 +34,21 @@ def _run(run_id: str, scores: dict[str, float]) -> UniverseRunResult:
                 moat_score=MoatScore(
                     as_of=NOW.date(),
                     economic_moat_score=score,
+                    rank_refinement=(
+                        MoatRankRefinement(
+                            mechanism_component=refinements[ticker],
+                            outcome_component=0,
+                            durability_component=1,
+                            counter_component=1,
+                        )
+                        if refinements and ticker in refinements
+                        else None
+                    ),
+                    rank_refinement_status=(
+                        MoatRankRefinementStatus.STABLE_COMPONENTS
+                        if refinements and ticker in refinements
+                        else None
+                    ),
                     mechanisms=[
                         MoatMechanismScore(
                             evidence_type=EvidenceType.SWITCHING_COST,
@@ -66,3 +93,16 @@ def test_reproducibility_gate_fails_rank_reversal() -> None:
 
     assert report["passed"] is False
     assert any("Spearman" in failure for failure in report["failures"])
+
+
+def test_reproducibility_gate_checks_final_public_first_rank_key() -> None:
+    scores = {"AAA": 6, "BBB": 6, "CCC": 6}
+    report = compare_runs(
+        _run("a", scores, {"AAA": 1, "BBB": 2, "CCC": 3}),
+        _run("b", scores, {"AAA": 3, "BBB": 2, "CCC": 1}),
+    )
+
+    assert report["score_spearman"] == 1
+    assert report["rank_key_spearman"] == -1
+    assert report["passed"] is False
+    assert any("rank-key Spearman" in failure for failure in report["failures"])

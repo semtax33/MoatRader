@@ -5,6 +5,11 @@ from moatrader.context.pack import (
     FinancialFeatureVector,
     build_financial_feature_vector,
 )
+from moatrader.context.moat_strength import (
+    ContextEvidenceReference,
+    MoatStrengthContext,
+    MoatStrengthContextBuilder,
+)
 
 __all__ = [
     "AllocationResult",
@@ -13,4 +18,7 @@ __all__ = [
     "EvidencePackBuilder",
     "FinancialFeatureVector",
     "build_financial_feature_vector",
+    "ContextEvidenceReference",
+    "MoatStrengthContext",
+    "MoatStrengthContextBuilder",
 ]

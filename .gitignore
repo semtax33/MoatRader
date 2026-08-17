@@ -10,4 +10,5 @@ build/
 data-lake/demo/
 
 data-lake/**
-./data-lake
+./data-
+tmp/

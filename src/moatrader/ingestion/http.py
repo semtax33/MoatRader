@@ -34,6 +34,15 @@ class HttpClient(Protocol):
         max_bytes: int | None = None,
     ) -> HttpResponse: ...
 
+    def post_form(
+        self,
+        url: str,
+        *,
+        form: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
+    ) -> HttpResponse: ...
+
 
 class HttpRequestError(RuntimeError):
     def __init__(self, message: str, *, status_code: int | None = None) -> None:
@@ -93,6 +102,44 @@ class ResilientHttpClient:
         max_bytes: int | None = None,
     ) -> HttpResponse:
         request_url = self._with_query(url, query)
+        return self._request(
+            request_url,
+            method="GET",
+            headers=headers,
+            max_bytes=max_bytes,
+        )
+
+    def post_form(
+        self,
+        url: str,
+        *,
+        form: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
+    ) -> HttpResponse:
+        body = urlencode(
+            [(key, str(value)) for key, value in form.items() if value is not None]
+        ).encode("utf-8")
+        return self._request(
+            url,
+            method="POST",
+            body=body,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                **(headers or {}),
+            },
+            max_bytes=max_bytes,
+        )
+
+    def _request(
+        self,
+        request_url: str,
+        *,
+        method: str,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        max_bytes: int | None = None,
+    ) -> HttpResponse:
         safe_url = self.redact_url(request_url)
         limit = max_bytes or self.default_max_bytes
         request_headers = {
@@ -105,7 +152,12 @@ class ResilientHttpClient:
         for attempt in range(self.max_retries + 1):
             self.rate_limiter.wait()
             try:
-                request = Request(request_url, headers=request_headers, method="GET")
+                request = Request(
+                    request_url,
+                    data=body,
+                    headers=request_headers,
+                    method=method,
+                )
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     response_headers = self._headers(response.headers)
                     content = self._read_bounded(response, limit, safe_url)

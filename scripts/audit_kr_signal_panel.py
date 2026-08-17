@@ -52,15 +52,23 @@ def _signal_expected(company: object) -> tuple[bool, Decimal | None, list[str]]:
         reasons.append(getattr(company, "status").value)
     if score is None:
         reasons.append("NO_MOAT_SCORE")
-    elif Decimal(str(score.economic_moat_score)) < Decimal("5"):
-        reasons.append("MOAT_BELOW_5")
+    else:
+        if Decimal(str(score.economic_moat_score)) < Decimal("5"):
+            reasons.append("MOAT_BELOW_5")
+        if score.audit_status.value == "FAIL":
+            reasons.append("MOAT_AUDIT_FAIL")
     if margin is None:
         reasons.append("NO_POSITIVE_DCF")
     elif margin < Decimal("0.20"):
         reasons.append("MARGIN_BELOW_20PCT")
     if dcf is not None and not dcf.screening_eligible:
         reasons.extend(dcf.screening_exclusion_reasons)
-    if score is not None and Decimal(str(score.model_confidence)) < Decimal("0.50"):
+    confidence = (
+        score.evidence_confidence
+        if score is not None and score.evidence_confidence is not None
+        else (score.model_confidence if score is not None else None)
+    )
+    if confidence is not None and Decimal(str(confidence)) < Decimal("0.50"):
         reasons.append("CONFIDENCE_BELOW_0_50")
     if score is not None and Decimal(str(score.document_coverage.moat_evidence_coverage or 0)) < Decimal("0.50"):
         reasons.append("MOAT_COVERAGE_BELOW_0_50")
@@ -147,6 +155,8 @@ def main() -> int:
     live_response_ids: list[str] = []
     replay_cache_outputs: dict[str, str] = {}
     replayed_call_count = 0
+    raw_calls_by_path: dict[Path, list[tuple[str, str, dict[str, object]]]] = {}
+    superseded_raw_call_count = 0
 
     for as_of, paths in signal_manifest["run_results"].items():
         by_ticker: dict[str, object] = {}
@@ -226,6 +236,10 @@ def main() -> int:
                     call["model"]
                 ).startswith(("gpt-5.6-luna", "fixture")):
                     routing_errors.append(f"{as_of}/{ticker}: {call['task']} -> {call['model']}")
+                if call["task"] == "CONTEXTUAL_MOAT_STRENGTH" and not str(
+                    call["model"]
+                ).startswith(("gpt-5.6-luna", "fixture")):
+                    routing_errors.append(f"{as_of}/{ticker}: {call['task']} -> {call['model']}")
                 if call["task"] == "SECTION_SUMMARY" and not str(call["model"]).startswith(
                     ("gpt-5-nano", "fixture")
                 ):
@@ -247,22 +261,47 @@ def main() -> int:
                 raw_path = Path(call.get("raw_response_path") or "")
                 if not _inside(raw_path.resolve(), artifact):
                     raw_audit_errors.append(f"{as_of}/{ticker}: raw LLM artifact is outside company directory")
-                elif not raw_path.is_file() or sha256(raw_path) == "":
-                    raw_audit_errors.append(f"{as_of}/{ticker}: missing raw LLM artifact")
                 else:
-                    payload = json.loads(raw_path.read_text(encoding="utf-8"))
-                    actual_hash = hashlib.sha256(payload["raw_output_text"].encode("utf-8")).hexdigest()
-                    if actual_hash != call.get("raw_response_sha256"):
-                        raw_audit_errors.append(f"{as_of}/{ticker}: raw response hash mismatch")
-                    normalized = json.dumps(
-                        payload["normalized_output"],
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    )
-                    normalized_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-                    if normalized_hash != call.get("normalized_output_sha256"):
-                        raw_audit_errors.append(f"{as_of}/{ticker}: normalized response hash mismatch")
+                    raw_calls_by_path.setdefault(raw_path.resolve(), []).append((as_of, ticker, call))
+
+    # Runner versions before content-addressed raw filenames reused the same
+    # path when a failed company was resumed.  The latest file remains fully
+    # auditable, while earlier call records sharing that path are explicitly
+    # counted as superseded instead of being mistaken for current corruption.
+    # New calls include the raw-response hash in their filename and therefore
+    # never enter this compatibility branch.
+    for raw_path, path_calls in raw_calls_by_path.items():
+        if not raw_path.is_file() or sha256(raw_path) == "":
+            raw_audit_errors.extend(
+                f"{as_of}/{ticker}: missing raw LLM artifact"
+                for as_of, ticker, _call in path_calls
+            )
+            continue
+        payload = json.loads(raw_path.read_text(encoding="utf-8"))
+        actual_hash = hashlib.sha256(payload["raw_output_text"].encode("utf-8")).hexdigest()
+        normalized = json.dumps(
+            payload["normalized_output"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        matching = [
+            item
+            for item in path_calls
+            if item[2].get("raw_response_sha256") == actual_hash
+            and item[2].get("normalized_output_sha256") == normalized_hash
+        ]
+        for as_of, ticker, call in path_calls:
+            if (as_of, ticker, call) in matching:
+                continue
+            if matching and len(path_calls) > 1:
+                superseded_raw_call_count += 1
+                continue
+            if call.get("raw_response_sha256") != actual_hash:
+                raw_audit_errors.append(f"{as_of}/{ticker}: raw response hash mismatch")
+            if call.get("normalized_output_sha256") != normalized_hash:
+                raw_audit_errors.append(f"{as_of}/{ticker}: normalized response hash mismatch")
 
     for as_of in dates:
         eligible_rows = [row for row in rows if row["date"] == as_of and row["signal_eligible"] == "1"]
@@ -292,8 +331,16 @@ def main() -> int:
         raise RuntimeError("duplicate live provider response IDs")
     status_counts = Counter(row["status"] for row in rows)
     eligible_counts = Counter(row["date"] for row in rows if row["signal_eligible"] == "1")
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+    cached_input_tokens = int(usage.get("cached_input_tokens", 0))
+    cache_write_tokens = int(usage.get("cache_write_tokens", 0))
+    live_call_count = sum(tasks.values()) - replayed_call_count
+    complete_company_count = int(status_counts.get(CompanyRunStatus.COMPLETE.value, 0))
+    eligible_signal_count = sum(eligible_counts.values())
+    provider_token_count = input_tokens + output_tokens
     audit = {
-        "schema_version": "moatrader-kr-signal-audit/2",
+        "schema_version": "moatrader-kr-signal-audit/3",
         "audited_at": datetime.now(timezone.utc).isoformat(),
         "workspace": str(workspace),
         "fresh_workspace_only": True,
@@ -316,17 +363,42 @@ def main() -> int:
             "score_contract_error_count": 0,
             "signal_recomputation_error_count": 0,
             "raw_llm_audit_error_count": 0,
+            "superseded_raw_call_count": superseded_raw_call_count,
             "model_routing_error_count": 0,
         },
         "llm_audit": {
             "call_count": sum(tasks.values()),
-            "live_call_count": sum(tasks.values()) - replayed_call_count,
+            "live_call_count": live_call_count,
             "replayed_call_count": replayed_call_count,
             "unique_live_response_id_count": len(set(live_response_ids)),
             "unique_replay_cache_key_count": len(replay_cache_outputs),
             "models": dict(models),
             "tasks": dict(tasks),
             "usage": dict(usage),
+            "efficiency": {
+                "cache_read_fraction_of_input": (
+                    cached_input_tokens / input_tokens if input_tokens else 0.0
+                ),
+                "cache_write_fraction_of_input": (
+                    cache_write_tokens / input_tokens if input_tokens else 0.0
+                ),
+                "output_to_input_token_ratio": (
+                    output_tokens / input_tokens if input_tokens else 0.0
+                ),
+                "provider_tokens_per_live_call": (
+                    provider_token_count / live_call_count if live_call_count else 0.0
+                ),
+                "provider_tokens_per_completed_company": (
+                    provider_token_count / complete_company_count
+                    if complete_company_count
+                    else 0.0
+                ),
+                "provider_tokens_per_eligible_signal": (
+                    provider_token_count / eligible_signal_count
+                    if eligible_signal_count
+                    else 0.0
+                ),
+            },
         },
         "sha256": {
             "universe.csv": sha256(workspace / "inputs" / "universe.csv"),

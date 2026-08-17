@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from difflib import SequenceMatcher
 
 from moatrader.canonical.ids import stable_id
@@ -10,6 +10,7 @@ from moatrader.canonical.models import SourceType, StatementType
 from moatrader.evidence.models import (
     AtomicEvidenceExtraction,
     AtomicEvidenceJudgment,
+    AtomicMoatRole,
     DcfLink,
     CanonicalClaimSignature,
     ClaimCluster,
@@ -24,6 +25,7 @@ from moatrader.evidence.models import (
     EvidenceType,
     ForwardDriverCard,
     ForwardDriverType,
+    OUTCOME_CORROBORATION_TYPES,
     SectionSummary,
     STRUCTURAL_MOAT_TYPES,
 )
@@ -44,10 +46,382 @@ _RETENTION_RE = re.compile(
     r"고객\s*(?:유지|이탈률|재구매율)|갱신률|renewal|retention|churn|switching|전환\s*비용",
     re.IGNORECASE,
 )
+_MARKET_SHARE_ANCHOR_RE = re.compile(
+    r"(?:시장\s*)?점유율|시장\s*점유|M\s*/\s*S|market\s*share|share\s+of\s+(?:the\s+)?market|"
+    r"(?:국내|글로벌|시장|업계|제품|category|market)\s*(?:내\s*)?(?:#\s*)?(?:1위|leader)|"
+    r"#\s*1|number[-\s]?one|market\s+leader|"
+    r"(?:\d+(?:\.\d+)?\s*%).{0,50}(?:시장|market)|(?:시장|market).{0,50}(?:\d+(?:\.\d+)?\s*%)",
+    re.IGNORECASE,
+)
+_CUSTOMER_RETENTION_ANCHOR_RE = re.compile(
+    r"고객\s*(?:유지|이탈)|유지율|이탈률|재구매|재수주|반복\s*(?:구매|주문|수주)|"
+    r"재계약|계약\s*갱신|갱신률|renewal|retention|churn|reorder|"
+    r"repeat(?:ed)?\s+(?:purchase|order)|same\s+customer|"
+    r"installed\s+base.{0,50}(?:reuse|service|maintenance|upgrade)|"
+    r"설치\s*(?:기반|대수).{0,50}(?:재사용|서비스|유지보수|교체|업그레이드)",
+    re.IGNORECASE,
+)
+_MARGIN_OR_PROFITABILITY_ANCHOR_RE = re.compile(
+    r"마진|이익률|수익성|수익\s*실현|흑자|"
+    r"gross\s*(?:margin|%)|operating\s*(?:margin|%)|net\s*(?:margin|%)|"
+    r"profitability|profitable",
+    re.IGNORECASE,
+)
+_EXPLICIT_MULTIPERIOD_RE = re.compile(
+    r"(?:[3-9]|[1-9]\d+)\s*(?:개\s*)?(?:년|분기)|"
+    r"(?:three|four|five|six|seven|eight|nine|ten|eleven|twelve|\d+)[-\s]+(?:years?|quarters?)|"
+    r"연속|consecutive",
+    re.IGNORECASE,
+)
+_PERIOD_TOKEN_RE = re.compile(
+    r"(?:19|20)\d{2}(?:[.\-/\s]?(?:[1-4]Q|Q[1-4]|[1-4]\s*분기))?|[‘'’]?\d{2}[.]?[1-4]Q",
+    re.IGNORECASE,
+)
+_COST_PROCESS_ANCHOR_RE = re.compile(
+    r"비용|원가|공정|단계|시간|수율|생산성|cost|unit\s+cost|steps?|process|time|yield|productivity",
+    re.IGNORECASE,
+)
+_DIRECT_COMPARISON_RE = re.compile(
+    r"대비|비교|절감|감축|줄(?:임|여)|낮은|적은|단축|피하|극복|"
+    r"versus|vs\.?|compared\s+(?:with|to)|avoid|reduce|lower|less|fewer|higher\s+yield|alternative",
+    re.IGNORECASE,
+)
+_COUNTER_EROSION_RE = re.compile(
+    r"불안정|변동|등락|악화|침식|훼손|축소|약화|"
+    r"volatil|instabil|unstable|deterior|erosion|erod|weaken|alternat|"
+    r"direction\s+revers|reverses?\s+(?:its\s+)?direction|"
+    r"declin(?:e|ed|ing).{0,30}(?:share|margin|retention|renewal)",
+    re.IGNORECASE,
+)
 _FORWARD_LANGUAGE_RE = re.compile(
     r"전망|계획|예상|기대|목표|가이던스|추정|will|expect|plan|target|forecast|guidance",
     re.IGNORECASE,
 )
+_LLM_NUMERIC_FRAGMENT_RE = re.compile(r"\d[\d,.:/%+\-~–—?]*")
+
+_MOAT_COUNTER_TYPES: frozenset[EvidenceType] = (
+    STRUCTURAL_MOAT_TYPES
+    | OUTCOME_CORROBORATION_TYPES
+    | {
+        EvidenceType.COMPETITIVE_THREAT,
+        EvidenceType.CUSTOMER_CONCENTRATION,
+        EvidenceType.SUBSTITUTION_RISK,
+        EvidenceType.TECHNOLOGY_RISK,
+        EvidenceType.CAPITAL_INTENSITY,
+    }
+)
+_NON_MOAT_RELEVANT_TYPES: frozenset[EvidenceType] = frozenset(
+    {
+        EvidenceType.MARKET_DEMAND,
+        EvidenceType.CATEGORY_RECURRING_DEMAND,
+        EvidenceType.CAPACITY_UTILIZATION,
+        EvidenceType.EXPORT_MIX,
+        EvidenceType.OPERATING_DRIVER,
+    }
+)
+_CANONICAL_MECHANISM_PHRASE: dict[EvidenceType, str] = {
+    EvidenceType.SWITCHING_COST: "observable switching friction",
+    EvidenceType.NETWORK_EFFECT: "observable network-effect barrier",
+    EvidenceType.COST_ADVANTAGE: "observable persistent cost barrier",
+    EvidenceType.INTANGIBLE_ASSET: "observable protected intangible barrier",
+    EvidenceType.SCALE_ADVANTAGE: "observable scale-based entry barrier",
+    EvidenceType.REGULATORY_BARRIER: "observable regulatory entry barrier",
+}
+
+
+def atomic_moat_role(extraction: AtomicEvidenceExtraction) -> AtomicMoatRole:
+    """Return a role only when role, subtype, direction, and scope agree.
+
+    Legacy callers may omit ``role``; those values are inferred from the old
+    type/direction contract.  New model output must explicitly select a
+    mutually compatible role.  Invalid combinations fail closed to ``NONE``.
+    """
+
+    if not extraction.is_investment_relevant:
+        return AtomicMoatRole.NONE
+    if extraction.economic_scope not in {EconomicScope.COMPANY, EconomicScope.SEGMENT}:
+        return AtomicMoatRole.NONE
+    explicit = extraction.moat_role
+    inferred = AtomicMoatRole.NONE
+    if (
+        extraction.evidence_type in STRUCTURAL_MOAT_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_POSITIVE
+    ):
+        inferred = AtomicMoatRole.MECHANISM
+    elif (
+        extraction.evidence_type in OUTCOME_CORROBORATION_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_POSITIVE
+    ):
+        inferred = AtomicMoatRole.OUTCOME
+    elif (
+        extraction.evidence_type in _MOAT_COUNTER_TYPES
+        and extraction.direction == EvidenceDirection.MOAT_NEGATIVE
+    ):
+        inferred = AtomicMoatRole.COUNTER
+    if explicit is None:
+        return inferred
+    return explicit if explicit == inferred else AtomicMoatRole.NONE
+
+
+def observable_atomic_anchor_violation(
+    extraction: AtomicEvidenceExtraction,
+    source_text: str,
+) -> str | None:
+    """Return a fail-closed reason when selected MOAT routes lack an observable anchor.
+
+    The LLM chooses the semantic route, but Python enforces the narrow claims
+    that repeatedly caused false precision in IR pages.  This is deliberately
+    not a keyword classifier: it can reject an unsupported route, but it never
+    promotes a ``NONE`` vote into score-bearing evidence.
+    """
+
+    role = atomic_moat_role(extraction)
+    if role == AtomicMoatRole.NONE:
+        return None
+    text = unicodedata.normalize("NFKC", source_text or "")
+    evidence_type = extraction.evidence_type
+    if evidence_type == EvidenceType.MARKET_SHARE and not _MARKET_SHARE_ANCHOR_RE.search(text):
+        return "MARKET_SHARE_REQUIRES_ISSUER_SHARE_OR_RANK"
+    if (
+        evidence_type == EvidenceType.CUSTOMER_RETENTION
+        and not _CUSTOMER_RETENTION_ANCHOR_RE.search(text)
+    ):
+        return "CUSTOMER_RETENTION_REQUIRES_DIRECT_RETENTION_BEHAVIOR"
+    if evidence_type == EvidenceType.MARGIN_STABILITY:
+        periods = {match.group(0).casefold() for match in _PERIOD_TOKEN_RE.finditer(text)}
+        multi_period = bool(_EXPLICIT_MULTIPERIOD_RE.search(text)) or len(periods) >= 3
+        if not (_MARGIN_OR_PROFITABILITY_ANCHOR_RE.search(text) and multi_period):
+            return "MARGIN_STABILITY_REQUIRES_MULTI_PERIOD_PROFITABILITY"
+    if evidence_type == EvidenceType.COST_ADVANTAGE and not (
+        _COST_PROCESS_ANCHOR_RE.search(text) and _DIRECT_COMPARISON_RE.search(text)
+    ):
+        return "COST_ADVANTAGE_REQUIRES_DIRECT_PROCESS_COMPARISON"
+    if role == AtomicMoatRole.COUNTER and not _COUNTER_EROSION_RE.search(text):
+        return "COUNTER_REQUIRES_EXPLICIT_MOAT_ANCHOR_EROSION"
+    return None
+
+
+def _canonical_atomic_fact(source_text: str) -> str:
+    fact = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", source_text)).strip()
+    if not fact:
+        return "No stable investment-relevant evidence"
+    return fact[:1_200].rstrip()
+
+
+def atomic_classification_signature(
+    extraction: AtomicEvidenceExtraction,
+) -> tuple[str, bool, str, str, str]:
+    """Fields that can change MOAT routing or score eligibility."""
+
+    return (
+        atomic_moat_role(extraction).value,
+        extraction.is_investment_relevant,
+        extraction.evidence_type.value,
+        extraction.direction.value,
+        extraction.economic_scope.value,
+    )
+
+
+def atomic_routing_signature(
+    extraction: AtomicEvidenceExtraction,
+) -> tuple[str, bool, str, str]:
+    """Economic route fields; scope is calibrated after route consensus."""
+
+    signature = atomic_classification_signature(extraction)
+    return signature[:4]
+
+
+def build_atomic_classification_consensus(
+    votes: list[AtomicEvidenceExtraction],
+    *,
+    source_text: str,
+) -> tuple[AtomicEvidenceExtraction, dict[str, object]]:
+    """Reduce independent atomic votes with a strict majority.
+
+    No majority means no score-bearing evidence.  Free-form model wording is
+    never selected by the vote: the final fact and claim identity are derived
+    from the frozen source plus the winning closed-set label.
+    """
+
+    if not votes:
+        raise ValueError("atomic classification consensus requires votes")
+    signatures = [atomic_classification_signature(vote) for vote in votes]
+    routing_signatures = [atomic_routing_signature(vote) for vote in votes]
+    route_counts = Counter(routing_signatures)
+    winning_route, winning_count = min(
+        route_counts.items(), key=lambda item: (-item[1], item[0])
+    )
+    quorum = len(votes) // 2 + 1
+    agreed = winning_count >= quorum
+    if agreed:
+        role_value, relevant, type_value, direction_value = winning_route
+        winning_votes = [
+            vote
+            for vote, route in zip(votes, routing_signatures, strict=True)
+            if route == winning_route
+        ]
+        scope_counts = Counter(vote.economic_scope for vote in winning_votes)
+        scope, _scope_count = min(
+            scope_counts.items(),
+            key=lambda item: (-item[1], item[0].value),
+        )
+        role = AtomicMoatRole(role_value)
+        evidence_type = EvidenceType(type_value)
+        direction = EvidenceDirection(direction_value)
+        fact = (
+            _canonical_atomic_fact(source_text)
+            if relevant
+            else "No stable investment-relevant evidence"
+        )
+        selected = AtomicEvidenceExtraction(
+            is_investment_relevant=relevant,
+            moat_role=role,
+            evidence_type=evidence_type,
+            direction=direction,
+            fact=fact,
+            mechanism=(
+                [_CANONICAL_MECHANISM_PHRASE[evidence_type]]
+                if role == AtomicMoatRole.MECHANISM
+                else []
+            ),
+            economic_scope=scope,
+            claim_subject=(
+                "company"
+                if scope == EconomicScope.COMPANY
+                else "segment"
+                if scope == EconomicScope.SEGMENT
+                else scope.value.casefold()
+            ),
+            claim_predicate=evidence_type.value.casefold(),
+        )
+        status = "CONSENSUS"
+    else:
+        scope_counts = Counter()
+        selected = AtomicEvidenceExtraction(
+            is_investment_relevant=False,
+            moat_role=AtomicMoatRole.NONE,
+            evidence_type=EvidenceType.OTHER,
+            direction=EvidenceDirection.NEUTRAL,
+            fact="No stable investment-relevant evidence",
+            economic_scope=EconomicScope.COMPANY,
+        )
+        status = "NO_CONSENSUS_FAIL_CLOSED"
+    diagnostics: dict[str, object] = {
+        "schema_version": "atomic-classification-consensus/1",
+        "vote_count": len(votes),
+        "quorum": quorum,
+        "status": status,
+        "winning_vote_count": winning_count,
+        "agreement_rate": winning_count / len(votes),
+        "winning_route": list(winning_route) if agreed else None,
+        "winning_signature": (
+            list(atomic_classification_signature(selected)) if agreed else None
+        ),
+        "vote_signatures": [list(signature) for signature in signatures],
+        "vote_routing_signatures": [list(signature) for signature in routing_signatures],
+        "signature_counts": [
+            {"signature": list(signature), "count": count}
+            for signature, count in sorted(Counter(signatures).items())
+        ],
+        "routing_signature_counts": [
+            {"signature": list(signature), "count": count}
+            for signature, count in sorted(route_counts.items())
+        ],
+        "winning_scope_counts": [
+            {"scope": scope.value, "count": count}
+            for scope, count in sorted(scope_counts.items(), key=lambda item: item[0].value)
+        ],
+    }
+    return selected, diagnostics
+
+
+def normalize_atomic_extraction(
+    extraction: AtomicEvidenceExtraction,
+    *,
+    source_text: str | None = None,
+) -> tuple[AtomicEvidenceExtraction, list[str]]:
+    """Keep free LLM prose qualitative; Python owns source numbers/periods.
+
+    Atomic raw quotes, metrics and periods are hydrated from the canonical
+    source after this step, so removing digits from model-authored prose loses
+    no auditable numeric evidence and prevents one malformed suffix from
+    failing an entire company.
+    """
+
+    actions: list[str] = []
+
+    def qualitative(value: str | None, field: str) -> str | None:
+        if value is None:
+            return None
+        cleaned = _LLM_NUMERIC_FRAGMENT_RE.sub("", value)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.;:-~")
+        if cleaned != value:
+            actions.append(f"REMOVE_NUMERIC_PROSE:{field}")
+        return cleaned or None
+
+    fact = qualitative(extraction.fact, "fact") or "Grounded canonical source evidence."
+    mechanisms = [
+        cleaned
+        for index, value in enumerate(extraction.mechanism)
+        if (cleaned := qualitative(value, f"mechanism[{index}]") or "")
+    ]
+    role = atomic_moat_role(extraction)
+    relevant = extraction.is_investment_relevant
+    evidence_type = extraction.evidence_type
+    direction = extraction.direction
+    scope = extraction.economic_scope
+    if source_text is not None:
+        anchor_violation = observable_atomic_anchor_violation(extraction, source_text)
+        if anchor_violation is not None:
+            relevant = False
+            actions.append(f"FAIL_CLOSED_OBSERVABLE_ANCHOR:{anchor_violation}")
+    if not relevant:
+        role = AtomicMoatRole.NONE
+        evidence_type = EvidenceType.OTHER
+        direction = EvidenceDirection.NEUTRAL
+        scope = EconomicScope.COMPANY
+        mechanisms = []
+        actions.append("CANONICALIZE_IRRELEVANT_LABEL")
+    elif role == AtomicMoatRole.NONE:
+        if evidence_type not in _NON_MOAT_RELEVANT_TYPES:
+            relevant = False
+            evidence_type = EvidenceType.OTHER
+            scope = EconomicScope.COMPANY
+            actions.append("FAIL_CLOSED_INVALID_OR_NONE_MOAT_ROLE")
+        else:
+            actions.append("PRESERVE_EXPLICIT_NON_MOAT_DCF_DRIVER")
+        direction = EvidenceDirection.NEUTRAL
+        mechanisms = []
+    else:
+        expected_direction = (
+            EvidenceDirection.MOAT_NEGATIVE
+            if role == AtomicMoatRole.COUNTER
+            else EvidenceDirection.MOAT_POSITIVE
+        )
+        if direction != expected_direction:
+            actions.append(f"CANONICALIZE_DIRECTION:{direction.value}->{expected_direction.value}")
+            direction = expected_direction
+        if role != AtomicMoatRole.MECHANISM:
+            mechanisms = []
+    normalized = extraction.model_copy(
+        update={
+            "is_investment_relevant": relevant,
+            "moat_role": role if relevant else AtomicMoatRole.NONE,
+            "evidence_type": evidence_type,
+            "direction": direction,
+            "economic_scope": scope,
+            "fact": fact if relevant else "No investment-relevant evidence",
+            "mechanism": mechanisms,
+            "claim_subject": qualitative(extraction.claim_subject, "subject") or "company",
+            "claim_predicate": qualitative(extraction.claim_predicate, "predicate")
+            or "unspecified",
+            # Source-derived period/horizon is added by
+            # atomic_extraction_to_judgment below.
+            "claim_horizon": qualitative(extraction.claim_horizon, "horizon"),
+            "claim_metric": qualitative(extraction.claim_metric, "metric"),
+        }
+    )
+    return normalized, actions
 _ATOMIC_METRIC_RE = re.compile(
     r"(?<![0-9A-Za-z])(?P<value>[-+]?\d[\d,]*(?:\.\d+)?)\s*"
     r"(?P<unit>%p|pp|%|억원|백만원|천원|원|달러|USD|KRW|개월|년|배)?",
@@ -179,6 +553,7 @@ def atomic_extraction_to_judgment(
     )
     return AtomicEvidenceJudgment(
         is_investment_relevant=extraction.is_investment_relevant,
+        moat_role=atomic_moat_role(extraction),
         evidence_type=extraction.evidence_type,
         statement_type=statement_type,
         fact=extraction.fact,
@@ -223,6 +598,7 @@ def atomic_judgment_to_card(
         evidence_id="PENDING",
         source_chunk_id=chunk.chunk_id,
         node_ids=sorted(set(chunk.node_ids)),
+        moat_role=judgment.moat_role,
         evidence_type=judgment.evidence_type,
         statement_type=judgment.statement_type,
         fact=judgment.fact,

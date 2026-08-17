@@ -11,14 +11,17 @@ from moatrader.evidence.atomic import (
     atomic_unit_set_sha256,
     build_atomic_evidence_units,
     select_atomic_evidence_units,
+    select_context_cited_atomic_units,
     split_atomic_evidence_text,
 )
 from moatrader.evidence.models import (
     AtomicEvidenceJudgment,
+    ContextualMoatAssessment,
     EvidenceCard,
     EvidenceDirection,
     STRUCTURAL_MOAT_TYPES,
 )
+from moatrader.context.moat_strength import MoatStrengthContext
 from moatrader.evidence.processing import atomic_judgment_to_card, build_canonical_claim_set
 from moatrader.evidence.validation import derive_moat_score
 from moatrader.semantic.chunker import HeuristicTokenCounter, SemanticChunk
@@ -140,10 +143,32 @@ def audit_company_metamorphs(
     *,
     issuer_id: str | None,
     maximum_atomic_units: int | None,
+    maximum_ir_atomic_units: int | None = None,
+    preserve_ir_document_coverage: bool = False,
 ) -> dict[str, object]:
     directory = Path(company_directory)
     chunks = list(_read_jsonl(directory / "chunks.jsonl", SemanticChunk))
     selected = list(_read_jsonl(directory / "atomic-evidence-units.jsonl", SemanticChunk))
+    selection_manifest = json.loads(
+        (directory / "evidence-chunk-selection.json").read_text(encoding="utf-8-sig")
+    )
+    source_partitioned = selection_manifest.get("method") == "dual_lane_citation_audit/1" and (
+        "baseline_base_atomic_unit_set_sha256" in selection_manifest
+    )
+    contextual_assessment = ContextualMoatAssessment.model_validate_json(
+        (directory / "contextual-moat-assessment.json").read_text(encoding="utf-8-sig")
+    )
+    strength_context = MoatStrengthContext.model_validate_json(
+        (directory / "moat-strength-context.json").read_text(encoding="utf-8-sig")
+    )
+    chunk_id_by_ref = {
+        reference.ref_id: reference.chunk_id
+        for reference in strength_context.references
+    }
+    raw_quote_by_ref = {
+        reference.ref_id: reference.raw_quote
+        for reference in strength_context.references
+    }
     claim_cards = list(_read_jsonl(directory / "canonical-claim-set.jsonl", EvidenceCard))
     all_cards = list(_read_jsonl(directory / "evidence.jsonl", EvidenceCard))
     current_cards = list(_read_jsonl(directory / "current-evidence.jsonl", EvidenceCard))
@@ -158,12 +183,6 @@ def audit_company_metamorphs(
     baseline_score = json.loads((directory / "moat-score.json").read_text(encoding="utf-8-sig"))
     scoring_cards = [card for card in claim_cards if _is_reducer_input(card)]
     as_of = baseline_score["as_of"]
-    baseline_claim_ids = set(baseline_score.get("canonical_claim_ids") or [])
-    baseline_evidence_ids = {
-        evidence_id
-        for mechanism in baseline_score.get("mechanisms") or []
-        for evidence_id in mechanism.get("evidence_ids") or []
-    } | set(baseline_score.get("counterevidence_ids") or [])
     selected_keys = {str(unit.metadata["atomic_evidence_key"]) for unit in selected}
     failures: list[str] = []
     results: dict[str, object] = {}
@@ -185,17 +204,64 @@ def audit_company_metamorphs(
         )
         for name, cards in reducer_inputs.items()
     }
-    expected_score = float(baseline_score["economic_moat_score"])
+    atomic_baseline = reducer_outputs["original"]
+    baseline_claim_ids = set(atomic_baseline.canonical_claim_ids)
+    baseline_evidence_ids = {
+        evidence_id
+        for mechanism in atomic_baseline.mechanisms
+        for evidence_id in mechanism.evidence_ids
+    } | set(atomic_baseline.counterevidence_ids)
+    expected_score = atomic_baseline.economic_moat_score
     for name, score in reducer_outputs.items():
         if score.economic_moat_score != expected_score:
-            failures.append(f"reducer {name} score delta is not zero")
+            failures.append(f"atomic audit reducer {name} score delta is not zero")
         if set(score.canonical_claim_ids) != baseline_claim_ids:
             failures.append(f"reducer {name} claim set changed")
 
     for name, transformed_chunks in _variants(chunks).items():
-        transformed_units = select_atomic_evidence_units(
-            build_atomic_evidence_units(transformed_chunks, issuer_id=issuer_id),
-            maximum_atomic_units,
+        all_transformed_units = build_atomic_evidence_units(
+            transformed_chunks,
+            issuer_id=issuer_id,
+        )
+        if source_partitioned:
+            transformed_base_units = [
+                unit
+                for unit in all_transformed_units
+                if not any(ref.source_type == SourceType.IR for ref in unit.source_refs)
+            ]
+            transformed_ir_units = [
+                unit
+                for unit in all_transformed_units
+                if any(ref.source_type == SourceType.IR for ref in unit.source_refs)
+            ]
+            baseline_transformed_units = [
+                *select_atomic_evidence_units(
+                    transformed_base_units,
+                    maximum_atomic_units,
+                ),
+                *select_atomic_evidence_units(
+                    transformed_ir_units,
+                    maximum_ir_atomic_units,
+                    preserve_document_coverage=preserve_ir_document_coverage,
+                ),
+            ]
+        else:
+            baseline_transformed_units = select_atomic_evidence_units(
+                all_transformed_units,
+                maximum_atomic_units,
+            )
+        cited_transformed_units = select_context_cited_atomic_units(
+            all_transformed_units,
+            contextual_assessment,
+            chunk_id_by_ref=chunk_id_by_ref,
+            raw_quote_by_ref=raw_quote_by_ref,
+        )
+        transformed_units = sorted(
+            {
+                unit.chunk_id: unit
+                for unit in [*baseline_transformed_units, *cited_transformed_units]
+            }.values(),
+            key=lambda unit: str(unit.metadata["atomic_evidence_key"]),
         )
         transformed_keys = {
             str(unit.metadata["atomic_evidence_key"]) for unit in transformed_units
@@ -259,6 +325,9 @@ def audit_company_metamorphs(
         "failures": failures,
         "baseline_atomic_unit_set_sha256": atomic_unit_set_sha256(selected),
         "baseline_claim_ids": sorted(baseline_claim_ids),
+        "published_contextual_score": float(baseline_score["economic_moat_score"]),
+        "published_scoring_method": baseline_score.get("scoring_method"),
+        "note": "metamorphic algebra applies to the atomic audit lane, not contextual strength",
         "reducer_algebra": {
             name: {
                 "score": score.economic_moat_score,
