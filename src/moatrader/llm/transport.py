@@ -223,7 +223,11 @@ class OpenAIResponsesTransport:
         raise RuntimeError(f"OpenAI request failed after {self.max_retries + 1} attempt(s): {last_error}") from last_error
 
     def _model_for(self, task: LLMTask) -> str:
+        if task == LLMTask.HISTORICAL_PREPROCESSING:
+            return self.summary_model
         if task in {
+            LLMTask.HISTORICAL_EVIDENCE_CLASSIFICATION,
+            LLMTask.HISTORICAL_ENTAILMENT_CHECK,
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.VALUATION_DRIVER_CLASSIFICATION,
             LLMTask.CONTEXTUAL_MOAT_STRENGTH,
@@ -413,7 +417,11 @@ class OpenAIResponsesTransport:
                 return repair_json(candidate, return_objects=True)
 
     def _effort_for(self, task: LLMTask) -> str:
+        if task == LLMTask.HISTORICAL_PREPROCESSING:
+            return self.summary_reasoning_effort
         if task in {
+            LLMTask.HISTORICAL_EVIDENCE_CLASSIFICATION,
+            LLMTask.HISTORICAL_ENTAILMENT_CHECK,
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.VALUATION_DRIVER_CLASSIFICATION,
         }:
@@ -430,6 +438,12 @@ class OpenAIResponsesTransport:
         # Atomic classification is one source unit and should never consume a
         # company-level answer budget. Caps prevent malformed verbose outputs
         # while the configured global maximum remains a compatibility ceiling.
+        if task in {
+            LLMTask.HISTORICAL_PREPROCESSING,
+            LLMTask.HISTORICAL_EVIDENCE_CLASSIFICATION,
+            LLMTask.HISTORICAL_ENTAILMENT_CHECK,
+        }:
+            return min(self.max_output_tokens, 8_000)
         if task in {
             LLMTask.LOCAL_EVIDENCE_EXTRACTION,
             LLMTask.VALUATION_DRIVER_CLASSIFICATION,

@@ -25,6 +25,7 @@ HANKYUNG_REPORT_API_URL = "https://markets.hankyung.com/api/v2/consensus/search/
 HANKYUNG_PDF_DOWNLOAD_URL = "https://consensus.hankyung.com/analysis/downpdf"
 HANKYUNG_CONSENSUS_URL = "https://markets.hankyung.com/consensus"
 HANKYUNG_INDUSTRY_REPORT_TYPE = "IN"
+HANKYUNG_COMPANY_REPORT_TYPE = "CO"
 SEOUL = ZoneInfo("Asia/Seoul")
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -167,6 +168,101 @@ class HankyungIndustryReport(ContractModel):
         )
 
 
+class HankyungCompanyReport(ContractModel):
+    """PIT identity for a company research report already held by Synalyst.
+
+    Market-opinion fields deliberately never enter this contract. The PDF is
+    evidence, while ``REGISTER_DATE`` supplies its exact availability time.
+    """
+
+    report_id: str = Field(min_length=1)
+    ticker: str = Field(pattern=r"^\d{6}$")
+    company_name: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    publisher: str | None = None
+    author: str | None = None
+    report_date: date
+    registered_at: datetime
+    filename: str = Field(min_length=1)
+    file_url: str | None = None
+    raw_metadata: dict[str, Any] = Field(default_factory=dict, exclude=True)
+
+    @model_validator(mode="after")
+    def valid_point_in_time(self) -> "HankyungCompanyReport":
+        if self.registered_at.tzinfo is None or self.registered_at.utcoffset() is None:
+            raise ValueError("registered_at must be timezone-aware")
+        published_at = datetime.combine(self.report_date, time.min, tzinfo=SEOUL)
+        if self.registered_at < published_at:
+            raise ValueError("REGISTER_DATE cannot precede REPORT_DATE")
+        return self
+
+    @classmethod
+    def from_api(cls, row: dict[str, Any]) -> "HankyungCompanyReport":
+        if str(row.get("REPORT_TYPE") or "").upper() != HANKYUNG_COMPANY_REPORT_TYPE:
+            raise ValueError("Hankyung record is not a company report")
+        report_id = str(row.get("REPORT_IDX") or row.get("LINK_IDX") or "").strip()
+        ticker = str(row.get("BUSINESS_CODE") or "").strip().zfill(6)
+        company_name = str(row.get("BUSINESS_NAME") or "").strip()
+        if not report_id or not re.fullmatch(r"\d{6}", ticker) or not company_name:
+            raise ValueError("Hankyung company report lacks report/company identity")
+        title = str(row.get("REPORT_TITLE") or row.get("REPORT_CONTENT") or "").strip()
+        if not title:
+            title = f"Hankyung company report {report_id}"
+        original_filename = str(row.get("REPORT_FILENAME") or title)
+        return cls(
+            report_id=report_id,
+            ticker=ticker,
+            company_name=company_name,
+            title=title,
+            publisher=str(row.get("OFFICE_NAME") or "").strip() or None,
+            author=str(row.get("REPORT_WRITER") or "").strip() or None,
+            report_date=_parse_report_date(row.get("REPORT_DATE")),
+            registered_at=_parse_registered_at(row.get("REGISTER_DATE")),
+            filename=_safe_filename(f"{report_id}_{original_filename}"),
+            file_url=(
+                str(row.get("REPORT_FILEPATH")).strip()
+                if str(row.get("REPORT_FILEPATH") or "").startswith(("https://", "http://"))
+                else None
+            ),
+            raw_metadata=dict(row),
+        )
+
+    @property
+    def source_document_id(self) -> str:
+        return f"HANKYUNG_CO_{self.report_id}"
+
+    def adapter_hints(self) -> dict[str, Any]:
+        return {
+            "source_type": SourceType.ANALYST.value,
+            "source_document_id": self.source_document_id,
+            "report_id": self.report_id,
+            "issuer_id": f"KRX:{self.ticker}",
+            "issuer_name": self.company_name,
+            "ticker": self.ticker,
+            "title": self.title,
+            "report_name": self.title,
+            "publisher": self.publisher,
+            "author": self.author,
+            "report_date": self.report_date.isoformat(),
+            "published_at": datetime.combine(
+                self.report_date, time.min, tzinfo=SEOUL
+            ).isoformat(),
+            "available_at": self.registered_at.isoformat(),
+            "availability_precision": AvailabilityPrecision.EXACT.value,
+            "availability_source": "hankyung_REGISTER_DATE",
+            "source_system": "hankyung_consensus",
+            "language": "ko",
+            "jurisdiction": "KR",
+            "source_specific": {
+                "report_type": HANKYUNG_COMPANY_REPORT_TYPE,
+                "publisher": self.publisher,
+                "author": self.author,
+                "hankyung_report_id": self.report_id,
+                "market_opinion_fields_quarantined": True,
+            },
+        }
+
+
 def load_hankyung_industry_reports(path: str | Path) -> dict[str, HankyungIndustryReport]:
     metadata_path = Path(path).expanduser().resolve()
     payload = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
@@ -182,6 +278,48 @@ def load_hankyung_industry_reports(path: str | Path) -> dict[str, HankyungIndust
             raise ValueError(f"conflicting Hankyung report metadata: {report.report_id}")
         reports[report.report_id] = report
     return reports
+
+
+def load_hankyung_company_reports(path: str | Path) -> dict[str, HankyungCompanyReport]:
+    metadata_path = Path(path).expanduser().resolve()
+    payload = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, list):
+        raise ValueError("Hankyung reports.json must contain a list")
+    reports: dict[str, HankyungCompanyReport] = {}
+    for row in payload:
+        if not isinstance(row, dict) or str(row.get("REPORT_TYPE") or "").upper() != "CO":
+            continue
+        try:
+            report = HankyungCompanyReport.from_api(row)
+        except ValueError:
+            # The historical API dump contains a small number of CO rows
+            # without a company code/name. They cannot be joined PIT-safely.
+            continue
+        prior = reports.get(report.report_id)
+        if prior is not None and prior != report:
+            raise ValueError(f"conflicting Hankyung report metadata: {report.report_id}")
+        reports[report.report_id] = report
+    return reports
+
+
+def raw_company_document_from_synalyst_pdf(
+    pdf_path: str | Path,
+    reports_json: str | Path,
+) -> RawDocument:
+    path = Path(pdf_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    report_id = path.stem.partition("_")[0]
+    report = load_hankyung_company_reports(reports_json).get(report_id)
+    if report is None:
+        raise ValueError(f"no company REPORT_IDX={report_id} metadata for {path.name}")
+    return RawDocument(
+        content=path.read_bytes(),
+        uri=report.file_url or path.as_uri(),
+        fetched_at=report.registered_at.astimezone(timezone.utc),
+        media_type="application/pdf",
+        hints={**report.adapter_hints(), "local_path": str(path)},
+    )
 
 
 def raw_document_from_synalyst_pdf(
@@ -400,4 +538,3 @@ class HankyungIndustryCollector:
             filings=filings,
             failures=failures,
         )
-
