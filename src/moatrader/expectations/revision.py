@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 from decimal import Decimal
 from enum import StrEnum
@@ -61,6 +62,20 @@ DRIVER_SHOCKS: dict[DriverName, Decimal] = {
     DriverName.ROIIC: D("0.05"),
     DriverName.CAP: D("1"),
 }
+
+
+# A deliberately small, fixed prior over economically broad driver states.
+# Every company uses the same 5^4 design; only scale, balance sheet, WACC and
+# stable-state assumptions come from its PIT base model.
+EXPECTATION_SURFACE_LEVELS: dict[DriverName, tuple[Decimal, ...]] = {
+    DriverName.GROWTH: tuple(D(value) for value in ("-0.20", "0.00", "0.10", "0.25", "0.60")),
+    DriverName.MARGIN: tuple(D(value) for value in ("-0.20", "0.05", "0.15", "0.30", "0.60")),
+    DriverName.ROIIC: tuple(D(value) for value in ("0.03", "0.10", "0.25", "0.75", "2.00")),
+    DriverName.CAP: tuple(D(value) for value in (1, 5, 10, 20, 40)),
+}
+SURFACE_KERNEL_BANDWIDTH = 0.05
+SURFACE_MAX_NEAREST_RELATIVE_ERROR = 0.10
+SURFACE_MIN_EFFECTIVE_POINTS = 5.0
 
 
 class PeriodicValueFactorVector(ContractModel):
@@ -142,6 +157,47 @@ class DynamicImpliedRevision(ContractModel):
                 raise ValueError("solved revision requires both implied levels")
             if self.implied_revision != self.target_implied - self.entry_implied:
                 raise ValueError("implied revision must be target minus entry")
+        return self
+
+
+class SurfaceStatus(StrEnum):
+    SOLVED = "SOLVED"
+    NO_ELIGIBLE_SURFACE = "NO_ELIGIBLE_SURFACE"
+    ENTRY_PRICE_OUTSIDE_SURFACE = "ENTRY_PRICE_OUTSIDE_SURFACE"
+    TARGET_PRICE_OUTSIDE_SURFACE = "TARGET_PRICE_OUTSIDE_SURFACE"
+
+
+class ExpectationSurfaceSnapshot(ContractModel):
+    observed_price: Decimal = Field(gt=0)
+    eligible: bool
+    nearest_relative_price_error: Decimal
+    effective_point_count: Decimal = Field(ge=0)
+    near_match_count: int = Field(ge=0)
+    driver_mean: dict[DriverName, Decimal] = Field(default_factory=dict)
+    driver_p10: dict[DriverName, Decimal] = Field(default_factory=dict)
+    driver_p90: dict[DriverName, Decimal] = Field(default_factory=dict)
+
+
+class ExpectationSurfaceRevision(ContractModel):
+    status: SurfaceStatus
+    entry: ExpectationSurfaceSnapshot | None = None
+    target: ExpectationSurfaceSnapshot | None = None
+    driver_revision: dict[DriverName, Decimal] = Field(default_factory=dict)
+    design_point_count: int = Field(ge=1)
+    eligible_valuation_count: int = Field(ge=0)
+    kernel_bandwidth: Decimal = Field(gt=0)
+
+    @model_validator(mode="after")
+    def surface_revision_matches(self) -> "ExpectationSurfaceRevision":
+        if self.status == SurfaceStatus.SOLVED:
+            if self.entry is None or self.target is None:
+                raise ValueError("solved surface revision requires both snapshots")
+            expected = {
+                driver: self.target.driver_mean[driver] - self.entry.driver_mean[driver]
+                for driver in DriverName
+            }
+            if self.driver_revision != expected:
+                raise ValueError("surface revision must equal target mean minus entry mean")
         return self
 
 
@@ -505,4 +561,151 @@ def dynamic_implied_revision(
         target_bracket_low=target[1],
         target_bracket_high=target[2],
         grid_point_count=count,
+    )
+
+
+def _surface_cloud(
+    base: EconomicDcfAssumptions,
+    engine: EconomicDcfEngine,
+) -> list[tuple[dict[DriverName, Decimal], Decimal]]:
+    cloud: list[tuple[dict[DriverName, Decimal], Decimal]] = []
+    levels = [EXPECTATION_SURFACE_LEVELS[driver] for driver in DriverName]
+    for combination in itertools.product(*levels):
+        state = dict(zip(DriverName, combination))
+        assumptions = base.model_copy(
+            update={
+                "revenue_growth": state[DriverName.GROWTH],
+                "target_nopat_margin": state[DriverName.MARGIN],
+                "roiic": state[DriverName.ROIIC],
+                "competitive_advantage_period_years": int(state[DriverName.CAP]),
+                "explicit_forecast_years": max(
+                    10, int(state[DriverName.CAP]) + base.fade_years
+                ),
+            }
+        )
+        try:
+            price = engine.value(assumptions).fair_value_per_share
+        except Exception:
+            continue
+        if price > 0:
+            cloud.append((state, price))
+    return cloud
+
+
+def _weighted_quantile(
+    values: Sequence[float],
+    weights: Sequence[float],
+    quantile: float,
+) -> Decimal:
+    ordered = sorted(zip(values, weights), key=lambda item: item[0])
+    threshold = sum(weights) * quantile
+    cumulative = 0.0
+    for value, weight in ordered:
+        cumulative += weight
+        if cumulative >= threshold:
+            return D(str(value))
+    return D(str(ordered[-1][0]))
+
+
+def _surface_snapshot(
+    cloud: Sequence[tuple[dict[DriverName, Decimal], Decimal]],
+    observed_price: Decimal,
+    *,
+    bandwidth: float,
+) -> ExpectationSurfaceSnapshot:
+    errors = [abs(math.log(float(price / observed_price))) for _state, price in cloud]
+    nearest = min(errors)
+    weights = [math.exp(-0.5 * (error / bandwidth) ** 2) for error in errors]
+    total = sum(weights)
+    if total <= 0:
+        weights = [1.0 if error == nearest else 0.0 for error in errors]
+        total = sum(weights)
+    normalized = [weight / total for weight in weights]
+    effective = 1.0 / sum(weight * weight for weight in normalized)
+    near_count = sum(error <= bandwidth for error in errors)
+    means: dict[DriverName, Decimal] = {}
+    p10: dict[DriverName, Decimal] = {}
+    p90: dict[DriverName, Decimal] = {}
+    for driver in DriverName:
+        values = [float(state[driver]) for state, _price in cloud]
+        means[driver] = D(str(sum(value * weight for value, weight in zip(values, normalized))))
+        p10[driver] = _weighted_quantile(values, normalized, 0.10)
+        p90[driver] = _weighted_quantile(values, normalized, 0.90)
+    nearest_relative = math.exp(nearest) - 1.0
+    eligible = (
+        nearest_relative <= SURFACE_MAX_NEAREST_RELATIVE_ERROR
+        and effective >= SURFACE_MIN_EFFECTIVE_POINTS
+    )
+    return ExpectationSurfaceSnapshot(
+        observed_price=observed_price,
+        eligible=eligible,
+        nearest_relative_price_error=D(str(nearest_relative)),
+        effective_point_count=D(str(effective)),
+        near_match_count=near_count,
+        driver_mean=means,
+        driver_p10=p10,
+        driver_p90=p90,
+    )
+
+
+def expectation_surface_revision(
+    *,
+    base: EconomicDcfAssumptions,
+    entry_price: Decimal,
+    target_price: Decimal,
+    engine: EconomicDcfEngine | None = None,
+    bandwidth: float = SURFACE_KERNEL_BANDWIDTH,
+) -> ExpectationSurfaceRevision:
+    """Estimate expectation changes from one fixed multidimensional price surface.
+
+    The uniform 5x5x5x5 design is an explicit identifying prior, not a claim
+    that price uniquely reveals four expectations.  Kernel weighting retains a
+    region of price-compatible states and reports its ranges and effective size.
+    """
+
+    if entry_price <= 0 or target_price <= 0:
+        raise ValueError("both prices must be positive")
+    if bandwidth <= 0:
+        raise ValueError("bandwidth must be positive")
+    valuation_engine = engine or EconomicDcfEngine()
+    cloud = _surface_cloud(base, valuation_engine)
+    design_count = math.prod(len(values) for values in EXPECTATION_SURFACE_LEVELS.values())
+    if not cloud:
+        return ExpectationSurfaceRevision(
+            status=SurfaceStatus.NO_ELIGIBLE_SURFACE,
+            design_point_count=design_count,
+            eligible_valuation_count=0,
+            kernel_bandwidth=D(str(bandwidth)),
+        )
+    entry = _surface_snapshot(cloud, entry_price, bandwidth=bandwidth)
+    if not entry.eligible:
+        return ExpectationSurfaceRevision(
+            status=SurfaceStatus.ENTRY_PRICE_OUTSIDE_SURFACE,
+            entry=entry,
+            design_point_count=design_count,
+            eligible_valuation_count=len(cloud),
+            kernel_bandwidth=D(str(bandwidth)),
+        )
+    target = _surface_snapshot(cloud, target_price, bandwidth=bandwidth)
+    if not target.eligible:
+        return ExpectationSurfaceRevision(
+            status=SurfaceStatus.TARGET_PRICE_OUTSIDE_SURFACE,
+            entry=entry,
+            target=target,
+            design_point_count=design_count,
+            eligible_valuation_count=len(cloud),
+            kernel_bandwidth=D(str(bandwidth)),
+        )
+    revisions = {
+        driver: target.driver_mean[driver] - entry.driver_mean[driver]
+        for driver in DriverName
+    }
+    return ExpectationSurfaceRevision(
+        status=SurfaceStatus.SOLVED,
+        entry=entry,
+        target=target,
+        driver_revision=revisions,
+        design_point_count=design_count,
+        eligible_valuation_count=len(cloud),
+        kernel_bandwidth=D(str(bandwidth)),
     )

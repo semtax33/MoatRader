@@ -7,9 +7,11 @@ import pandas as pd
 from moatrader.expectations.driver_signals import DriverName, supported_driver_estimate
 from moatrader.expectations.revision import (
     RevisionStatus,
+    SurfaceStatus,
     assumptions_with_driver,
     driver_sensitivities,
     dynamic_implied_revision,
+    expectation_surface_revision,
     periodic_value_factor_vector,
     turbo_driver,
 )
@@ -172,3 +174,34 @@ def test_dynamic_revision_uses_one_curve_and_recovers_continuous_branch() -> Non
     assert abs(revision.entry_implied - entry_driver) < D("0.005")
     assert abs(revision.target_implied - target_driver) < D("0.01")
     assert revision.implied_revision is not None and revision.implied_revision > 0
+
+
+def test_multidimensional_surface_retains_region_and_emits_all_driver_revisions() -> None:
+    estimate = supported_driver_estimate(
+        annual_history(), size_bucket="MID", diluted_shares=D("10")
+    )
+    base = estimate.assumptions()
+    engine = EconomicDcfEngine()
+    entry_price = engine.value(
+        base.model_copy(
+            update={
+                "revenue_growth": D("0.10"),
+                "target_nopat_margin": D("0.15"),
+                "roiic": D("0.25"),
+                "competitive_advantage_period_years": 10,
+                "explicit_forecast_years": 15,
+            }
+        )
+    ).fair_value_per_share
+    target_price = entry_price * D("1.05")
+    surface = expectation_surface_revision(
+        base=base,
+        entry_price=entry_price,
+        target_price=target_price,
+    )
+
+    assert surface.status == SurfaceStatus.SOLVED
+    assert surface.entry is not None and surface.entry.effective_point_count >= D("5")
+    assert surface.entry.driver_p10[DriverName.GROWTH] <= surface.entry.driver_p90[DriverName.GROWTH]
+    assert set(surface.driver_revision) == set(DriverName)
+    assert any(value != 0 for value in surface.driver_revision.values())
