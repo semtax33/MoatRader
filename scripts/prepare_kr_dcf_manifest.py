@@ -710,6 +710,20 @@ def canonical_manifest_rows(
 latest_manifest_rows = canonical_manifest_rows
 
 
+def resolve_filing_ticker(
+    security_ticker: str,
+    filing_by_stock: dict[str, list[dict[str, str]]],
+) -> tuple[str, str]:
+    """Resolve a listed security class to the issuer's periodic filing ticker."""
+    if filing_by_stock.get(security_ticker):
+        return security_ticker, "DIRECT"
+    if len(security_ticker) == 6 and security_ticker[-1] != "0":
+        common_candidate = f"{security_ticker[:5]}0"
+        if filing_by_stock.get(common_candidate):
+            return common_candidate, "SECURITY_CLASS_TO_COMMON_ISSUER"
+    return security_ticker, "UNRESOLVED"
+
+
 def historical_market_snapshot(
     ticker: str,
     as_of: datetime,
@@ -749,6 +763,35 @@ def historical_market_snapshot(
         datetime_time(hour=16),
         tzinfo=as_of.tzinfo,
     )
+    return price, shares, price_at, source
+
+
+def market_snapshot_from_universe_row(
+    row: dict[str, str],
+    *,
+    as_of: datetime,
+) -> tuple[Decimal, Decimal, datetime, str] | None:
+    """Use a pinned PIT market snapshot when the universe provides one."""
+
+    fields = ("current_price", "listed_shares", "price_as_of")
+    populated = [bool(str(row.get(field, "")).strip()) for field in fields]
+    if not any(populated):
+        return None
+    if not all(populated):
+        raise ValueError("universe PIT market snapshot is incomplete")
+
+    price = decimal_value(row["current_price"])
+    shares = decimal_value(row["listed_shares"])
+    if price is None or price <= 0:
+        raise ValueError("universe current_price must be positive")
+    if shares is None or shares <= 0:
+        raise ValueError("universe listed_shares must be positive")
+    price_at = datetime.fromisoformat(str(row["price_as_of"]).replace("Z", "+00:00"))
+    if price_at.tzinfo is None or price_at.utcoffset() is None:
+        raise ValueError("universe price_as_of must include a timezone offset")
+    if price_at > as_of:
+        raise ValueError("universe price_as_of cannot be later than the research cutoff")
+    source = str(row.get("price_source") or "UNIVERSE_PINNED_PIT_MARKET_SNAPSHOT")
     return price, shares, price_at, source
 
 
@@ -799,16 +842,22 @@ def main() -> int:
     for index, source in enumerate(universe, start=1):
         ticker = source["stock_code"].zfill(6)
         print(f"[{index}/{len(universe)}] {ticker}", flush=True)
-        filings = filing_by_stock.get(ticker, [])
+        filing_ticker, security_mapping_method = resolve_filing_ticker(
+            ticker,
+            filing_by_stock,
+        )
+        filings = filing_by_stock.get(filing_ticker, [])
         if not filings:
             exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": "NO_PERIODIC_PIT_FILING"})
             continue
         filing = max(filings, key=lambda item: (item.get("selection_period_end", ""), item.get("selection_report_kind", "")))
-        corp_code = corp_by_stock.get(ticker) or filing.get("issuer_id", "")
+        corp_code = corp_by_stock.get(filing_ticker) or filing.get("issuer_id", "")
         try:
-            price, diluted_shares, price_as_of, price_source = historical_market_snapshot(
-                ticker,
-                as_of,
+            market_snapshot = market_snapshot_from_universe_row(source, as_of=as_of)
+            price, diluted_shares, price_as_of, price_source = (
+                market_snapshot
+                if market_snapshot is not None
+                else historical_market_snapshot(ticker, as_of)
             )
         except ValueError as exc:
             exclusions.append({"stock_code": ticker, "name": source.get("name", ""), "reason": str(exc)})
@@ -825,16 +874,24 @@ def main() -> int:
             "price_as_of": price_as_of.isoformat(),
             "price_source": price_source,
             "diluted_shares": str(diluted_shares),
+            "filing_ticker": filing_ticker,
+            "security_mapping_method": security_mapping_method,
         }
         name = source.get("name", "")
         special_valuation = (
-            source.get("finance_hint", "").strip().lower() == "true"
+            filing_ticker != ticker
+            or source.get("finance_hint", "").strip().lower() == "true"
             or source.get("holding_hint", "").strip().lower() == "true"
             or source.get("security_type", "COMMON").strip().upper() != "COMMON"
             or bool(re.search(r"리츠|REIT|리얼티|인프라", name, re.IGNORECASE))
         )
         if special_valuation:
-            exclusions.append({"stock_code": ticker, "name": name, "reason": "SPECIAL_COMPANY_DCF_MODEL_MISMATCH"})
+            reason = (
+                "NON_COMMON_SECURITY_DCF_MODEL_MISMATCH"
+                if filing_ticker != ticker
+                else "SPECIAL_COMPANY_DCF_MODEL_MISMATCH"
+            )
+            exclusions.append({"stock_code": ticker, "name": name, "reason": reason})
         else:
             try:
                 base_metrics, pit_details, latest_report = build_pit_ttm_input(
@@ -920,6 +977,8 @@ def main() -> int:
                 {
                     **selected_filing,
                     "ticker": ticker,
+                    "filing_ticker": filing_ticker,
+                    "security_mapping_method": security_mapping_method,
                     "issuer_name": selected_filing.get("issuer_name") or source.get("name", ""),
                     "current_price": format(price, "f"),
                     "price_as_of": price_as_of.isoformat(),
@@ -934,6 +993,7 @@ def main() -> int:
         "ticker", "source", "input", "metadata", "issuer_id", "issuer_name",
         "current_price", "price_as_of", "dcf_assumptions", "dcf_input", "dcf_input_sha256",
         "selection_report_kind", "selection_period_end", "selection_is_amendment",
+        "filing_ticker", "security_mapping_method",
     ]
     write_csv(output_root / "universe-manifest.csv", manifest_rows, manifest_headers)
     audit_headers = sorted({key for row in audits for key in row})

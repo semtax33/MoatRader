@@ -19,10 +19,58 @@ from scripts.prepare_kr_dcf_manifest import (
     canonical_manifest_rows,
     financial_metrics,
     latest_pit_financial_report,
+    market_snapshot_from_universe_row,
+    resolve_filing_ticker,
 )
 
 
 KST = timezone(timedelta(hours=9))
+
+
+def test_pinned_universe_market_snapshot_preserves_its_real_timestamp() -> None:
+    snapshot = market_snapshot_from_universe_row(
+        {
+            "current_price": "80200",
+            "listed_shares": "5919637922",
+            "price_as_of": "2026-08-14T16:00:00+09:00",
+            "price_source": "FINANCEDATA_MARCAP_PINNED",
+        },
+        as_of=datetime.fromisoformat("2026-08-18T23:59:59+09:00"),
+    )
+
+    assert snapshot == (
+        Decimal("80200"),
+        Decimal("5919637922"),
+        datetime.fromisoformat("2026-08-14T16:00:00+09:00"),
+        "FINANCEDATA_MARCAP_PINNED",
+    )
+
+
+def test_incomplete_pinned_universe_market_snapshot_fails_closed() -> None:
+    try:
+        market_snapshot_from_universe_row(
+            {"current_price": "80200", "listed_shares": ""},
+            as_of=datetime.fromisoformat("2026-08-18T23:59:59+09:00"),
+        )
+    except ValueError as exc:
+        assert "incomplete" in str(exc)
+    else:
+        raise AssertionError("incomplete PIT market snapshot must fail closed")
+
+
+def test_filing_ticker_resolves_non_common_security_class_to_common_issuer() -> None:
+    filings = {"005930": [{"issuer_id": "00126380"}]}
+
+    assert resolve_filing_ticker("005930", filings) == ("005930", "DIRECT")
+    assert resolve_filing_ticker("005935", filings) == (
+        "005930",
+        "SECURITY_CLASS_TO_COMMON_ISSUER",
+    )
+    assert resolve_filing_ticker("00593K", filings) == (
+        "005930",
+        "SECURITY_CLASS_TO_COMMON_ISSUER",
+    )
+    assert resolve_filing_ticker("999999", filings) == ("999999", "UNRESOLVED")
 
 
 def test_manifest_selection_uses_period_first_and_keeps_annual_plus_interim(tmp_path: Path) -> None:

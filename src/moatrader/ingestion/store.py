@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -126,7 +127,7 @@ class BronzeFilingStore:
             checksum_lines = "".join(f"{digest}  {name.replace(os.sep, '/')}\n" for name, digest in sorted(file_hashes.items()))
             self._atomic_write(temporary / "sha256.txt", checksum_lines.encode("utf-8"))
             try:
-                temporary.replace(version_dir)
+                self._replace_directory_with_retry(temporary, version_dir)
             except FileExistsError:
                 shutil.rmtree(temporary)
             self._write_latest(latest_path, version_dir, version_dir / "metadata.json", raw_sha256, version_sha256)
@@ -224,3 +225,37 @@ class BronzeFilingStore:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temporary.write_bytes(content)
         temporary.replace(path)
+
+    @staticmethod
+    def _replace_directory_with_retry(
+        source: Path,
+        target: Path,
+        *,
+        maximum_attempts: int = 6,
+        initial_delay_seconds: float = 0.05,
+    ) -> None:
+        """Commit a completed version despite short-lived Windows directory locks."""
+        if maximum_attempts < 1:
+            raise ValueError("maximum_attempts must be positive")
+        for attempt in range(maximum_attempts):
+            try:
+                source.replace(target)
+                return
+            except PermissionError:
+                if attempt + 1 >= maximum_attempts:
+                    BronzeFilingStore._copy_directory_fallback(source, target)
+                    return
+                time.sleep(initial_delay_seconds * (2**attempt))
+
+    @staticmethod
+    def _copy_directory_fallback(source: Path, target: Path) -> None:
+        """Publish a version by copy when Windows persistently blocks directory rename."""
+        if target.exists():
+            raise FileExistsError(target)
+        try:
+            shutil.copytree(source, target)
+            shutil.rmtree(source)
+        except Exception:
+            if target.exists():
+                shutil.rmtree(target)
+            raise

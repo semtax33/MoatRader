@@ -53,7 +53,10 @@ class FakeDartHttp:
                     "CORPCODE.xml": b"""<?xml version='1.0' encoding='UTF-8'?>
 <result><list><corp_code>00126380</corp_code><corp_name>Sample</corp_name>
 <corp_eng_name>Sample Inc.</corp_eng_name><stock_code>005930</stock_code>
-<modify_date>20250101</modify_date></list></result>"""
+<modify_date>20250101</modify_date></list>
+<list><corp_code>00999999</corp_code><corp_name>Alpha Code Sample</corp_name>
+<corp_eng_name>Alpha Code Sample Inc.</corp_eng_name><stock_code>00680K</stock_code>
+<modify_date>20260101</modify_date></list></result>"""
                 }
             )
         elif url.endswith("/list.json"):
@@ -160,6 +163,31 @@ def test_dart_collector_resolves_stock_downloads_raw_and_links_amendment(tmp_pat
     assert second.unchanged_count == 2
     document_calls = [url for url, _ in http.calls if url.endswith("/document.xml")]
     assert len(document_calls) == 2
+
+
+def test_dart_collector_accepts_krx_alphanumeric_stock_codes(tmp_path: Path) -> None:
+    archive = _zip({"20250315000001.xml": b"<html><body>Report</body></html>"})
+    http = FakeDartHttp(
+        {
+            "20250315000001": archive,
+            "20250320000002": archive,
+        }
+    )
+    collector = DartCollector(
+        DartOpenApiClient(http, "x" * 40),
+        BronzeFilingStore(tmp_path / "bronze"),
+    )
+
+    collector.collect(
+        begin_date=date(2025, 1, 1),
+        end_date=date(2025, 3, 31),
+        stock_codes=["00680k"],
+        report_kinds={"annual"},
+        max_filings=1,
+    )
+
+    list_calls = [params for url, params in http.calls if url.endswith("/list.json")]
+    assert list_calls[0]["corp_code"] == "00999999"
 
 
 def test_dart_zip_extraction_rejects_path_traversal() -> None:

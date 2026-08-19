@@ -9,11 +9,13 @@ description = "PIT financial evidence, economic DCF, reverse DCF, and expectatio
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi>=0.115",
     "json-repair>=0.63",
     "lxml>=5.0",
     "pymupdf>=1.26",
     "pydantic>=2.10",
     "requests>=2.32",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -30,6 +32,7 @@ all = [
 
 [project.scripts]
 moatrader = "moatrader.cli:main"
+moatrader-api = "moatrader.api.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

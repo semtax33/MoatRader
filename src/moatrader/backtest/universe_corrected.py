@@ -16,6 +16,10 @@ from scipy import stats
 PREFERRED_RE = re.compile(r"(?:우|우B|우C|\d우|\d우B|\d우C)$", re.IGNORECASE)
 SPAC_RE = re.compile(r"(스팩|기업인수목적)", re.IGNORECASE)
 REIT_RE = re.compile(r"(리츠|REIT)", re.IGNORECASE)
+CURRENT_REIT_RE = re.compile(
+    r"(?:리츠|REIT)(?:우|우B|우C|\d우|\d우B|\d우C)?$",
+    re.IGNORECASE,
+)
 FINANCE_HINT_RE = re.compile(r"(금융지주|증권|생명|손해보험|화재|은행|캐피탈|저축은행)", re.IGNORECASE)
 HOLDING_HINT_RE = re.compile(r"(홀딩스|지주)", re.IGNORECASE)
 
@@ -29,10 +33,23 @@ def sha256_file(path: Path) -> str:
 
 
 def classify_security(name: object) -> str:
+    """Preserve the frozen v7 historical-universe classifier exactly."""
     value = str(name).strip()
     if SPAC_RE.search(value):
         return "SPAC"
     if REIT_RE.search(value):
+        return "REIT"
+    if PREFERRED_RE.search(value):
+        return "PREFERRED"
+    return "COMMON"
+
+
+def classify_current_security(name: object) -> str:
+    """Classify a live security without treating company names like 메리츠 as REITs."""
+    value = str(name).strip()
+    if SPAC_RE.search(value):
+        return "SPAC"
+    if CURRENT_REIT_RE.search(value):
         return "REIT"
     if PREFERRED_RE.search(value):
         return "PREFERRED"

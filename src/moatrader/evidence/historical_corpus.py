@@ -27,6 +27,16 @@ _EVIDENCE_TERMS = (
     "pricing", "switch", "retention", "renewal", "churn", "barrier", "competition", "risk",
 )
 
+# PyMuPDF 1.26.x's positional sorting expands malformed Korean CID mappings
+# in these archived KIND IR files into hundreds of millions of characters.
+# Unsorted MuPDF extraction remains bounded and preserves the actual text.
+# Immutable raw-file hashes keep the fallback deterministic without changing
+# extraction order for normal sources.
+_UNSORTED_PYMUPDF_SHA256 = {
+    "fd8a3330f75d33d7d44f837dac0e24693be37225f37a4a78501a8cca153b0fb4",
+    "c32b4974036d24ec54813f219181387e329a390782401806b5ef8e5636e90f86",
+}
+
 
 def opaque_unit_id(source_id: str, text: str) -> str:
     digest = hashlib.sha256(f"{source_id}\n{text}".encode("utf-8")).hexdigest()
@@ -51,8 +61,26 @@ def quarantine_market_opinion(text: str) -> tuple[str, int]:
 
 def pdf_text(path: str | Path) -> str:
     source = Path(path).resolve()
-    with fitz.open(source) as document:
-        return "\n\n".join(page.get_text("text", sort=True) for page in document)
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    sort_text = digest not in _UNSORTED_PYMUPDF_SHA256
+    # Some archived broker PDFs contain malformed CID font declarations.
+    # MuPDF can still extract their text, but otherwise writes thousands of
+    # non-actionable parser diagnostics directly to stderr.  Silence only
+    # those native diagnostics for this bounded extraction and restore the
+    # process setting immediately afterwards; Python exceptions still fail
+    # the caller normally and remain auditable.
+    display_errors = bool(fitz.TOOLS.mupdf_display_errors())
+    try:
+        fitz.TOOLS.mupdf_display_errors(False)
+        with fitz.open(source) as document:
+            return "\n\n".join(page.get_text("text", sort=sort_text) for page in document)
+    finally:
+        # Long all-market runs touch hundreds of unrelated CID font sets.
+        # Release MuPDF's native document/glyph caches between files so the
+        # process does not retain gigabytes of one-shot broker-report data.
+        fitz.TOOLS.store_shrink(100)
+        fitz.TOOLS.glyph_cache_empty()
+        fitz.TOOLS.mupdf_display_errors(display_errors)
 
 
 def _bounded_blocks(text: str, *, maximum_chars: int = 1200) -> list[str]:

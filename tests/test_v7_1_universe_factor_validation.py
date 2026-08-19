@@ -9,6 +9,7 @@ import pytest
 
 from moatrader.backtest.universe_corrected import (
     build_historical_universe,
+    classify_current_security,
     classify_security,
     extract_arcana_annual_metrics,
     moving_block_bootstrap_mean,
@@ -22,6 +23,14 @@ def test_security_classification_matches_frozen_order() -> None:
     assert classify_security("테스트리츠우") == "REIT"
     assert classify_security("테스트3우B") == "PREFERRED"
     assert classify_security("테스트") == "COMMON"
+
+
+def test_current_security_classification_does_not_treat_meritz_as_a_reit() -> None:
+    assert classify_current_security("테스트스팩3호") == "SPAC"
+    assert classify_current_security("테스트리츠우") == "REIT"
+    assert classify_current_security("메리츠금융지주") == "COMMON"
+    assert classify_current_security("메리츠화재") == "COMMON"
+    assert classify_current_security("테스트3우B") == "PREFERRED"
 
 
 def test_arcana_adapter_uses_only_capex_outflows_and_avoids_combined_nwc_double_count() -> None:

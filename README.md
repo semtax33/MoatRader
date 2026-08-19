@@ -116,6 +116,7 @@ LLM 요청은 고정 rubric·schema를 앞에, 기업별 원문 context를 뒤�
 
 ```text
 src/moatrader/
+├─ api/          read-only Fundamental Research OS HTTP contract
 ├─ adapters/     source-specific parsing
 ├─ canonical/    source-neutral document contract
 ├─ evidence/     atomic evidence, validation, claim ledger
@@ -140,6 +141,31 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
+
+### Fundamental Research OS API
+
+완료된 immutable run artifact를 사용자 화면에서 읽을 때는 분석 파이프라인과 분리된
+read-only API를 실행합니다. API는 원본 artifact를 수정하지 않으며 DCF, 시나리오,
+Reverse DCF expectation surface와 evidence provenance를 하나의 보고서 계약으로
+조립합니다.
+
+```powershell
+$env:MOATRADER_DATA_ROOT = "D:\Programming\python_example\MoatRader\data-lake\backtests"
+moatrader-api --host 127.0.0.1 --port 8010
+```
+
+`MOATRADER_DATA_ROOT`를 생략하면 저장소의 `data-lake/backtests`를 사용합니다.
+
+| Endpoint | 설명 |
+| --- | --- |
+| `GET /health` | 데이터 저장소와 API 상태 |
+| `GET /api/research` | 사용 가능한 최신 기업 보고서 목록 |
+| `GET /api/research/{ticker}?as_of=YYYY-MM-DD` | 지정 시점 이하의 최신 PIT 보고서 |
+
+응답에는 사업·산업·해자, bear/base/bull valuation, 시장 내재 성장·마진·ROIIC·CAP,
+민감도/Turbo Trigger, thesis breaker, 모니터링 항목, 원문 링크와 계산 provenance가
+포함됩니다. Economic Value percentile은 현재 완료된 보고서 집합 안의 진단값이며
+알파나 매수·매도 추천으로 해석하지 않습니다.
 
 외부 API 없이 예제 DART 문서를 canonical artifact로 변환할 수 있습니다.
 

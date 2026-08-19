@@ -70,6 +70,49 @@ def test_safe_relative_path_rejects_absolute_and_parent_paths() -> None:
         safe_relative_path("C:\\outside")
 
 
+def test_bronze_store_retries_transient_directory_replace_permission_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FlakyDirectory:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def replace(self, target: Path) -> None:
+            del target
+            self.attempts += 1
+            if self.attempts < 3:
+                raise PermissionError("transient Windows directory lock")
+
+    source = FlakyDirectory()
+    sleeps: list[float] = []
+    monkeypatch.setattr("moatrader.ingestion.store.time.sleep", sleeps.append)
+
+    BronzeFilingStore._replace_directory_with_retry(  # type: ignore[arg-type]
+        source,
+        Path("version"),
+    )
+
+    assert source.attempts == 3
+    assert sleeps == [0.05, 0.1]
+
+
+def test_bronze_store_copies_completed_version_after_persistent_directory_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    (source / "metadata.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(Path, "replace", lambda self, other: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.setattr("moatrader.ingestion.store.time.sleep", lambda _: None)
+
+    BronzeFilingStore._replace_directory_with_retry(source, target)
+
+    assert not source.exists()
+    assert (target / "metadata.json").read_text(encoding="utf-8") == "{}"
+
+
 def test_manifest_generation_fails_closed_for_conflicting_company_identity(tmp_path: Path) -> None:
     input_path = tmp_path / "input.html"
     metadata_path = tmp_path / "metadata.json"

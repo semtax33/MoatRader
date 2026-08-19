@@ -269,9 +269,15 @@ class DartCollector:
     ) -> CollectionResult:
         started = datetime.now(timezone.utc)
         requested_corp_codes = list(dict.fromkeys(value.strip() for value in (corp_codes or [])))
-        requested_stock_codes = list(dict.fromkeys(value.strip() for value in (stock_codes or [])))
+        requested_stock_codes = list(
+            dict.fromkeys(value.strip().upper() for value in (stock_codes or []))
+        )
         invalid_corp_codes = [value for value in requested_corp_codes if not re.fullmatch(r"\d{8}", value)]
-        invalid_stock_codes = [value for value in requested_stock_codes if not re.fullmatch(r"\d{6}", value)]
+        invalid_stock_codes = [
+            value
+            for value in requested_stock_codes
+            if not re.fullmatch(r"[0-9A-Z]{6}", value)
+        ]
         if invalid_corp_codes:
             raise ValueError(f"invalid DART corporation codes: {invalid_corp_codes}")
         if invalid_stock_codes:
