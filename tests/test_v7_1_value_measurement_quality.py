@@ -154,9 +154,11 @@ def test_industry_comparability_has_no_holm_significant_dcf_advantage() -> None:
     assert (differences["holm_adjusted_p"] > 0.05).all()
 
 
-def test_final_report_records_the_ex_post_universal_value_rejection() -> None:
+def test_final_report_limits_rejection_to_static_historical_fcff() -> None:
     report = (OUTPUT / "FINAL-REPORT.md").read_text(encoding="utf-8")
     assert "사후 진단" in report
     assert "비-PIT sensitivity only" in report
-    assert "Universal Value measurement" in report
-    assert "주력 Value ranker로는 단순 PER+PBR 또는 PBR보다 약했습니다" in report
+    assert "one-size-fits-all historical FCFF Cheap ranker" in report
+    assert "Unified/Universal Value는 이 실험에서 테스트하지 않았습니다" in report
+    assert "multi-model Unified/Universal Value의 실패로 확대해석할 수 없습니다" in report
+    assert "주력 Value ranker로서 단순 PER+PBR 또는 PBR보다 약했습니다" in report

@@ -11,7 +11,7 @@ from moatrader.valuation.base import (
 from moatrader.valuation.profile import EconomicArchetype, ValuationProfile
 
 
-ROUTER_CONTRACT_VERSION = "valuation-router/1"
+ROUTER_CONTRACT_VERSION = "valuation-router/2"
 
 
 REQUIRED_DATA: dict[ValuationMethod, tuple[str, ...]] = {
@@ -106,43 +106,46 @@ class ValuationProfileRouter:
     def _select(
         profile: ValuationProfile,
     ) -> tuple[ValuationMethod, ValuationMethod | None, list[str]]:
-        if profile.is_financial_intermediary:
+        if profile.economic_archetype == EconomicArchetype.FINANCIAL_INTERMEDIARY:
             return (
                 ValuationMethod.RIM,
                 ValuationMethod.PB_ROE_CROSS_CHECK,
                 ["Deposits/debt are operating inputs; value equity residual income."],
             )
-        if profile.multi_segment and profile.segment_heterogeneity_material:
+        if profile.economic_archetype == EconomicArchetype.MULTI_BUSINESS:
             return (
                 ValuationMethod.SOTP,
                 ValuationMethod.REVERSE_DCF,
                 ["Materially heterogeneous segments require separately scoped valuations."],
             )
-        if profile.pipeline_assets_material:
+        if profile.economic_archetype in {
+            EconomicArchetype.PRE_REVENUE_BIOTECH,
+            EconomicArchetype.COMMERCIAL_PLUS_PIPELINE,
+        }:
             return (
                 ValuationMethod.RNPV,
                 ValuationMethod.SOTP,
                 ["Material discrete pipeline outcomes require probability- and timing-adjusted rNPV."],
             )
-        if profile.is_reit or profile.is_resource_company or profile.asset_value_primary:
+        if profile.economic_archetype == EconomicArchetype.ASSET_BACKED:
             return (
                 ValuationMethod.NAV,
                 ValuationMethod.NORMALIZED_EARNINGS,
                 ["Separable physical assets, not a perpetual operating cash flow, drive value."],
             )
-        if profile.leverage_path_material:
+        if profile.economic_archetype == EconomicArchetype.LEVERAGE_DRIVEN:
             return (
                 ValuationMethod.APV,
                 ValuationMethod.ECONOMIC_FCFF,
                 ["A material changing debt path requires financing effects to be valued separately."],
             )
-        if profile.economic_archetype == EconomicArchetype.LOSS_MAKING_GROWTH or profile.ebit_positive is False:
+        if profile.economic_archetype == EconomicArchetype.LOSS_MAKING_GROWTH:
             return (
                 ValuationMethod.SCENARIO_DCF,
                 ValuationMethod.REVERSE_DCF,
                 ["Commercial but loss-making economics require explicit mature-state scenarios."],
             )
-        if profile.materially_cyclical:
+        if profile.economic_archetype == EconomicArchetype.CYCLICAL_OPERATING:
             return (
                 ValuationMethod.NORMALIZED_FCFF,
                 ValuationMethod.NORMALIZED_EARNINGS,

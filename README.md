@@ -94,6 +94,14 @@ LLM 요청은 고정 rubric·schema를 앞에, 기업별 원문 context를 뒤�
 
 경제적 강도용 broad context는 정확도 검증 단계에서 압축하지 않습니다. Factor별 pruning, 축약 field alias, atomic reasoning 하향, small→large confidence escalation, canonical-state delta 재사용은 holdout 품질 동등성이 확인되기 전에는 production 기본값으로 쓰지 않습니다. `previous_response_id`나 opaque compaction도 PIT provenance/replay를 대신하지 않습니다.
 
+### 6. Unified Economic Value는 deterministic multi-model output
+
+Valuation router는 경제구조에 따라 FCFF/RIM/rNPV/SOTP/NAV/APV/Scenario DCF를 선택하고,
+전용 입력이 없으면 다른 FCFF로 fallback하지 않습니다. Trusted valuation만
+route·archetype reference class 안에서 percentile로 정규화합니다. 이 실행 경로에는
+LLM 호출이 없습니다. 입력 계약과 route audit은
+[`docs/unified-value-routing.md`](docs/unified-value-routing.md)에 있습니다.
+
 ## 구현 범위
 
 - OpenDART와 SEC EDGAR 원문 수집, immutable content-addressed Bronze 저장

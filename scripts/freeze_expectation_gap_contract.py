@@ -30,6 +30,7 @@ FROZEN_SOURCES = (
     "src/moatrader/valuation/assumptions.py",
     "src/moatrader/valuation/biotech_rnpv.py",
     "src/moatrader/valuation/economic_dcf.py",
+    "src/moatrader/valuation/execution.py",
     "src/moatrader/valuation/profile.py",
     "src/moatrader/valuation/router.py",
     "src/moatrader/valuation/rim.py",
@@ -49,6 +50,63 @@ FROZEN_SOURCES = (
     "scripts/evaluate_frozen_expectation_gap_holdout.py",
     "scripts/preflight_expectation_gap_holdout.py",
 )
+
+
+ENGINEERING_AUDIT_SCHEMA_VERSION = "expanded-valuation-signal-audit/2"
+
+
+def validate_engineering_coverage(coverage: dict[str, object]) -> None:
+    if coverage.get("schema_version") != ENGINEERING_AUDIT_SCHEMA_VERSION:
+        raise ValueError("freeze requires routed valuation audit schema v2")
+    if coverage.get("row_count") != 600 or coverage.get("pit_sector_count") != 600:
+        raise ValueError("freeze requires a complete 600-row PIT-sector engineering audit")
+    if coverage.get("return_data_accessed") is not False:
+        raise ValueError("freeze requires a return-free engineering audit")
+    if coverage.get("fallback_fcff_count") != 0:
+        raise ValueError("freeze forbids fallback FCFF valuations")
+    if coverage.get("llm_call_count") != 0:
+        raise ValueError("routing and valuation freeze requires zero LLM calls")
+    method_audit = coverage.get("method_audit")
+    if not isinstance(method_audit, dict) or not method_audit:
+        raise ValueError("freeze requires per-method route/generation/trust audit")
+    dead_routes: list[str] = []
+    routed_total = 0
+    generated_total = 0
+    trusted_total = 0
+    for method, raw in method_audit.items():
+        if not isinstance(raw, dict):
+            dead_routes.append(str(method))
+            continue
+        routed = int(raw.get("routed_count", 0))
+        generated = int(raw.get("valuation_generated_count", 0))
+        trusted = int(raw.get("rank_eligible_count", 0))
+        if not 0 <= trusted <= generated <= routed:
+            raise ValueError(f"invalid route coverage ordering for {method}")
+        routed_total += routed
+        generated_total += generated
+        trusted_total += trusted
+        if routed > 0 and (generated == 0 or trusted == 0):
+            dead_routes.append(str(method))
+    if dead_routes:
+        raise ValueError(
+            "freeze forbids routed methods with zero generated/trusted valuations: "
+            + ",".join(sorted(dead_routes))
+        )
+    if routed_total != int(coverage["row_count"]):
+        raise ValueError("per-method routed counts must sum to audit row_count")
+    if generated_total != int(coverage.get("valuation_generated_count", -1)):
+        raise ValueError("per-method generated counts must match valuation_generated_count")
+    if trusted_total != int(coverage.get("rank_eligible_count", -1)):
+        raise ValueError("per-method trusted counts must match rank_eligible_count")
+    engine_counts = coverage.get("actual_engine_counts")
+    if not isinstance(engine_counts, dict) or len(engine_counts) < 3:
+        raise ValueError("freeze requires at least three distinct executed valuation engines")
+    total = sum(int(value) for value in engine_counts.values())
+    if total != generated_total:
+        raise ValueError("actual engine counts must match valuation_generated_count")
+    dominant = max((int(value) for value in engine_counts.values()), default=0)
+    if total <= 0 or dominant / total > 0.90:
+        raise ValueError("freeze forbids a single valuation engine exceeding 90% of generated values")
 
 
 def sha256(path: Path) -> str:
@@ -85,10 +143,7 @@ def main() -> int:
             raise ValueError(f"engineering stability mismatch for {name}")
         stability_hashes[name] = left_hash
     coverage = read_json(args.stability_a.resolve() / "coverage.json")
-    if coverage.get("row_count") != 600 or coverage.get("pit_sector_count") != 600:
-        raise ValueError("freeze requires a complete 600-row PIT-sector engineering audit")
-    if coverage.get("return_data_accessed") is not False:
-        raise ValueError("freeze requires a return-free engineering audit")
+    validate_engineering_coverage(coverage)
     with args.development_dates.resolve().open("r", encoding="utf-8-sig", newline="") as stream:
         development = [date.fromisoformat(str(next(iter(row.values()))).strip()) for row in csv.DictReader(stream)]
     holdout = [date.fromisoformat(item.strip()) for item in args.holdout_dates.split(",") if item.strip()]

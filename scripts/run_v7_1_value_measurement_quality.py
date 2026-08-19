@@ -1178,7 +1178,9 @@ def write_report(
 | Value trap | **혼합** | 다음 EBIT 악화는 PER+PBR보다 `{abs(dcf_vs_simple_trap_ebit.dcf_minus_benchmark_mean):.1%}p` 낮음(Holm p=`{dcf_vs_simple_trap_ebit.holm_adjusted_p:.4g}`); top 365일 수익률도 `{abs(dcf_vs_simple_trap_return.dcf_minus_benchmark_mean):.1%}p` 낮음(Holm p=`{dcf_vs_simple_trap_return.holm_adjusted_p:.4g}`) |
 | 장기 horizon | **열위** | 365일 IC가 PER+PBR보다 `{abs(dcf_vs_simple_365_ic.dcf_minus_benchmark_mean):.4f}` 낮고 paired HAC t=`{dcf_vs_simple_365_ic.difference_hac_t:.2f}`, Holm p=`{dcf_vs_simple_365_ic.holm_adjusted_p:.4f}` |
 
-**종합:** 현재 static historical-DCF Cheap을 단순 PER/PBR보다 더 좋은 `Universal Value measurement`라고 볼 증거는 없습니다. DCF는 다음 EBIT 악화 위험을 줄이는 보조 진단에는 가능성이 있지만, 가격수익률 순위와 coverage를 함께 보면 주력 Value ranker로는 단순 PER+PBR 또는 PBR보다 약했습니다.
+**해석 범위:** 이 실험은 model router 없이 동일한 historical FCFF DCF를 적용한 Cheap 한 종류만 검정했습니다. 따라서 아래 열위 판정은 `one-size-fits-all historical FCFF Cheap ranker`에 한정됩니다. RIM/rNPV/SOTP/NAV/APV/Mid-cycle을 실제 실행하고 route별 reference-class percentile로 통합한 Unified/Universal Value는 이 실험에서 테스트하지 않았습니다.
+
+**종합:** 현재 static historical-FCFF Cheap은 가격수익률 순위와 coverage를 함께 보면 주력 Value ranker로서 단순 PER+PBR 또는 PBR보다 약했습니다. 다음 EBIT 악화 위험을 줄이는 보조 진단 가능성은 남지만, 이 결과를 multi-model Unified/Universal Value의 실패로 확대해석할 수 없습니다.
 
 ## 장기 horizon — 공통표본
 

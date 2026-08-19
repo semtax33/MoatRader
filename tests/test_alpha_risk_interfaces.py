@@ -16,7 +16,9 @@ from moatrader.expectations import (
     RiskProfile,
     ThesisConfirmation,
     ThreePValidity,
+    ValuationTrustPolicy,
     ValuationFragilityDiagnostics,
+    assign_method_archetype_percentiles,
 )
 
 
@@ -51,7 +53,15 @@ def test_method_neutral_fragility_uses_scenarios_confidence_and_warnings() -> No
 
     assert low is not None and high is not None
     assert 0 <= low < high <= 100
-from moatrader.valuation import CheckStatus, PlausibilityStatus, ProbabilitySupport
+from moatrader.valuation import (
+    ApplicabilityStatus,
+    CheckStatus,
+    ModelApplicability,
+    PlausibilityStatus,
+    ProbabilitySupport,
+    ValuationMethod,
+    ValuationResult,
+)
 
 
 def test_cheap_is_the_only_alpha_rank_and_preserves_raw_gap() -> None:
@@ -64,7 +74,8 @@ def test_cheap_is_the_only_alpha_rank_and_preserves_raw_gap() -> None:
     signal = AlphaSignal(cheap=cheap)
 
     assert cheap.raw_expectation_gap == Decimal("0.35")
-    assert signal.rank_value == pytest.approx(0.35)
+    with pytest.raises(ValueError, match="not normalized"):
+        _ = signal.rank_value
     assert set(signal.model_dump()) == {"cheap"}
 
 
@@ -78,6 +89,94 @@ def test_invalid_cheap_cannot_be_rank_eligible() -> None:
             status=AlphaSignalStatus.MODEL_NOT_APPLICABLE,
             rank_eligible=True,
         )
+
+
+def _common_valuation(
+    method: ValuationMethod,
+    fair_value: str,
+    *,
+    confidence: str = "0.8",
+    screening_eligible: bool = True,
+) -> ValuationResult:
+    value = Decimal(fair_value)
+    return ValuationResult(
+        method=method,
+        applicability=ModelApplicability(
+            method=method,
+            status=ApplicabilityStatus.ELIGIBLE,
+        ),
+        equity_value=value * Decimal("10"),
+        fair_value_per_share=value,
+        downside_value_per_share=value * Decimal("0.8"),
+        base_value_per_share=value,
+        upside_value_per_share=value * Decimal("1.2"),
+        assumption_confidence=Decimal(confidence),
+        metadata={"screening_eligible": screening_eligible},
+    )
+
+
+@pytest.mark.parametrize(
+    ("confidence", "screening_eligible", "reason"),
+    [
+        ("0.49", True, "LOW_OR_MISSING_ASSUMPTION_CONFIDENCE"),
+        ("0.80", False, "SCREENING_INELIGIBLE"),
+    ],
+)
+def test_untrusted_valuation_is_explainable_but_unrankable(
+    confidence: str,
+    screening_eligible: bool,
+    reason: str,
+) -> None:
+    cheap = CheapSignal.from_valuation(
+        valuation=_common_valuation(
+            ValuationMethod.RIM,
+            "130",
+            confidence=confidence,
+            screening_eligible=screening_eligible,
+        ),
+        economic_archetype="FINANCIAL_INTERMEDIARY",
+        market_price=Decimal("100"),
+        trust_policy=ValuationTrustPolicy(),
+    )
+
+    assert cheap.primary_fair_value_per_share == Decimal("130")
+    assert cheap.status == AlphaSignalStatus.UNTRUSTED_VALUATION
+    assert not cheap.rank_eligible
+    assert reason in cheap.trust_reason_codes
+    assert cheap.unified_value_score is None
+
+
+def test_unified_score_uses_local_route_reference_class_not_raw_cross_method_gap() -> None:
+    specs = [
+        (ValuationMethod.RIM, "FINANCIAL_INTERMEDIARY", "105"),
+        (ValuationMethod.RIM, "FINANCIAL_INTERMEDIARY", "120"),
+        (ValuationMethod.RNPV, "PRE_REVENUE_BIOTECH", "150"),
+        (ValuationMethod.RNPV, "PRE_REVENUE_BIOTECH", "300"),
+    ]
+    signals = [
+        CheapSignal.from_valuation(
+            valuation=_common_valuation(method, fair),
+            economic_archetype=archetype,
+            market_price=Decimal("100"),
+        )
+        for method, archetype, fair in specs
+    ]
+
+    normalized = assign_method_archetype_percentiles(signals)
+
+    assert [item.raw_expectation_gap for item in normalized] == [
+        Decimal("0.05"),
+        Decimal("0.2"),
+        Decimal("0.5"),
+        Decimal("2"),
+    ]
+    assert [item.unified_value_score for item in normalized] == [0.0, 100.0, 0.0, 100.0]
+    assert [AlphaSignal(cheap=item).rank_value for item in normalized] == [
+        0.0,
+        100.0,
+        0.0,
+        100.0,
+    ]
 
 
 def test_three_p_gate_uses_possible_only_and_keeps_review_separate() -> None:

@@ -99,6 +99,33 @@ def _profile(**updates: object) -> ValuationProfile:
             ),
             ValuationMethod.SCENARIO_DCF,
         ),
+        (
+            _profile(
+                economic_archetype=EconomicArchetype.LEVERAGE_DRIVEN,
+                leverage_path_material=True,
+                available_data=[
+                    "unlevered_cashflows",
+                    "debt_schedule",
+                    "tax_shields",
+                    "diluted_shares",
+                ],
+            ),
+            ValuationMethod.APV,
+        ),
+        (
+            _profile(
+                economic_archetype=EconomicArchetype.CYCLICAL_OPERATING,
+                materially_cyclical=True,
+                available_data=[
+                    "revenue_history",
+                    "margin_history",
+                    "invested_capital",
+                    "valuation_assumptions",
+                    "diluted_shares",
+                ],
+            ),
+            ValuationMethod.NORMALIZED_FCFF,
+        ),
     ],
 )
 def test_router_uses_economic_structure_before_value(profile: ValuationProfile, method: ValuationMethod) -> None:
@@ -126,6 +153,33 @@ def test_profile_contract_rejects_price_or_return_fields() -> None:
         _profile(current_price=100, forward_return=0.2)
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "economic_archetype": EconomicArchetype.GENERAL_OPERATING,
+            "pipeline_assets_material": True,
+        },
+        {
+            "economic_archetype": EconomicArchetype.MULTI_BUSINESS,
+            "multi_segment": False,
+            "segment_heterogeneity_material": False,
+        },
+        {
+            "economic_archetype": EconomicArchetype.GENERAL_OPERATING,
+            "ebit_positive": False,
+        },
+        {
+            "economic_archetype": EconomicArchetype.ASSET_BACKED,
+            "asset_value_primary": False,
+        },
+    ],
+)
+def test_profile_rejects_archetype_flag_mismatch(updates: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        _profile(**updates)
+
+
 def _valuation(method: ValuationMethod, fair_value: str) -> ValuationResult:
     value = D(fair_value)
     return ValuationResult(
@@ -139,6 +193,7 @@ def _valuation(method: ValuationMethod, fair_value: str) -> ValuationResult:
         downside_value_per_share=value * D("0.8"),
         base_value_per_share=value,
         upside_value_per_share=value * D("1.2"),
+        assumption_confidence=D("0.8"),
     )
 
 
@@ -156,3 +211,7 @@ def test_common_cheap_is_value_over_price_and_normalized_within_method_archetype
     assert [item.raw_expectation_gap for item in normalized] == [D("-0.1"), D("0.2"), D("0.5")]
     assert [item.method_archetype_percentile for item in normalized] == [0.0, 50.0, 100.0]
     assert [item.method_percentile for item in normalized] == [0.0, 50.0, 100.0]
+    assert [item.unified_value_score for item in normalized] == [0.0, 50.0, 100.0]
+    assert all(
+        item.reference_class == "RIM::FINANCIAL_INTERMEDIARY" for item in normalized
+    )

@@ -51,11 +51,51 @@ class ValuationProfile(ContractModel):
             raise ValueError("available_data must not contain duplicates")
         if self.is_financial_intermediary and self.economic_archetype != EconomicArchetype.FINANCIAL_INTERMEDIARY:
             raise ValueError("financial intermediary must use FINANCIAL_INTERMEDIARY archetype")
+        if (
+            self.economic_archetype == EconomicArchetype.FINANCIAL_INTERMEDIARY
+            and not self.is_financial_intermediary
+        ):
+            raise ValueError("FINANCIAL_INTERMEDIARY archetype requires financial flag")
+        pipeline_archetypes = {
+            EconomicArchetype.PRE_REVENUE_BIOTECH,
+            EconomicArchetype.COMMERCIAL_PLUS_PIPELINE,
+        }
+        if self.pipeline_assets_material != (self.economic_archetype in pipeline_archetypes):
+            raise ValueError("material pipeline flag and pipeline archetype must agree")
+        sotp_trigger = self.multi_segment and self.segment_heterogeneity_material
+        if sotp_trigger != (self.economic_archetype == EconomicArchetype.MULTI_BUSINESS):
+            raise ValueError("heterogeneous multi-segment flag and MULTI_BUSINESS archetype must agree")
+        if self.leverage_path_material != (
+            self.economic_archetype == EconomicArchetype.LEVERAGE_DRIVEN
+        ):
+            raise ValueError("material leverage path and LEVERAGE_DRIVEN archetype must agree")
+        if self.materially_cyclical != (
+            self.economic_archetype == EconomicArchetype.CYCLICAL_OPERATING
+        ):
+            raise ValueError("cyclical flag and CYCLICAL_OPERATING archetype must agree")
+        if (
+            self.economic_archetype == EconomicArchetype.LOSS_MAKING_GROWTH
+            and self.ebit_positive is not False
+        ):
+            raise ValueError("LOSS_MAKING_GROWTH archetype requires nonpositive EBIT evidence")
+        if (
+            self.ebit_positive is False
+            and self.economic_archetype
+            not in {
+                EconomicArchetype.LOSS_MAKING_GROWTH,
+                *pipeline_archetypes,
+            }
+        ):
+            raise ValueError("nonpositive EBIT must use loss-making or pipeline archetype")
         if (self.is_reit or self.is_resource_company or self.asset_value_primary) and self.economic_archetype not in {
             EconomicArchetype.ASSET_BACKED,
             EconomicArchetype.MULTI_BUSINESS,
         }:
             raise ValueError("asset-primary companies must use ASSET_BACKED or MULTI_BUSINESS")
+        if self.economic_archetype == EconomicArchetype.ASSET_BACKED and not (
+            self.is_reit or self.is_resource_company or self.asset_value_primary
+        ):
+            raise ValueError("ASSET_BACKED archetype requires asset-primary evidence")
         return self
 
     def fingerprint(self) -> str:
