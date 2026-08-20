@@ -32,6 +32,7 @@ from moatrader.expectations.future_eri import (
     target_trading_session,
 )
 from moatrader.valuation.assumptions import EconomicDcfAssumptions
+from moatrader.valuation.economic_dcf import EconomicDcfEngine
 from scripts.run_future_eri_v1 import run
 
 
@@ -274,6 +275,11 @@ def test_future_eri_label_is_exactly_63_sessions_and_not_a_return_label() -> Non
     assert label.horizon_trading_days == 63
     assert label.return_data_accessed is False
     assert "future_return" not in label.model_dump()
+    assert (
+        label.enterprise_equity_bridge.counterfactual_enterprise_value
+        - label.enterprise_equity_bridge.counterfactual_net_debt
+        == label.enterprise_equity_bridge.counterfactual_equity_value
+    )
 
     changed_feature = feature.model_copy(
         update={
@@ -301,6 +307,116 @@ def test_future_eri_label_is_exactly_63_sessions_and_not_a_return_label() -> Non
             trading_sessions=_sessions(),
         )
 
+
+def _null_case_label(realized: RealizedFcffStateV1):
+    feature = _feature()
+    base_outcome = _outcome(feature)
+    outcome = base_outcome.model_copy(update={"realized_state": realized})
+    rolled = roll_forward_frozen_expectations(feature, outcome)
+    explained_price = EconomicDcfEngine().value(rolled).fair_value_per_share
+    explained_outcome = outcome.model_copy(update={"actual_market_price": explained_price})
+    seal = seal_feature_dataset([feature], sealed_at=SIGNAL_AT + timedelta(minutes=1))
+    return build_future_eri_label(
+        feature=feature,
+        outcome=explained_outcome,
+        feature_seal=seal,
+        trading_sessions=_sessions(),
+    )
+
+
+def test_eri_null_case_a_unchanged_price_and_expectations_is_zero() -> None:
+    assumptions = _assumptions()
+    target = _outcome(_feature()).target_session
+    realized = RealizedFcffStateV1(
+        available_at=datetime.combine(target, time(8), tzinfo=KST),
+        base_period=assumptions.base_period or "2024Q1",
+        base_revenue=assumptions.base_revenue,
+        base_nopat_margin=assumptions.base_nopat_margin,
+        base_invested_capital=assumptions.base_invested_capital,
+        net_debt=assumptions.net_debt,
+        diluted_shares=assumptions.diluted_shares,
+        wacc=assumptions.wacc,
+        wacc_source_id="NULL:A:WACC",
+        source_document_ids=["NULL:A"],
+    )
+    label = _null_case_label(realized)
+    assert label.future_eri == 0
+    assert label.enterprise_future_eri == 0
+    assert label.capital_structure_bridge_effect == 0
+
+
+def test_eri_null_case_b_wacc_only_move_is_removed() -> None:
+    base = _outcome(_feature()).realized_state
+    label = _null_case_label(
+        base.model_copy(
+            update={
+                "base_revenue": _assumptions().base_revenue,
+                "base_nopat_margin": _assumptions().base_nopat_margin,
+                "base_invested_capital": _assumptions().base_invested_capital,
+                "net_debt": _assumptions().net_debt,
+                "diluted_shares": _assumptions().diluted_shares,
+                "wacc": D("0.07"),
+                "wacc_source_id": "NULL:B:LOWER_WACC",
+                "source_document_ids": ["NULL:B"],
+            }
+        )
+    )
+    assert label.future_eri == 0
+    assert label.enterprise_future_eri == 0
+
+
+def test_eri_null_case_c_expected_fundamental_realization_is_removed() -> None:
+    base = _outcome(_feature()).realized_state
+    label = _null_case_label(
+        base.model_copy(
+            update={
+                "base_revenue": D("1080"),
+                "base_nopat_margin": D("0.108"),
+                "base_invested_capital": D("840"),
+                "net_debt": D("95"),
+                "diluted_shares": D("10"),
+                "wacc": D("0.09"),
+                "wacc_source_id": "NULL:C:WACC",
+                "source_document_ids": ["NULL:C:REALIZED"],
+            }
+        )
+    )
+    assert label.future_eri == 0
+    assert label.enterprise_future_eri == 0
+
+
+@pytest.mark.parametrize(
+    ("case_id", "net_debt", "shares"),
+    [
+        ("SPLIT", D("100"), D("20")),
+        ("DIVIDEND", D("110"), D("10")),
+        ("RIGHTS_ISSUE", D("80"), D("12")),
+    ],
+)
+def test_eri_null_case_d_corporate_actions_are_removed_by_ev_equity_bridge(
+    case_id: str,
+    net_debt: Decimal,
+    shares: Decimal,
+) -> None:
+    assumptions = _assumptions()
+    base = _outcome(_feature()).realized_state
+    label = _null_case_label(
+        base.model_copy(
+            update={
+                "base_revenue": assumptions.base_revenue,
+                "base_nopat_margin": assumptions.base_nopat_margin,
+                "base_invested_capital": assumptions.base_invested_capital,
+                "net_debt": net_debt,
+                "diluted_shares": shares,
+                "wacc": assumptions.wacc,
+                "wacc_source_id": f"NULL:D:{case_id}:WACC",
+                "source_document_ids": [f"NULL:D:{case_id}"],
+            }
+        )
+    )
+    assert label.future_eri == 0
+    assert abs(label.enterprise_future_eri) < D("1e-24")
+    assert abs(label.capital_structure_bridge_effect) < D("1e-24")
 
 def test_five_band_monotonicity_gate_opens_ml_but_never_runs_return_stage() -> None:
     scores = [-4, -3, -2, -1, 0, 0, 1, 2, 3, 5]

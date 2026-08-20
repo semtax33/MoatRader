@@ -1,5 +1,9 @@
 # FCFF Evidence → Future ERI V1
 
+역사 공시 원천, LLM/human 품질 게이트, feature 봉인, ERI outcome, clustered 통계 및
+downstream Value-neutral 단계는
+[historical-future-eri-research-pipeline.md](historical-future-eri-research-pipeline.md)에 정리되어 있다.
+
 ## 목적
 
 V1은 일반 FCFF 영업기업에서 오늘 확인된 사업 변화가 63거래일 뒤 시장의 미래 기대수정을 예측하는지 검증한다.

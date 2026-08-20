@@ -526,6 +526,9 @@ class FutureEriOutcomeInputV1(ContractModel):
     actual_market_price: Decimal = Field(gt=0)
     target_price_source_id: str = Field(min_length=1)
     realized_state: RealizedFcffStateV1
+    price_basis: Literal["RAW_CLOSE_WITH_REALIZED_EV_EQUITY_BRIDGE"] = (
+        "RAW_CLOSE_WITH_REALIZED_EV_EQUITY_BRIDGE"
+    )
 
     @model_validator(mode="after")
     def outcome_is_point_in_time(self) -> "FutureEriOutcomeInputV1":
@@ -534,6 +537,53 @@ class FutureEriOutcomeInputV1(ContractModel):
             raise ValueError("target_price_at must fall on target_session")
         if self.realized_state.available_at > self.target_price_at:
             raise ValueError("counterfactual cannot use fundamentals published after target price")
+        return self
+
+
+class EnterpriseEquityBridgeV1(ContractModel):
+    counterfactual_enterprise_value: Decimal = Field(gt=0)
+    counterfactual_net_debt: Decimal
+    counterfactual_equity_value: Decimal = Field(gt=0)
+    actual_equity_value: Decimal = Field(gt=0)
+    actual_enterprise_value: Decimal = Field(gt=0)
+    diluted_shares: Decimal = Field(gt=0)
+    counterfactual_value_per_share: Decimal = Field(gt=0)
+    actual_market_price: Decimal = Field(gt=0)
+    enterprise_future_eri: Decimal
+    equity_future_eri: Decimal
+    capital_structure_bridge_effect: Decimal
+    capital_structure_source_ids: list[str] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def exact_ev_equity_bridge(self) -> "EnterpriseEquityBridgeV1":
+        tolerance = D("1e-24")
+        if self.counterfactual_equity_value != (
+            self.counterfactual_enterprise_value - self.counterfactual_net_debt
+        ):
+            raise ValueError("counterfactual EV-to-equity bridge is inconsistent")
+        if self.actual_equity_value != self.actual_market_price * self.diluted_shares:
+            raise ValueError("actual equity value must equal price times realized diluted shares")
+        if self.actual_enterprise_value != self.actual_equity_value + self.counterfactual_net_debt:
+            raise ValueError("actual EV must use the same realized net-debt bridge")
+        if self.counterfactual_value_per_share != (
+            self.counterfactual_equity_value / self.diluted_shares
+        ):
+            raise ValueError("counterfactual per-share bridge is inconsistent")
+        expected_enterprise = (
+            self.actual_enterprise_value / self.counterfactual_enterprise_value
+        ).ln()
+        expected_equity = (
+            self.actual_equity_value / self.counterfactual_equity_value
+        ).ln()
+        if abs(self.enterprise_future_eri - expected_enterprise) > tolerance:
+            raise ValueError("enterprise ERI does not match bridged EV ratio")
+        if abs(self.equity_future_eri - expected_equity) > tolerance:
+            raise ValueError("equity ERI does not match bridged equity ratio")
+        if abs(
+            self.capital_structure_bridge_effect
+            - (self.equity_future_eri - self.enterprise_future_eri)
+        ) > tolerance:
+            raise ValueError("capital-structure bridge effect is inconsistent")
         return self
 
 
@@ -546,6 +596,9 @@ class FutureEriLabelV1(ContractModel):
     actual_market_price: Decimal = Field(gt=0)
     counterfactual_value_per_share: Decimal = Field(gt=0)
     future_eri: Decimal
+    enterprise_future_eri: Decimal
+    capital_structure_bridge_effect: Decimal
+    enterprise_equity_bridge: EnterpriseEquityBridgeV1
     feature_dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     frozen_assumptions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     counterfactual_assumptions_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -562,6 +615,15 @@ class FutureEriLabelV1(ContractModel):
         expected = (self.actual_market_price / self.counterfactual_value_per_share).ln()
         if abs(self.future_eri - expected) > D("1e-24"):
             raise ValueError("future_eri must equal log(actual/counterfactual)")
+        if self.future_eri != self.enterprise_equity_bridge.equity_future_eri:
+            raise ValueError("primary V1 ERI must remain the frozen equity-bridge ERI")
+        if self.enterprise_future_eri != self.enterprise_equity_bridge.enterprise_future_eri:
+            raise ValueError("enterprise ERI must match the EV bridge")
+        if (
+            self.capital_structure_bridge_effect
+            != self.enterprise_equity_bridge.capital_structure_bridge_effect
+        ):
+            raise ValueError("label bridge effect must match EV bridge")
         return self
 
 
@@ -634,6 +696,25 @@ def build_future_eri_label(
     if value <= 0:
         raise ValueError("counterfactual equity value per share must be positive")
     eri = (outcome.actual_market_price / value).ln()
+    actual_equity = outcome.actual_market_price * outcome.realized_state.diluted_shares
+    actual_enterprise = actual_equity + outcome.realized_state.net_debt
+    if actual_enterprise <= 0 or valuation.enterprise_value <= 0:
+        raise ValueError("actual and counterfactual enterprise values must be positive")
+    enterprise_eri = (actual_enterprise / valuation.enterprise_value).ln()
+    bridge = EnterpriseEquityBridgeV1(
+        counterfactual_enterprise_value=valuation.enterprise_value,
+        counterfactual_net_debt=outcome.realized_state.net_debt,
+        counterfactual_equity_value=valuation.equity_value,
+        actual_equity_value=actual_equity,
+        actual_enterprise_value=actual_enterprise,
+        diluted_shares=outcome.realized_state.diluted_shares,
+        counterfactual_value_per_share=value,
+        actual_market_price=outcome.actual_market_price,
+        enterprise_future_eri=enterprise_eri,
+        equity_future_eri=eri,
+        capital_structure_bridge_effect=eri - enterprise_eri,
+        capital_structure_source_ids=outcome.realized_state.source_document_ids,
+    )
     return FutureEriLabelV1(
         observation_id=feature.observation_id,
         target_session=outcome.target_session,
@@ -641,6 +722,9 @@ def build_future_eri_label(
         actual_market_price=outcome.actual_market_price,
         counterfactual_value_per_share=value,
         future_eri=eri,
+        enterprise_future_eri=enterprise_eri,
+        capital_structure_bridge_effect=eri - enterprise_eri,
+        enterprise_equity_bridge=bridge,
         feature_dataset_sha256=feature_seal.feature_dataset_sha256,
         frozen_assumptions_sha256=model_sha256(feature.frozen_expectation_assumptions),
         counterfactual_assumptions_sha256=model_sha256(counterfactual),
