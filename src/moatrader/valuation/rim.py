@@ -1,11 +1,63 @@
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import Field, model_validator
 
 from moatrader.canonical.models import ContractModel
 from moatrader.valuation.base import ValuationMethod, ValuationResult, eligible
+
+
+RIM_POLICY_VERSION = "rim-policy/1"
+RIM_COST_OF_EQUITY_BY_SIZE: dict[str, Decimal] = {
+    "LARGE": Decimal("0.09"),
+    "MID": Decimal("0.10"),
+    "SMALL": Decimal("0.12"),
+}
+
+
+class RimBuildInput(ContractModel):
+    """PIT accounting inputs used to build a deterministic RIM scenario set."""
+
+    policy_version: Literal["rim-policy/1"] = RIM_POLICY_VERSION
+    issuer_id: str = Field(min_length=1)
+    as_of: str = Field(min_length=10)
+    book_equity: Decimal = Field(gt=0)
+    prior_fy_net_income: Decimal
+    current_ytd_net_income: Decimal
+    prior_ytd_net_income: Decimal
+    diluted_shares: Decimal = Field(gt=0)
+    size_bucket: Literal["LARGE", "MID", "SMALL"]
+    evidence_available_at: dict[str, date] = Field(min_length=2)
+    provenance: list[str] = Field(min_length=2)
+
+    @property
+    def ttm_net_income(self) -> Decimal:
+        return (
+            self.prior_fy_net_income
+            + self.current_ytd_net_income
+            - self.prior_ytd_net_income
+        )
+
+    @model_validator(mode="after")
+    def evidence_is_pit(self) -> "RimBuildInput":
+        cutoff = date.fromisoformat(self.as_of[:10])
+        future = sorted(
+            ref
+            for ref, available_at in self.evidence_available_at.items()
+            if available_at > cutoff
+        )
+        if future:
+            raise ValueError(f"RIM evidence is future-dated: {future}")
+        evidence_refs = set(self.evidence_available_at)
+        if not evidence_refs.issubset(set(self.provenance)):
+            raise ValueError("RIM provenance must include every dated evidence ref")
+        roe = self.ttm_net_income / self.book_equity
+        if abs(roe) > Decimal("0.50"):
+            raise ValueError("RIM_ROE_OUTSIDE_ENGINEERING_BOUND")
+        return self
 
 
 class RimAssumptions(ContractModel):
@@ -118,4 +170,44 @@ class CommonRimEngine:
             assumption_confidence=assumptions.base.assumption_confidence,
             provenance=assumptions.base.provenance,
             metadata={"terminal_residual_income": str(base.terminal_residual_income)},
+        )
+
+
+class RimBuilder:
+    """Build RIM without LLM inference or outcome-conditioned parameters."""
+
+    def build(self, source: RimBuildInput) -> RimScenarioSet:
+        cost = RIM_COST_OF_EQUITY_BY_SIZE[source.size_bucket]
+        central_roe = source.ttm_net_income / source.book_equity
+        cases: list[RimAssumptions] = []
+        for shift in (Decimal("-0.03"), Decimal(0), Decimal("0.03")):
+            start_roe = central_roe + shift
+            terminal_roe = cost + (start_roe - cost) * Decimal("0.25")
+            roe_path = [
+                start_roe
+                + (terminal_roe - start_roe) * Decimal(year) / Decimal(5)
+                for year in range(1, 6)
+            ]
+            cases.append(
+                RimAssumptions(
+                    book_equity=source.book_equity,
+                    roe_path=roe_path,
+                    cost_of_equity=cost,
+                    payout_ratio=Decimal("0.40"),
+                    terminal_roe=terminal_roe,
+                    terminal_growth=Decimal("0.02"),
+                    diluted_shares=source.diluted_shares,
+                    assumption_confidence=Decimal("0.60"),
+                    provenance=list(
+                        dict.fromkeys(
+                            source.provenance
+                            + [RIM_POLICY_VERSION, "NO_LLM:DETERMINISTIC_BUILDER"]
+                        )
+                    ),
+                )
+            )
+        return RimScenarioSet(
+            downside=cases[0],
+            base=cases[1],
+            upside=cases[2],
         )

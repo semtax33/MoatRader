@@ -51,10 +51,32 @@ Audit artifacts (the final repeat pair):
 
 두 실행의 동일 hash는 결정론만 증명합니다. 모델 다양성·정확성은 증명하지 않습니다.
 
-새 schema v2 freeze gate는 fallback FCFF와 LLM 호출이 모두 0이어야 하며, route된 각
-method에서 실제 valuation과 trusted signal이 최소 1건 이상 생성되어야 합니다. 또한
-서로 다른 실제 엔진이 최소 3개 실행되고 단일 엔진 비중이 90%를 넘으면 freeze를
-거부합니다.
+현재 schema v4 freeze gate는 fallback FCFF와 LLM 호출이 모두 0이어야 하며, 입력 계약을
+충족해 eligible인 route는 100% 실제 valuation을 생성해야 합니다. Route와 actual engine의
+호환도 100%, route stability는 90% 이상이어야 합니다. Trusted reference class가 20개
+미만이라 percentile을 만들지 않는 것은 실행 실패와 분리해 기록합니다. 서로 다른 실제
+엔진이 최소 3개 실행되고 단일 엔진 비중이 90%를 넘으면 freeze를 거부합니다.
+
+## Current return-blind architecture calibration
+
+Normalized FCFF, Scenario DCF, rNPV와 RIM은 method-specific deterministic builder와 실제
+엔진으로 실행합니다. SOTP도 각 part의 실제 sub-model 실행 계약을 갖지만, 실제 part
+evidence가 없는 historical route는 fail closed합니다. 따라서 architecture PASS는 typed
+input, 실행 완결성, 엔진 일치, route 안정성과 결정론을 증명할 뿐 alpha나 Universal Value
+ranking 우월성을 증명하지 않습니다. RIM의 현재 입력 생성 표본은 41개 issuer로 N≥20을
+충족하지만, 이 4개 역사 signal-date 내부의 RIM reference class는 여전히 작아 올바르게
+`UNRANKABLE`입니다.
+
+최종 반복 실행은
+`data-lake/experiments/unified-value-routing-calibration-20260820-v8`입니다. 600개 route 중
+413개가 입력 계약을 충족했고 413개 모두 실제 엔진으로 실행됐습니다. A/B 산출물은
+byte-identical, route-engine 호환은 100%, 전체 route stability는 97.1%, fallback FCFF와
+LLM 호출은 각각 0건입니다. 실제 엔진별 실행은 Economic FCFF 298, Normalized FCFF 80,
+Scenario DCF 16, RIM 16, rNPV 3건입니다. Scenario의 이전-route 기준 안정성은 82.9%로
+전체보다 낮아 계속 별도 관찰합니다. 6개 이탈은 4개 persistent-loss 조건 해제와 2개
+pipeline 구조 확인으로 reason code에 보존됐으며, 이 수치를 숨기거나 100%로 보정하지
+않습니다. NAV/SOTP/APV는 실제 evidence가 없어 0건 실행됐고 이를 coverage 성공으로
+간주하지 않습니다.
 
 ## Return-blind research adapter
 
@@ -66,7 +88,7 @@ The development dry run for 2026-05-31 produced exactly 150 research rows and 15
 
 기존 `expectation-gap-production-candidate-v6/frozen-contract.json`은 schema v1 감사와
 수정 전 source hash를 고정하므로 새 multi-model 코드에는 유효하지 않습니다. 아래
-날짜를 사용하려면 schema v2 engineering audit A/B를 먼저 통과한 뒤 새 계약을
+날짜를 사용하려면 schema v4 engineering audit A/B를 먼저 통과한 뒤 새 계약을
 freeze해야 합니다. 기존 hash를 업데이트하거나 덮어쓰면 안 됩니다.
 
 Holdout dates:

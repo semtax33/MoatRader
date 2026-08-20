@@ -93,7 +93,7 @@ def main() -> int:
         status = AlphaSignalStatus(str(row.get("alpha_status") or "MODEL_NOT_APPLICABLE"))
         market_price = number(row.get("market_price"))
         fair_value = number(row.get("primary_fair_value_per_share"))
-        raw_gap = number(row.get("raw_expectation_gap"))
+        raw_gap = number(row.get("raw_value_gap") or row.get("raw_expectation_gap"))
         if status == AlphaSignalStatus.VALID:
             if market_price is None or fair_value is None:
                 raise ValueError(f"VALID Cheap input is incomplete for {code}")
@@ -103,7 +103,7 @@ def main() -> int:
                 market_price=market_price,
                 primary_fair_value_per_share=fair_value,
             )
-            if raw_gap is None or abs(cheap.raw_expectation_gap - raw_gap) > Decimal("0.00000001"):
+            if raw_gap is None or abs(cheap.raw_value_gap - raw_gap) > Decimal("0.00000001"):
                 raise ValueError(f"raw expectation gap drift for {code}")
         else:
             complete = market_price is not None and fair_value is not None and raw_gap is not None
@@ -112,7 +112,7 @@ def main() -> int:
                 economic_archetype=str(row["economic_archetype"]),
                 market_price=market_price if complete else None,
                 primary_fair_value_per_share=fair_value if complete else None,
-                raw_expectation_gap=raw_gap if complete else None,
+                raw_value_gap=raw_gap if complete else None,
                 status=status,
                 rank_eligible=False,
             )

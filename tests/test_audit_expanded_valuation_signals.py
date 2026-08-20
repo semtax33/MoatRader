@@ -17,11 +17,12 @@ from moatrader.valuation import (
     RimScenarioSet,
     RnpvScenarioSet,
     RoutedValuationInput,
+    RoutedValuationExecutor,
     ValuationMethod,
     ValuationProfile,
 )
 from moatrader.valuation.biotech_rnpv import BiotechRnpvAssumptions
-from scripts.audit_expanded_valuation_signals import run
+from scripts.audit_expanded_valuation_signals import _profile, run
 
 
 DATE = "2026-05-31"
@@ -98,6 +99,101 @@ def _input(ticker: str, method: ValuationMethod, assumptions: object) -> dict[st
         assumptions=assumptions.model_dump(mode="json"),
         source_refs=[f"PIT:FIXTURE:{ticker}"],
     ).model_dump(mode="json")
+
+
+def test_profitable_milestone_does_not_remove_pipeline_adjudication() -> None:
+    profile, _ = _profile(
+        code="039200",
+        as_of=DATE,
+        universe={"name": "오스코텍", "listed_shares": "10"},
+        sector="Pharmaceuticals",
+        sector_evidence="PIT:SECTOR",
+        snapshot={
+            "issuer_id": "BIO1",
+            "series": [
+                _point("REVENUE", "6"),
+                _point("EBIT", "2"),
+                _point("TOTAL_ASSETS", "100"),
+            ],
+        },
+        dcf_input={
+            "annual_history": [
+                {"metrics": {"revenue": "10", "ebit": "-5"}},
+                {"metrics": {"revenue": "10", "ebit": "-4"}},
+                {"metrics": {"revenue": "10", "ebit": "2"}},
+            ]
+        },
+    )
+
+    assert profile.economic_archetype == EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED
+    assert profile.pipeline_adjudication_required is True
+
+
+def test_validated_rnpv_input_confirms_material_pipeline_before_scenario_route() -> None:
+    prepared = RoutedValuationExecutor.prepare(
+        _input(
+            "BIO1",
+            ValuationMethod.RNPV,
+            RnpvScenarioSet(
+                downside=_rnpv("0.2"), base=_rnpv("0.5"), upside=_rnpv("0.8")
+            ),
+        )
+    )
+    profile, _ = _profile(
+        code="220100",
+        as_of=DATE,
+        universe={"name": "퓨쳐켐", "listed_shares": "10"},
+        sector="Pharmaceuticals",
+        sector_evidence="PIT:SECTOR",
+        snapshot={
+            "issuer_id": "BIO1",
+            "series": [
+                _point("REVENUE", "50"),
+                _point("EBIT", "-5"),
+                _point("TOTAL_ASSETS", "100"),
+            ],
+        },
+        dcf_input={
+            "annual_history": [
+                {"metrics": {"revenue": "40", "ebit": "-6"}},
+                {"metrics": {"revenue": "45", "ebit": "-5"}},
+                {"metrics": {"revenue": "50", "ebit": "-5"}},
+            ]
+        },
+        prepared_input=prepared,
+    )
+
+    assert profile.economic_archetype == EconomicArchetype.COMMERCIAL_PLUS_PIPELINE
+    assert profile.pipeline_assets_material is True
+    assert profile.pipeline_adjudication_required is False
+
+
+def test_persistent_loss_pharma_requires_pipeline_adjudication_even_with_revenue() -> None:
+    profile, _ = _profile(
+        code="082800",
+        as_of=DATE,
+        universe={"name": "비보존제약", "listed_shares": "10"},
+        sector="Pharmaceuticals",
+        sector_evidence="PIT:SECTOR",
+        snapshot={
+            "issuer_id": "BIO2",
+            "series": [
+                _point("REVENUE", "80"),
+                _point("EBIT", "-10"),
+                _point("TOTAL_ASSETS", "100"),
+            ],
+        },
+        dcf_input={
+            "annual_history": [
+                {"metrics": {"revenue": "70", "ebit": "-12"}},
+                {"metrics": {"revenue": "75", "ebit": "-11"}},
+                {"metrics": {"revenue": "80", "ebit": "-10"}},
+            ]
+        },
+    )
+
+    assert profile.economic_archetype == EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED
+    assert profile.pipeline_adjudication_required is True
 
 
 def test_audit_executes_rim_nav_rnpv_and_emits_unified_route_audit(tmp_path: Path) -> None:
@@ -227,7 +323,8 @@ def test_audit_executes_rim_nav_rnpv_and_emits_unified_route_audit(tmp_path: Pat
     coverage_b = run(args)
 
     assert coverage["valuation_generated_count"] == 4
-    assert coverage["rank_eligible_count"] == 4
+    assert coverage["trust_gate_pass_count"] == 4
+    assert coverage["rank_eligible_count"] == 0
     assert coverage["actual_engine_counts"] == {
         "ApvEngine": 1,
         "CommonRimEngine": 1,
@@ -237,7 +334,7 @@ def test_audit_executes_rim_nav_rnpv_and_emits_unified_route_audit(tmp_path: Pat
     assert coverage["fallback_fcff_count"] == 0
     assert coverage["llm_call_count"] == 0
     assert coverage_b == coverage
-    assert all(row["rank_eligible_count"] == 1 for row in coverage["method_audit"].values())
+    assert all(row["rank_eligible_count"] == 0 for row in coverage["method_audit"].values())
 
     with (output / "signals.csv").open(encoding="utf-8-sig", newline="") as stream:
         signals = list(csv.DictReader(stream))
@@ -248,7 +345,13 @@ def test_audit_executes_rim_nav_rnpv_and_emits_unified_route_audit(tmp_path: Pat
         "CommonRnpvEngine",
         "NavEngine",
     }
-    assert {row["unified_value_score"] for row in signals} == {"50.0"}
+    assert {row["unified_value_score"] for row in signals} == {""}
+    assert {row["reference_class_size"] for row in signals} == {"1"}
+    assert {row["alpha_status"] for row in signals} == {
+        "INSUFFICIENT_REFERENCE_CLASS"
+    }
+    assert {row["normalization_level"] for row in signals} == {"MODEL_FAMILY"}
+    assert {row["normalization_fallback_used"] for row in signals} == {"1"}
     assert all("::" in row["reference_class"] for row in signals)
 
     with (output / "routing.csv").open(encoding="utf-8-sig", newline="") as stream:
@@ -258,5 +361,13 @@ def test_audit_executes_rim_nav_rnpv_and_emits_unified_route_audit(tmp_path: Pat
     contract = json.loads((output / "audit-contract.json").read_text(encoding="utf-8"))
     assert contract["cross_method_fallback_forbidden"] is True
     assert contract["llm_calls_for_routing_or_valuation"] == 0
+    assert contract["trust_policy_version"] == "valuation-trust/2"
+    assert contract["normalization_policy_version"] == "unified-value-normalization/2"
+    assert contract["reference_class_hierarchy"] == [
+        "METHOD_ARCHETYPE",
+        "METHOD",
+        "MODEL_FAMILY",
+    ]
+    assert contract["broad_value_role"] == "COMPARISON_BASELINE_ONLY_NOT_PRIMARY_RANK"
     for name in ("routing.csv", "signals.csv", "coverage.json", "audit-contract.json"):
         assert (output / name).read_bytes() == (output_b / name).read_bytes()

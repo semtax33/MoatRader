@@ -11,7 +11,7 @@ from moatrader.valuation.base import (
 from moatrader.valuation.profile import EconomicArchetype, ValuationProfile
 
 
-ROUTER_CONTRACT_VERSION = "valuation-router/2"
+ROUTER_CONTRACT_VERSION = "valuation-router/3"
 
 
 REQUIRED_DATA: dict[ValuationMethod, tuple[str, ...]] = {
@@ -23,10 +23,9 @@ REQUIRED_DATA: dict[ValuationMethod, tuple[str, ...]] = {
         "diluted_shares",
     ),
     ValuationMethod.NORMALIZED_FCFF: (
-        "revenue_history",
-        "margin_history",
-        "invested_capital",
-        "valuation_assumptions",
+        "history_5y",
+        "normalization_contract",
+        "base_invested_capital",
         "diluted_shares",
     ),
     ValuationMethod.RIM: ("book_equity", "net_income", "diluted_shares"),
@@ -40,6 +39,9 @@ REQUIRED_DATA: dict[ValuationMethod, tuple[str, ...]] = {
     ),
     ValuationMethod.SCENARIO_DCF: (
         "revenue",
+        "persistent_loss",
+        "path_to_positive_unit_economics",
+        "scenario_policy",
         "scenario_assumptions",
         "valuation_assumptions",
         "diluted_shares",
@@ -52,9 +54,11 @@ REQUIRED_DATA: dict[ValuationMethod, tuple[str, ...]] = {
     ),
     ValuationMethod.NAV: ("asset_values", "debt", "diluted_shares"),
     ValuationMethod.SOTP: (
-        "segment_values",
-        "cashflow_scopes",
-        "ownership_pct",
+        "segment_submodel_inputs",
+        "valuation_basis",
+        "cashflow_scope_id",
+        "net_debt_scope_id",
+        "nci_scope_id",
         "diluted_shares",
     ),
 }
@@ -126,6 +130,18 @@ class ValuationProfileRouter:
                 ValuationMethod.RNPV,
                 ValuationMethod.SOTP,
                 ["Material discrete pipeline outcomes require probability- and timing-adjusted rNPV."],
+            )
+        if (
+            profile.economic_archetype
+            == EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED
+        ):
+            return (
+                ValuationMethod.RNPV,
+                ValuationMethod.SOTP,
+                [
+                    "Pharma/biotech loss-maker is held out of Scenario DCF until "
+                    "pipeline ownership and materiality are adjudicated."
+                ],
             )
         if profile.economic_archetype == EconomicArchetype.ASSET_BACKED:
             return (

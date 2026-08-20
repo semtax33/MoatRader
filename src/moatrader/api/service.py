@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Iterable
 
 from moatrader.api.models import (
@@ -27,6 +31,7 @@ from moatrader.api.models import (
     PriceExplanation,
     ReportMeta,
     ResearchReport,
+    SegmentTrend,
     SensitivityAnalysis,
     SensitivityDriver,
     ThesisAnalysis,
@@ -48,6 +53,7 @@ from moatrader.financial.dcf import DcfAssumptions, DcfEngine
 SCHEMA_VERSION = "fundamental-research/1.0"
 CALCULATION_VERSION = "research-assembly/1.0"
 PCT = Decimal("100")
+DETAIL_VALUATION_STATUSES = {"READY", "CALCULATED_NOT_SCREENING_ELIGIBLE"}
 
 
 MOAT_AXES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
@@ -134,7 +140,10 @@ class FundamentalResearchService:
         self.dcf_engine = DcfEngine()
 
     def get_report(self, ticker: str, *, as_of=None) -> ResearchReport:
-        artifacts = self.repository.load(ticker, as_of=as_of)
+        try:
+            artifacts = self.repository.load(ticker, as_of=as_of)
+        except ResearchArtifactNotFoundError:
+            artifacts = self._current_artifacts(ticker, as_of=as_of)
         assumptions = DcfAssumptions.model_validate(artifacts.dcf_assumptions)
         base_value = self.dcf_engine.value(assumptions)
         current_price = _float(artifacts.result.get("current_price"))
@@ -193,6 +202,559 @@ class FundamentalResearchService:
             ),
         )
 
+    def catalog_results(self) -> list[dict[str, Any]]:
+        """Return detail-capable legacy and all-security reports once per ticker."""
+        selected: dict[str, dict[str, Any]] = {}
+        for result in self.repository.latest_results():
+            ticker = str(result["ticker"]).upper()
+            try:
+                self.repository.load(ticker)
+            except ResearchArtifactNotFoundError:
+                continue
+            selected[ticker] = result
+        for report in self.repository.latest_current_report_catalog():
+            ticker = str(report.get("ticker") or "").upper()
+            if (
+                not ticker
+                or ticker in selected
+                or report.get("status") != "COMPLETE"
+                or report.get("valuation_status") not in DETAIL_VALUATION_STATUSES
+            ):
+                continue
+            selected[ticker] = {
+                "ticker": ticker,
+                "issuer_name": report.get("name") or ticker,
+                "valuation_as_of": report.get("valuation_as_of"),
+                "status": report.get("status"),
+                "current_price": None,
+                "moat_score": None,
+            }
+        return [selected[ticker] for ticker in sorted(selected)]
+
+    @staticmethod
+    def _current_run_root(report_path: Path) -> Path:
+        for parent in report_path.parents:
+            if parent.name == "research-reports":
+                return parent.parent
+        raise ResearchArtifactNotFoundError(
+            f"current report is outside a research-reports directory: {report_path}"
+        )
+
+    @staticmethod
+    def _current_input_path(
+        run_root: Path,
+        cutoff: datetime,
+        kind: str,
+        ticker: str,
+        configured: Any = None,
+    ) -> Path:
+        local = run_root / "date-inputs" / cutoff.date().isoformat() / kind / f"{ticker}.json"
+        if local.is_file():
+            return local
+        if configured:
+            configured_path = Path(str(configured))
+            if configured_path.is_file():
+                return configured_path
+        raise ResearchArtifactNotFoundError(
+            f"required current-report input is missing: {kind}/{ticker}.json"
+        )
+
+    @staticmethod
+    def _current_selected_pack(
+        run_root: Path,
+        cutoff: datetime,
+        ticker: str,
+    ) -> dict[str, Any]:
+        path = (
+            run_root
+            / "research-reports"
+            / cutoff.date().isoformat()
+            / "packs"
+            / "selected"
+            / f"KR-{cutoff.date().isoformat()}-{ticker}.json"
+        )
+        if not path.is_file():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    @staticmethod
+    def _segment_trends(
+        selected_pack: dict[str, Any],
+        cutoff: datetime,
+    ) -> list[dict[str, Any]]:
+        trends: dict[str, dict[str, Any]] = {}
+        for excerpt in selected_pack.get("excerpts", []):
+            if excerpt.get("source_role") != "DART_ORIGINAL":
+                continue
+            text = re.sub(r"\s+", " ", str(excerpt.get("text") or "")).strip()
+            if "부문별로" not in text:
+                continue
+            clause = text.split("부문별로", 1)[1]
+            for fragment in re.split(r"[,;]", clause):
+                match = re.search(
+                    r"(?P<name>.+?)(?:이|가|은|는)\s*"
+                    r"(?P<value>\d+(?:\.\d+)?)%\s*(?P<move>증가|감소)",
+                    fragment,
+                )
+                if not match:
+                    continue
+                name = re.sub(r"^.*?대비\s*", "", match.group("name")).strip(" -·")
+                if not name or len(name) > 40:
+                    continue
+                magnitude = float(match.group("value"))
+                move = match.group("move")
+                trends[name] = {
+                    "name": name,
+                    "change_pct": magnitude if move == "증가" else -magnitude,
+                    "direction": "positive" if move == "증가" else "negative",
+                    "period": cutoff.date().isoformat(),
+                    "metric_label": "전년 동기 대비 매출",
+                    "source_document_id": str(excerpt.get("source_id") or "UNKNOWN"),
+                }
+        return list(trends.values())[:8]
+
+    @staticmethod
+    def _context_evidence(
+        selected_pack: dict[str, Any],
+        cutoff: datetime,
+        ticker: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        definitions = (
+            (
+                "SEGMENT_TREND",
+                lambda text: "부문별로" in text and "매출" in text,
+                "공시된 사업부문별 매출 변화",
+            ),
+            (
+                "FINANCIAL_RESULT",
+                lambda text: "매출액은" in text and "영업이익" in text,
+                "공시된 최근 매출과 영업이익 변화",
+            ),
+            (
+                "RISK_EXPOSURE",
+                lambda text: "위험에 노출" in text,
+                "공시에 명시된 주요 재무위험 노출",
+            ),
+            (
+                "BUSINESS_MODEL",
+                lambda text: "수익은 주로" in text or "주요 원재료" in text,
+                "공시에 명시된 사업·원가 구조",
+            ),
+            (
+                "INDUSTRY_OUTLOOK",
+                lambda text: any(
+                    token in text
+                    for token in (
+                        "산업의 성장성",
+                        "시장 성장",
+                        "시장 규모",
+                        "시장 수요",
+                        "수요가 증가",
+                        "수요가 감소",
+                        "시황이 악화",
+                        "시황이 개선",
+                    )
+                ),
+                "공시에 제시된 산업 수요와 시장 환경",
+            ),
+            (
+                "COMPETITIVE_DYNAMICS",
+                lambda text: any(
+                    token in text
+                    for token in (
+                        "핵심 경쟁 요소",
+                        "경쟁의 패러다임",
+                        "중요한 사업 경쟁력",
+                        "기술 경쟁력",
+                        "원가 경쟁력",
+                        "시장점유율",
+                        "진입장벽",
+                    )
+                ),
+                "공시에 설명된 산업 경쟁요소와 기술 변화",
+            ),
+            (
+                "RISK_MANAGEMENT",
+                lambda text: (
+                    "위험관리의 목적" in text[:180]
+                    or "위험회피전략" in text[:180]
+                    or "환율변동위험" in text[:180]
+                    or "시장위험" in text[:180]
+                    or "신용위험" in text[:180]
+                ),
+                "공시에 설명된 주요 위험과 관리 정책",
+            ),
+            (
+                "PRODUCT_PORTFOLIO",
+                lambda text: any(
+                    token in text
+                    for token in (
+                        "주요 제품",
+                        "제품 및 서비스",
+                        "제품과 서비스",
+                    )
+                ),
+                "공시에 설명된 주요 제품과 수요처",
+            ),
+        )
+        available_at = {
+            str(item.get("source_id")): item.get("available_at")
+            for item in (selected_pack.get("source_assignment") or {}).get(
+                "dart_documents", []
+            )
+        }
+        selected: list[tuple[str, str, dict[str, Any], str]] = []
+        selected_units: set[str] = set()
+        excerpts = sorted(
+            (
+                item
+                for item in selected_pack.get("excerpts", [])
+                if item.get("source_role") == "DART_ORIGINAL"
+            ),
+            key=lambda item: str(
+                available_at.get(str(item.get("source_id")))
+                or item.get("available_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        for evidence_type, predicate, fact in definitions:
+            match = next(
+                (
+                    (item, re.sub(r"\s+", " ", str(item.get("text") or "")).strip())
+                    for item in excerpts
+                    if str(item.get("unit_id") or "") not in selected_units
+                    if predicate(re.sub(r"\s+", " ", str(item.get("text") or "")))
+                ),
+                None,
+            )
+            if match:
+                item, quote = match
+                selected.append((evidence_type, fact, item, quote[:700]))
+                selected_units.add(str(item.get("unit_id") or ""))
+            if len(selected) >= 6:
+                break
+
+        # Every detail-capable current report has a PIT-selected DART pack.  If
+        # none of the named categories match, surface the most business-relevant
+        # excerpt as neutral disclosure context instead of presenting an empty
+        # ledger.  This is deliberately not promoted to moat support.
+        if not selected and excerpts:
+            relevance_tokens = (
+                "산업",
+                "시장",
+                "제품",
+                "고객",
+                "수요",
+                "경쟁",
+                "생산",
+                "기술",
+                "매출",
+                "원재료",
+                "위험",
+            )
+            boilerplate_tokens = (
+                "회계정책",
+                "리스기간",
+                "퇴직급여",
+                "법인세",
+                "공정가치로 측정",
+            )
+
+            def relevance(item: dict[str, Any]) -> tuple[int, int]:
+                text = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+                score = sum(2 for token in relevance_tokens if token in text)
+                score -= sum(3 for token in boilerplate_tokens if token in text)
+                return score, min(len(text), 2000)
+
+            item = max(excerpts, key=relevance)
+            quote = re.sub(r"\s+", " ", str(item.get("text") or "")).strip()
+            if quote:
+                selected.append(
+                    (
+                        "DISCLOSURE_CONTEXT",
+                        "PIT 선별 공시의 사업·재무 문맥",
+                        item,
+                        quote[:700],
+                    )
+                )
+        cards: list[dict[str, Any]] = []
+        ledger: list[dict[str, Any]] = []
+        for index, (evidence_type, fact, item, quote) in enumerate(selected, start=1):
+            evidence_id = f"{ticker}:CTX{index:02d}"
+            source_id = str(item.get("source_id") or "UNKNOWN")
+            cards.append(
+                {
+                    "evidence_id": evidence_id,
+                    "evidence_type": evidence_type,
+                    "fact": fact,
+                    "mechanism": ["DIRECT_DISCLOSURE_CONTEXT"],
+                    "direction": "NEUTRAL",
+                    "strength": 1.0,
+                    "reliability": 1.0,
+                    "source_type": "DART",
+                    "raw_quote": quote,
+                    "period": cutoff.date().isoformat(),
+                    "dcf_links": [],
+                }
+            )
+            ledger.append(
+                {
+                    "evidence_id": evidence_id,
+                    "source_document_id": source_id,
+                    "source_available_at": available_at.get(source_id)
+                    or cutoff.isoformat(),
+                }
+            )
+        return cards, ledger
+
+    @classmethod
+    def _current_financial_snapshot(
+        cls,
+        dcf_input: dict[str, Any],
+        selected_pack: dict[str, Any],
+        cutoff: datetime,
+    ) -> dict[str, Any]:
+        annual = sorted(
+            dcf_input.get("annual_history", []),
+            key=lambda item: int(item.get("year") or 0),
+        )
+        revenue_points = [
+            {
+                "period": f"{int(item['year'])}-12-31",
+                "period_basis": "FY",
+                "value": item.get("metrics", {}).get("revenue"),
+                "unit": "KRW",
+            }
+            for item in annual
+            if item.get("year") and item.get("metrics", {}).get("revenue") is not None
+        ]
+        derived: list[dict[str, Any]] = []
+        if len(revenue_points) >= 2:
+            first = _float(revenue_points[0]["value"])
+            last = _float(revenue_points[-1]["value"])
+            years = int(annual[-1]["year"]) - int(annual[0]["year"])
+            if first > 0 and last > 0 and years > 0:
+                derived.append(
+                    {
+                        "name": "REVENUE_CAGR",
+                        "period": revenue_points[-1]["period"],
+                        "value": (last / first) ** (1 / years) - 1,
+                        "unit": "RATIO",
+                    }
+                )
+        metrics = dcf_input.get("metrics") or {}
+        revenue = _float(metrics.get("revenue"))
+        ebit = _float(metrics.get("ebit"))
+        if revenue > 0:
+            derived.append(
+                {
+                    "name": "EBIT_MARGIN",
+                    "period": str((dcf_input.get("pit") or {}).get("latest_report_period") or "PIT"),
+                    "value": ebit / revenue,
+                    "unit": "RATIO",
+                }
+            )
+        return {
+            "series": [{"concept": "REVENUE", "points": revenue_points}],
+            "breakdowns": [],
+            "derived_metrics": derived,
+            "segment_trends": cls._segment_trends(selected_pack, cutoff),
+            "current_report_adapter": True,
+        }
+
+    def _current_artifacts(self, ticker: str, *, as_of=None) -> ResearchArtifacts:
+        report_path, report = self.repository.load_current_report_entry(ticker, as_of=as_of)
+        valuation = report.get("valuation") or {}
+        if (
+            report.get("status") != "COMPLETE"
+            or valuation.get("status") not in DETAIL_VALUATION_STATUSES
+        ):
+            reasons = ", ".join(str(item) for item in report.get("source_exclusions", []))
+            reason_suffix = f": {reasons}" if reasons else ""
+            raise ValueError(
+                f"{ticker} 보고서는 존재하지만 현재 상세 가치평가 형식을 적용할 수 없습니다 "
+                f"({valuation.get('status', 'UNAVAILABLE')}{reason_suffix})"
+            )
+
+        normalized = str(report.get("ticker") or ticker).upper()
+        cutoff = datetime.fromisoformat(str(report["cutoff"]))
+        run_root = self._current_run_root(report_path)
+        assumptions_path = self._current_input_path(
+            run_root,
+            cutoff,
+            "assumptions",
+            normalized,
+            valuation.get("assumptions_path"),
+        )
+        dcf_input_path = self._current_input_path(
+            run_root,
+            cutoff,
+            "dcf-inputs",
+            normalized,
+        )
+        assumptions = self.repository._read(assumptions_path)
+        dcf_input = self.repository._read(dcf_input_path)
+        selected_pack = self._current_selected_pack(run_root, cutoff, normalized)
+        context_cards, context_ledger = self._context_evidence(
+            selected_pack,
+            cutoff,
+            normalized,
+        )
+        overlay = report.get("evidence_overlay") or {}
+        claims = overlay.get("validated_claims") or []
+        supportive = [item for item in claims if item.get("direction") == "SUPPORTIVE"]
+        evidence_ids = [
+            str(item.get("judgment_id") or f"{normalized}:E{index:03d}")
+            for index, item in enumerate(claims, start=1)
+        ]
+        claim_pairs = list(zip(evidence_ids, claims))
+        mechanisms: list[dict[str, Any]] = []
+        for axis in sorted({str(item.get("axis") or "OTHER_MOAT") for item in supportive}):
+            matching = [
+                (evidence_id, item)
+                for evidence_id, item in claim_pairs
+                if item.get("direction") == "SUPPORTIVE"
+                and str(item.get("axis") or "OTHER_MOAT") == axis
+            ]
+            mechanisms.append(
+                {
+                    "evidence_type": axis,
+                    "score": round(
+                        sum(_float(item.get("confidence"), 0.5) for _, item in matching)
+                        / max(len(matching), 1)
+                        * 10,
+                        2,
+                    ),
+                    "evidence_ids": [evidence_id for evidence_id, _ in matching],
+                }
+            )
+        erosive_ids = [
+            evidence_id
+            for evidence_id, item in claim_pairs
+            if item.get("direction") == "EROSIVE"
+        ]
+        original_count = int(
+            (overlay.get("anonymization_audit") or {}).get("original_claim_count")
+            or len(claims)
+        )
+        coverage = len(claims) / original_count if original_count else 0.0
+        source_ids = list(
+            dict.fromkeys(
+                [str(item.get("source_id")) for item in claims if item.get("source_id")]
+                + [
+                    str(item.get("source_document_id"))
+                    for item in context_ledger
+                    if item.get("source_document_id")
+                ]
+            )
+        )
+        signature = hashlib.sha256(
+            json.dumps(report, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        result = {
+            "ticker": normalized,
+            "issuer_name": str(report.get("name") or normalized),
+            "status": "COMPLETE",
+            "run_signature": signature,
+            "source_document_ids": source_ids,
+            "evidence_count": len(claims) + len(context_cards),
+            "moat_score": {},
+            "dcf": {
+                "fair_value_per_share": valuation.get("fair_value_per_share"),
+                "assumption_confidence": valuation.get("assumption_confidence"),
+                "terminal_value_share": valuation.get("terminal_value_share"),
+            },
+            "current_price": valuation.get("current_price"),
+            "price_as_of": report.get("price_as_of"),
+            "valuation_as_of": report.get("cutoff"),
+            "runner_version": "kr-all-current-report/1",
+            "valuation_method": "FCFF DCF",
+            "valuation_priority": "DCF",
+            "expectation_gap_status": "NOT_AVAILABLE_FOR_REPORT_CUTOFF",
+        }
+        dossier = {
+            "evidence": (
+                [
+                    {
+                        "evidence_id": evidence_id,
+                        "evidence_type": str(item.get("axis") or "OTHER_MOAT"),
+                        "fact": str(item.get("claim") or ""),
+                        "mechanism": [str(item.get("axis") or "OTHER_MOAT")],
+                        "direction": (
+                            "MOAT_POSITIVE"
+                            if item.get("direction") == "SUPPORTIVE"
+                            else "MOAT_NEGATIVE"
+                            if item.get("direction") == "EROSIVE"
+                            else "NEUTRAL"
+                        ),
+                        "strength": _float(item.get("confidence"), 0.5),
+                        "reliability": _float(item.get("confidence"), 0.5),
+                        "source_type": "DART",
+                        "raw_quote": str(item.get("exact_quote") or ""),
+                        "period": cutoff.date().isoformat(),
+                        "dcf_links": [],
+                    }
+                    for evidence_id, item in claim_pairs
+                ]
+                + context_cards
+            )
+        }
+        moat_score = {
+            "score_status": "UNSCORED_CURRENT_OVERLAY",
+            "economic_moat_score": 0,
+            "durability": "UNSCORED",
+            "model_confidence": max(
+                (_float(item.get("confidence")) for item in claims),
+                default=0.0,
+            ),
+            "document_coverage": {"moat_evidence_coverage": min(coverage, 1.0)},
+            "mechanisms": mechanisms,
+            "counterevidence_ids": erosive_ids,
+            "context_evidence_ids": [
+                str(item["evidence_id"]) for item in context_cards
+            ],
+        }
+        manifest = {
+            "run_id": str(overlay.get("pack_id") or signature[:16]),
+            "model": str((report.get("model_contract") or {}).get("main_model") or "unknown"),
+            "created_at": report.get("cutoff"),
+            "evidence_cutoff": report.get("cutoff"),
+            "prompt_version": "kr-all-current-report/1",
+            "parser_version": "kr-all-current-report/1",
+        }
+        ledger = {
+            "records": (
+                [
+                    {
+                        "evidence_id": evidence_id,
+                        "source_document_id": item.get("source_id"),
+                        "source_available_at": item.get("available_at")
+                        or report.get("cutoff"),
+                    }
+                    for evidence_id, item in claim_pairs
+                ]
+                + context_ledger
+            )
+        }
+        return ResearchArtifacts(
+            directory=report_path.parent,
+            result=result,
+            dossier=dossier,
+            moat_score=moat_score,
+            dcf_assumptions=assumptions,
+            financial_snapshot=self._current_financial_snapshot(
+                dcf_input,
+                selected_pack,
+                cutoff,
+            ),
+            run_manifest=manifest,
+            evidence_ledger=ledger,
+        )
+
     @staticmethod
     def _meta(artifacts: ResearchArtifacts, warnings: list[str]) -> ReportMeta:
         result = artifacts.result
@@ -200,7 +762,15 @@ class FundamentalResearchService:
         coverage = _float(
             artifacts.moat_score.get("document_coverage", {}).get("moat_evidence_coverage")
         )
-        data_grade = "RESEARCH" if coverage >= 0.7 else "LIMITED" if coverage > 0 else "INSUFFICIENT"
+        if coverage >= 0.7:
+            data_grade = "RESEARCH"
+        elif coverage > 0 or (
+            artifacts.financial_snapshot.get("current_report_adapter")
+            and int(result.get("evidence_count") or 0) > 0
+        ):
+            data_grade = "LIMITED"
+        else:
+            data_grade = "INSUFFICIENT"
         return ReportMeta(
             schema_version=SCHEMA_VERSION,
             report_id=f"{result['ticker']}:{result['run_signature'][:16]}",
@@ -613,11 +1183,20 @@ class FundamentalResearchService:
     def _company(self, artifacts: ResearchArtifacts) -> CompanyProfile:
         snapshot = artifacts.financial_snapshot
         mix = self._mix(snapshot)
+        segment_trends = [
+            SegmentTrend.model_validate(item)
+            for item in snapshot.get("segment_trends", [])
+        ]
         geography = self._geography(snapshot)
         top_names = [item.name for item in mix[:3]]
         business_model = (
             f"{', '.join(top_names)}를 중심으로 매출을 만드는 다각화 영업모델입니다."
             if top_names
+            else (
+                f"{', '.join(item.name for item in segment_trends[:4])} 등 "
+                "공시에 식별된 사업부문을 통해 매출을 창출합니다."
+            )
+            if segment_trends
             else "공시 재무와 사업 근거를 결합해 현금흐름을 창출하는 영업모델을 분석합니다."
         )
         cagr = self._latest_metric(snapshot, "REVENUE_CAGR")
@@ -650,22 +1229,33 @@ class FundamentalResearchService:
             ),
         ]
         digital_tokens = {"서치플랫폼", "커머스", "핀테크", "콘텐츠", "엔터프라이즈"}
+        segment_names = {item.name for item in segment_trends}
         industry = (
             "디지털 플랫폼·인터넷 서비스"
             if digital_tokens.intersection(top_names)
+            else "반도체·디스플레이·소비자전자"
+            if {"DX 부문", "DS 부문", "SDC", "Harman"}.intersection(segment_names)
             else "다각화 영업기업"
         )
+        if snapshot.get("current_report_adapter"):
+            business_summary = (
+                f"{artifacts.result['issuer_name']}의 시점고정 공시 재무, 사업부문 변화와 "
+                "FCFF DCF를 연결한 분석입니다. 검증되지 않은 해자 주장은 별도로 추정하지 않습니다."
+            )
+        else:
+            business_summary = (
+                f"{artifacts.result['issuer_name']}의 공시 원문, 재무 세그먼트와 해자 근거를 "
+                "사업→경쟁우위→가치의 흐름으로 연결한 시점고정 분석입니다."
+            )
         return CompanyProfile(
             ticker=str(artifacts.result["ticker"]),
             issuer_id=artifacts.result.get("issuer_id"),
             issuer_name=str(artifacts.result["issuer_name"]),
-            business_summary=(
-                f"{artifacts.result['issuer_name']}의 공시 원문, 재무 세그먼트와 해자 근거를 "
-                "사업→경쟁우위→가치의 흐름으로 연결한 시점고정 분석입니다."
-            ),
+            business_summary=business_summary,
             business_model=business_model,
             industry_label=industry,
             revenue_mix=mix,
+            segment_trends=segment_trends,
             geography=geography,
             key_metrics=metrics,
         )
@@ -691,6 +1281,7 @@ class FundamentalResearchService:
         for mechanism in moat.get("mechanisms", []):
             selected_ids.extend(mechanism.get("evidence_ids", [])[:2])
         selected_ids.extend(moat.get("counterevidence_ids", [])[:5])
+        selected_ids.extend(moat.get("context_evidence_ids", [])[:6])
         selected_ids = list(dict.fromkeys(selected_ids))[:16]
         cards = {str(item.get("evidence_id")): item for item in artifacts.dossier.get("evidence", [])}
         output: list[EvidenceItem] = []
@@ -788,9 +1379,28 @@ class FundamentalResearchService:
                 )
             )
         score = _float(score_data.get("economic_moat_score"))
-        rating = "WIDE" if score >= 7.5 else "NARROW" if score >= 5 else "NONE"
+        rating = (
+            "INSUFFICIENT"
+            if score_data.get("score_status") == "UNSCORED_CURRENT_OVERLAY"
+            else "WIDE"
+            if score >= 7.5
+            else "NARROW"
+            if score >= 5
+            else "NONE"
+        )
         primary = [axis.label for axis in axes if axis.status != "NOT_OBSERVED"][:3]
         coverage = _float(score_data.get("document_coverage", {}).get("moat_evidence_coverage"))
+        if primary:
+            summary = (
+                f"핵심 해자 원천은 {', '.join(primary)}입니다. "
+                f"공시 기반 내구성 평가는 {score_data.get('durability', 'UNKNOWN')}이며, "
+                "확인되지 않은 축은 점수로 추정하지 않았습니다."
+            )
+        else:
+            summary = (
+                "현재 검증된 해자 원천이 없습니다. 직접 공시 맥락은 제공하되, "
+                "검증되지 않은 전환비용·네트워크 효과·가격 결정력은 점수로 추정하지 않았습니다."
+            )
         return MoatAnalysis(
             score=score,
             rating=rating,
@@ -798,11 +1408,7 @@ class FundamentalResearchService:
             confidence=_float(score_data.get("model_confidence")),
             evidence_coverage=coverage,
             primary_sources=primary,
-            summary=(
-                f"핵심 해자 원천은 {', '.join(primary)}입니다. "
-                f"공시 기반 내구성 평가는 {score_data.get('durability', 'UNKNOWN')}이며, "
-                "확인되지 않은 축은 점수로 추정하지 않았습니다."
-            ),
+            summary=summary,
             axes=axes,
         )
 
@@ -827,7 +1433,9 @@ class FundamentalResearchService:
                 label="경쟁",
                 status="주의" if competition else "근거 제한",
                 tone="warning" if competition else "neutral",
-                description="경쟁우위는 플랫폼 이용·무형자산·규모의 유지 여부에 좌우됩니다.",
+                description=(
+                    "검증된 경쟁우위 근거가 있는지와 그 지속성을 원문 기준으로 추적합니다."
+                ),
                 evidence_ids=competition,
             ),
             IndustryForce(
@@ -835,7 +1443,10 @@ class FundamentalResearchService:
                 label="사이클",
                 status="사업 믹스 분산",
                 tone="neutral",
-                description=f"{len(company.revenue_mix)}개 주요 매출 축의 조합이 단일 사업 변동을 일부 분산합니다.",
+                description=(
+                    f"{len(company.revenue_mix) or len(company.segment_trends)}개 공시 사업 축을 "
+                    "함께 추적해 단일 사업 변동의 영향을 확인합니다."
+                ),
             ),
             IndustryForce(
                 id="regulation",
@@ -846,12 +1457,25 @@ class FundamentalResearchService:
                 evidence_ids=regulatory,
             ),
         ]
-        primary_moat = moat.primary_sources[0] if moat.primary_sources else "검증된 경쟁우위"
+        primary_moat = moat.primary_sources[0] if moat.primary_sources else "경쟁우위 검증 필요"
+        if company.industry_label == "디지털 플랫폼·인터넷 서비스":
+            structure_summary = (
+                "디지털 플랫폼·인터넷 서비스의 기업가치는 사용자·거래·콘텐츠 연결과 "
+                "수익화 효율, 규제 비용의 균형에 좌우됩니다."
+            )
+        elif company.segment_trends:
+            structure_summary = (
+                f"{company.industry_label}의 기업가치는 "
+                f"{', '.join(item.name for item in company.segment_trends[:4])}의 "
+                "수요, 가격, 원가와 투자 효율의 조합에 좌우됩니다."
+            )
+        else:
+            structure_summary = (
+                f"{company.industry_label}의 기업가치는 매출 성장, 정상 마진, "
+                "재투자 효율과 자본비용의 균형에 좌우됩니다."
+            )
         return IndustryAnalysis(
-            structure_summary=(
-                f"{company.industry_label}의 기업가치는 사용자·거래·콘텐츠가 연결되는 정도와 "
-                "수익화 효율, 규제 비용의 균형에 의해 결정됩니다."
-            ),
+            structure_summary=structure_summary,
             forces=forces,
             value_driver_chain=[
                 ValueLink(stage="industry", title="산업 구조", description=company.industry_label),
@@ -871,11 +1495,15 @@ class FundamentalResearchService:
         scenario_width: float,
     ) -> EconomicValueScore:
         gaps: list[float] = []
-        for result in self.repository.latest_results():
-            price = _float(result.get("current_price"))
-            fair = _float((result.get("dcf") or {}).get("fair_value_per_share"))
-            if price > 0 and fair > 0:
-                gaps.append(fair / price - 1)
+        is_current_adapter = bool(
+            artifacts.financial_snapshot.get("current_report_adapter")
+        )
+        if not is_current_adapter:
+            for result in self.repository.latest_results():
+                price = _float(result.get("current_price"))
+                fair = _float((result.get("dcf") or {}).get("fair_value_per_share"))
+                if price > 0 and fair > 0:
+                    gaps.append(fair / price - 1)
         own_gap = base_fair_value / max(current_price, 1) - 1
         percentile = None
         if gaps:
@@ -889,12 +1517,17 @@ class FundamentalResearchService:
         label = (
             "상대적으로 저평가" if percentile is not None and percentile >= 70 else
             "중립 범위" if percentile is not None and percentile >= 30 else
-            "상대적으로 높은 기대 반영" if percentile is not None else "표본 부족"
+            "상대적으로 높은 기대 반영" if percentile is not None else
+            "동일 cutoff 비교표본 미연결" if is_current_adapter else "표본 부족"
         )
         return EconomicValueScore(
             percentile=percentile,
             label=label,
-            reference_class="동일 시점 MoatRader 완료 보고서",
+            reference_class=(
+                "동일 cutoff 전 종목 DCF 비교표본"
+                if is_current_adapter
+                else "동일 시점 MoatRader 완료 보고서"
+            ),
             sample_size=len(gaps),
             confidence=_confidence_label(confidence_value),
             fragility=fragility,
@@ -902,7 +1535,11 @@ class FundamentalResearchService:
                 artifacts.moat_score.get("document_coverage", {}).get("moat_evidence_coverage")
             ),
             caveat=(
-                "이 percentile은 독립 알파가 아니라 모델별 가치격차를 현재 사용 가능한 완료 표본 안에서 정규화한 진단치입니다."
+                "동일 cutoff 전 종목 DCF 분포가 API 비교표본으로 연결되지 않아 percentile을 "
+                "표시하지 않습니다. 적정가는 위 FCFF DCF 절대가치 범위를 우선 확인하십시오."
+                if is_current_adapter
+                else "이 percentile은 독립 알파가 아니라 모델별 가치격차를 현재 사용 가능한 "
+                "완료 표본 안에서 정규화한 진단치입니다."
             ),
         )
 
@@ -942,11 +1579,22 @@ class FundamentalResearchService:
                     sources=[str(item) for item in artifacts.dcf_assumptions.get("assumption_sources", {}).get(key, [])],
                 )
             )
+        valuation_method = str(artifacts.result.get("valuation_method") or "FCFF")
+        if artifacts.result.get("valuation_priority") == "DCF":
+            rationale = (
+                "동일 cutoff의 Expectation GAP 적정가 산출물이 없어 결정론적 FCFF DCF를 "
+                "1순위 적정가로 사용합니다. Reverse DCF는 적정가가 아니라 현재 가격의 "
+                "내재 기대를 보여주는 보조 진단입니다."
+            )
+        else:
+            rationale = (
+                "현재 완료 산출물은 비금융 영업기업용 FCFF와 명시적 재투자 가정을 사용합니다."
+            )
         return ValuationAnalysis(
             route=ModelRoute(
-                primary_model="FCFF",
+                primary_model=valuation_method,
                 base_period=assumptions.base_period,
-                rationale="현재 완료 산출물은 비금융 영업기업용 FCFF와 명시적 재투자 가정을 사용합니다.",
+                rationale=rationale,
                 cross_checks=["Reverse DCF", "Economic Value percentile", "Scenario sensitivity"],
             ),
             currency="KRW",
@@ -969,14 +1617,29 @@ class FundamentalResearchService:
     ) -> PriceExplanation:
         gap = valuation.base_value_gap_pct
         direction = "낮은" if gap > 0 else "높은"
-        concern = next((item.fact for item in evidence if item.direction == "negative"), "경쟁우위 지속성과 정상 수익성에 대한 불확실성")
-        primary_moat = moat.primary_sources[0] if moat.primary_sources else "경쟁우위"
-        return PriceExplanation(
-            headline=f"현재 가격은 FCFF 기준가치보다 {abs(gap):.1f}% {direction} 수준입니다.",
-            summary=(
-                f"단순 멀티플보다 중요한 쟁점은 {surface.headline} "
-                f"{company.issuer_name}의 {primary_moat}가 이 가정을 지지하는지가 가격 해석의 핵심입니다."
+        concern = next(
+            (item.fact for item in evidence if item.direction == "negative"),
+            next(
+                (item.fact for item in evidence if item.evidence_type == "RISK_EXPOSURE"),
+                "경쟁우위 지속성과 정상 수익성에 대한 불확실성",
             ),
+        )
+        method = valuation.route.primary_model
+        if moat.primary_sources:
+            summary = (
+                f"{surface.headline} {company.issuer_name}의 "
+                f"{moat.primary_sources[0]} 근거가 이 가정을 지지하는지가 핵심입니다."
+            )
+        else:
+            summary = (
+                f"{surface.headline} 현재 검증된 해자 지지 근거가 없으므로, "
+                f"{sensitivity.primary_driver_label}과 현금흐름 전환을 후속 공시에서 확인해야 합니다."
+            )
+        return PriceExplanation(
+            headline=(
+                f"현재 가격은 {method} 1순위 적정가보다 {abs(gap):.1f}% {direction} 수준입니다."
+            ),
+            summary=summary,
             core_question=f"{sensitivity.primary_driver_label} 개선이 실제 현금흐름으로 이어질 수 있는가?",
             market_concern=concern,
             rerating_condition=sensitivity.turbo_trigger,
@@ -993,6 +1656,13 @@ class FundamentalResearchService:
     ) -> ThesisAnalysis:
         positive = [item for item in evidence if item.direction == "positive"]
         negative = [item for item in evidence if item.direction == "negative"]
+        neutral = [item for item in evidence if item.direction == "neutral"]
+        risk_context = [
+            item
+            for item in neutral
+            if item.evidence_type in {"RISK_EXPOSURE", "RISK_MANAGEMENT"}
+        ]
+        assumption_context = [item for item in neutral if item not in risk_context]
         margin = next((item for item in company.key_metrics if item.id == "ebit_margin"), None)
         valuation_status = "INTACT" if valuation.base_value_gap_pct > 10 else "WATCH"
         monitor = [
@@ -1016,7 +1686,11 @@ class FundamentalResearchService:
                 label="Industry / regulation",
                 status="WEAKENING" if len(negative) >= 3 else "WATCH",
                 tone="negative" if len(negative) >= 3 else "warning",
-                detail=f"구조적 반대 근거 {len(negative)}개를 계속 추적해야 합니다.",
+                detail=(
+                    f"구조적 반대 근거 {len(negative)}개를 계속 추적해야 합니다."
+                    if negative
+                    else "검증된 반대 근거가 없지만, 이는 위험 부재를 뜻하지 않습니다."
+                ),
                 evidence_ids=[item.id for item in negative[:3]],
             ),
             ThesisMonitorItem(
@@ -1024,7 +1698,10 @@ class FundamentalResearchService:
                 label="Valuation",
                 status=valuation_status,
                 tone="positive" if valuation_status == "INTACT" else "warning",
-                detail=f"Base value gap {valuation.base_value_gap_pct:+.1f}%",
+                detail=(
+                    f"{valuation.route.primary_model} 적정가 대비 "
+                    f"{valuation.base_value_gap_pct:+.1f}%"
+                ),
             ),
         ]
         changes: list[ThesisChange] = []
@@ -1059,14 +1736,25 @@ class FundamentalResearchService:
                         tone="positive" if margin.value > old else "negative" if margin.value < old else "neutral",
                     )
                 )
+        if positive:
+            core_thesis = (
+                f"{company.issuer_name}의 {', '.join(moat.primary_sources[:2])} 근거가 "
+                f"{sensitivity.primary_driver_label}을 방어하면 현재 가격과 "
+                f"{valuation.route.primary_model} 적정가의 간극이 축소될 수 있습니다."
+            )
+        else:
+            core_thesis = (
+                f"검증된 해자 지지 근거가 아직 없습니다. {company.issuer_name}의 "
+                f"{valuation.route.primary_model} 적정가가 성립하려면 "
+                f"{sensitivity.primary_driver_label} 가정과 현금흐름 전환을 후속 공시에서 확인해야 합니다."
+            )
         return ThesisAnalysis(
-            core_thesis=(
-                f"{company.issuer_name}의 {', '.join(moat.primary_sources[:2]) or '검증된 경쟁우위'}가 "
-                f"{sensitivity.primary_driver_label}을 방어하면 현재 가격과 기준가치의 간극이 축소될 수 있습니다."
-            ),
+            core_thesis=core_thesis,
             supporting_evidence_ids=[item.id for item in positive[:5]],
+            context_evidence_ids=[item.id for item in assumption_context[:4]],
             breakers=[item.fact for item in negative[:4]],
             breaker_evidence_ids=[item.id for item in negative[:4]],
+            risk_context_evidence_ids=[item.id for item in risk_context[:3]],
             monitor=monitor,
             changes_since_previous=changes,
         )
@@ -1099,7 +1787,8 @@ class FundamentalResearchService:
                 *[item.label for item in thesis.monitor if item.status in {"WATCH", "WEAKENING"}][:2],
             ],
             use_boundary=(
-                "이 응답은 종목 추천이나 독립 알파 신호가 아니라, 결정론적 가치평가와 cutoff 원문 근거를 연결한 진단 도구입니다."
+                f"이 응답은 종목 추천이나 독립 알파 신호가 아니라, "
+                f"{valuation.route.primary_model} 적정가와 cutoff 원문 근거를 연결한 진단 도구입니다."
             ),
             disclaimer="투자 판단과 손익의 책임은 사용자에게 있으며, 가정과 원문을 직접 검토해야 합니다.",
         )

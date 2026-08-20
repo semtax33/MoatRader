@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from moatrader.expectations import CheapSignal, assign_method_archetype_percentiles
+from moatrader.expectations import (
+    CheapSignal,
+    UnifiedValueNormalizationPolicy,
+    ValuationTrustPolicy,
+    assign_method_archetype_percentiles,
+)
 from moatrader.financial.dcf import DcfAssumptions
 from moatrader.financial.pit_sector import PitSectorRecord, load_pit_sector_csv, resolve_pit_sector
 from moatrader.valuation import (
@@ -30,12 +35,28 @@ from moatrader.valuation import (
     ValuationProfile,
     ValuationProfileRouter,
     stress_legacy_fcff,
+    ASSUMPTION_POLICY_VERSION,
+    ROUTED_VALUATION_INPUT_VERSION,
+    ROUTER_CONTRACT_VERSION,
+    engine_matches_method,
+    expected_engine_name,
 )
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
-SCHEMA_VERSION = "expanded-valuation-signal-audit/2"
+SCHEMA_VERSION = "expanded-valuation-signal-audit/5"
+BENCHMARK_POLICY_VERSION = "unified-value-benchmark/1"
 FORBIDDEN_INPUT_NAMES = {"returns.csv", "forward-returns.csv", "evaluation.json"}
+ARCHITECTURE_METHODS = (
+    ValuationMethod.ECONOMIC_FCFF,
+    ValuationMethod.NORMALIZED_FCFF,
+    ValuationMethod.RIM,
+    ValuationMethod.RNPV,
+    ValuationMethod.SCENARIO_DCF,
+    ValuationMethod.APV,
+    ValuationMethod.NAV,
+    ValuationMethod.SOTP,
+)
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -175,8 +196,37 @@ def _profile(
     if equity is not None and debt is not None and cash is not None and equity + debt - cash > 0:
         available.add("invested_capital")
     history = (dcf_input or {}).get("annual_history") or []
+    annual_ebit_margins = [
+        number(item.get("metrics", {}).get("ebit"))
+        / number(item.get("metrics", {}).get("revenue"))
+        for item in history
+        if number(item.get("metrics", {}).get("ebit")) is not None
+        and number(item.get("metrics", {}).get("revenue")) is not None
+        and number(item.get("metrics", {}).get("revenue")) > 0
+    ]
+    persistent_loss = bool(
+        ebit is not None
+        and ebit < 0
+        and len(annual_ebit_margins) >= 2
+        and all(item < 0 for item in annual_ebit_margins[-2:])
+    )
+    current_margin = ebit / revenue if ebit is not None and revenue else None
+    path_to_positive_unit_economics = bool(
+        persistent_loss
+        and current_margin is not None
+        and annual_ebit_margins
+        and current_margin > annual_ebit_margins[-1]
+    )
     if len(history) >= 3:
         available.update({"revenue_history", "margin_history"})
+    if len(history) >= 5:
+        available.add("history_5y")
+    if equity is not None and debt is not None and cash is not None and equity + debt - cash > 0:
+        available.add("base_invested_capital")
+    if persistent_loss:
+        available.add("persistent_loss")
+    if path_to_positive_unit_economics:
+        available.add("path_to_positive_unit_economics")
     if dcf_input is not None:
         available.update({"scenario_assumptions", "valuation_assumptions"})
     if prepared_input is not None:
@@ -199,14 +249,41 @@ def _profile(
             "HealthCare",
         )
     ) or "바이오" in str(universe.get("name") or "")
-    pre_revenue_like = (
+    confirmed_rnpv_input = bool(
         biotech_prior
-        and ebit is not None
-        and ebit < 0
-        and revenue is not None
-        and assets is not None
-        and assets > 0
-        and revenue / assets < Decimal("0.02")
+        and prepared_input is not None
+        and prepared_input.envelope.method == ValuationMethod.RNPV
+    )
+    historical_loss_years = sum(item < 0 for item in annual_ebit_margins)
+    pipeline_revenue_intensity = (
+        revenue / assets
+        if revenue is not None and assets is not None and assets > 0
+        else None
+    )
+    # Pipeline economics must not disappear because a milestone or licensing
+    # payment makes one current period profitable.  Low revenue intensity plus
+    # repeated historical operating losses is a price-free structural signal;
+    # asset ownership/materiality still requires explicit adjudication.
+    pipeline_structure_candidate = bool(
+        biotech_prior
+        and (
+            persistent_loss
+            or (
+                pipeline_revenue_intensity is not None
+                and pipeline_revenue_intensity < Decimal("0.10")
+                and (ebit is not None and ebit < 0 or historical_loss_years >= 2)
+            )
+        )
+    )
+    pre_revenue_like = bool(
+        pipeline_structure_candidate
+        and pipeline_revenue_intensity is not None
+        and pipeline_revenue_intensity < Decimal("0.02")
+    )
+    pipeline_adjudication_required = bool(
+        pipeline_structure_candidate
+        and not pre_revenue_like
+        and not confirmed_rnpv_input
     )
     asset_primary = any(
         term in normalized_sector
@@ -236,12 +313,16 @@ def _profile(
         archetype = EconomicArchetype.MULTI_BUSINESS
     elif pre_revenue_like:
         archetype = EconomicArchetype.PRE_REVENUE_BIOTECH
+    elif confirmed_rnpv_input:
+        archetype = EconomicArchetype.COMMERCIAL_PLUS_PIPELINE
+    elif pipeline_adjudication_required:
+        archetype = EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED
     elif asset_primary:
         archetype = EconomicArchetype.ASSET_BACKED
-    elif ebit is not None and ebit < 0:
-        archetype = EconomicArchetype.LOSS_MAKING_GROWTH
     elif cyclical:
         archetype = EconomicArchetype.CYCLICAL_OPERATING
+    elif persistent_loss:
+        archetype = EconomicArchetype.LOSS_MAKING_GROWTH
     else:
         archetype = EconomicArchetype.GENERAL_OPERATING
     profile = ValuationProfile(
@@ -258,11 +339,14 @@ def _profile(
         revenue_positive=revenue > 0 if revenue is not None else None,
         ebit_positive=ebit > 0 if ebit is not None else None,
         fcf_positive=None,
-        pipeline_assets_material=pre_revenue_like,
+        pipeline_assets_material=pre_revenue_like or confirmed_rnpv_input,
+        pipeline_adjudication_required=pipeline_adjudication_required,
         multi_segment=holding,
         segment_heterogeneity_material=holding,
         asset_value_primary=asset_primary,
         materially_cyclical=cyclical,
+        persistent_loss=persistent_loss,
+        path_to_positive_unit_economics=path_to_positive_unit_economics,
         available_data=sorted(available),
         provenance=[
             f"PIT:financial-snapshot:{as_of}:{code}",
@@ -405,6 +489,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     development = _current_sector_map(args.development_sector_map)
     universe = {ticker(row.get("stock_code")): row for row in universe_rows}
     router = ValuationProfileRouter()
+    normalization_policy = getattr(args, "normalization_policy", None) or UnifiedValueNormalizationPolicy()
+    trust_policy = getattr(args, "trust_policy", None) or ValuationTrustPolicy()
     routing_rows: list[dict[str, Any]] = []
     signal_objects: dict[str, list[tuple[int, CheapSignal]]] = {}
     signals: list[dict[str, Any]] = []
@@ -483,6 +569,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 profile = ValuationProfile.model_validate(profile_payload)
                 profile_input_source = "EXPLICIT_PIT_VALUATION_PROFILE"
             route = router.route(profile)
+            expected_engine = expected_engine_name(route.primary_method)
             valuation, valuation_reason, actual_engine, valuation_input_source, execution_status = _valuation_for(
                 route=route,
                 metrics=metrics,
@@ -511,6 +598,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         valuation=valuation,
                         economic_archetype=profile.economic_archetype.value,
                         market_price=price,
+                        trust_policy=trust_policy,
                     )
                 except Exception as exc:
                     valuation_reason = f"CHEAP_ERROR:{type(exc).__name__}:{exc}"
@@ -530,13 +618,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         if cheap and cheap.primary_fair_value_per_share is not None
                         else ""
                     ),
-                    "raw_expectation_gap": str(cheap.raw_expectation_gap) if cheap else "",
+                    "raw_value_gap": str(cheap.raw_value_gap) if cheap else "",
                     "method_percentile": "",
                     "method_archetype_percentile": "",
                     "unified_value_score": "",
                     "reference_class": cheap.reference_class if cheap else f"{route.primary_method.value}::{profile.economic_archetype.value}",
+                    "reference_class_size": cheap.reference_class_size if cheap else 0,
+                    "method_archetype_reference_size": 0,
+                    "method_reference_size": 0,
+                    "model_family_reference_size": 0,
+                    "normalization_level": "",
+                    "normalization_fallback_used": 0,
                     "rank_eligible": int(bool(cheap and cheap.rank_eligible)),
                     "alpha_status": cheap.status.value if cheap else "MODEL_NOT_APPLICABLE",
+                    "pre_normalization_status": cheap.status.value if cheap else "MODEL_NOT_APPLICABLE",
+                    "trust_gate_pass": int(bool(cheap and cheap.rank_eligible)),
                     "downside_value_per_share": (
                         str(valuation.downside_value_per_share) if valuation else ""
                     ),
@@ -552,6 +648,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         else ""
                     ),
                     "valuation_warning_count": len(valuation.warnings) if valuation else "",
+                    "valuation_warning_codes": (
+                        json.dumps(valuation.warnings, ensure_ascii=False) if valuation else ""
+                    ),
+                    "valuation_disclosure_count": len(valuation.disclosures) if valuation else "",
+                    "valuation_disclosures": (
+                        json.dumps(valuation.disclosures, ensure_ascii=False) if valuation else ""
+                    ),
                     "trust_reason_codes": ";".join(cheap.trust_reason_codes) if cheap else "",
                     "possible_pass": int(bool(cheap and cheap.rank_eligible)),
                     "valuation_reason": valuation_reason,
@@ -579,6 +682,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "valuation_generated": int(valuation is not None),
                     "execution_status": execution_status,
                     "actual_engine": actual_engine,
+                    "expected_engine": expected_engine,
+                    "route_actual_engine_match": int(
+                        bool(
+                            valuation is not None
+                            and engine_matches_method(route.primary_method, actual_engine)
+                        )
+                    ),
                     "valuation_input_source": valuation_input_source,
                     "valuation_input_refs": ";".join(
                         prepared_input.envelope.source_refs if prepared_input else []
@@ -587,14 +697,79 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 }
             )
     for pairs in signal_objects.values():
-        normalized = assign_method_archetype_percentiles([item[1] for item in pairs])
+        normalized = assign_method_archetype_percentiles(
+            [item[1] for item in pairs],
+            normalization_policy,
+        )
         for (index, _), cheap in zip(pairs, normalized, strict=True):
             signals[index]["method_percentile"] = cheap.method_percentile
             signals[index]["method_archetype_percentile"] = cheap.method_archetype_percentile
             signals[index]["unified_value_score"] = cheap.unified_value_score
             signals[index]["reference_class"] = cheap.reference_class
+            signals[index]["reference_class_size"] = cheap.reference_class_size
+            signals[index]["method_archetype_reference_size"] = cheap.method_archetype_reference_size
+            signals[index]["method_reference_size"] = cheap.method_reference_size
+            signals[index]["model_family_reference_size"] = cheap.model_family_reference_size
+            signals[index]["normalization_level"] = (
+                cheap.normalization_level.value if cheap.normalization_level else ""
+            )
+            signals[index]["normalization_fallback_used"] = int(
+                cheap.normalization_fallback_used
+            )
+            signals[index]["alpha_status"] = cheap.status.value
+            signals[index]["rank_eligible"] = int(cheap.rank_eligible)
+            signals[index]["trust_reason_codes"] = ";".join(cheap.trust_reason_codes)
     routing_rows.sort(key=lambda row: (row["date"], row["ticker"]))
     signals.sort(key=lambda row: (row["date"], row["ticker"]))
+    prior_by_ticker: dict[str, tuple[str, str]] = {}
+    transition_count = 0
+    stable_transition_count = 0
+    method_transitions: dict[str, dict[str, int]] = {}
+    for row in routing_rows:
+        previous = prior_by_ticker.get(str(row["ticker"]))
+        if previous is None:
+            row["previous_route"] = ""
+            row["route_change_reason"] = "INITIAL_OBSERVATION"
+        else:
+            previous_method, previous_archetype = previous
+            current_method = str(row["primary_method"])
+            current_archetype = str(row["economic_archetype"])
+            row["previous_route"] = previous_method
+            transition_count += 1
+            stats = method_transitions.setdefault(
+                previous_method, {"transition_count": 0, "stable_count": 0}
+            )
+            stats["transition_count"] += 1
+            if previous_method == current_method:
+                row["route_change_reason"] = "UNCHANGED_STRUCTURAL_ARCHETYPE"
+                stable_transition_count += 1
+                stats["stable_count"] += 1
+            elif previous_archetype != current_archetype:
+                if current_archetype in {
+                    EconomicArchetype.PRE_REVENUE_BIOTECH.value,
+                    EconomicArchetype.COMMERCIAL_PLUS_PIPELINE.value,
+                    EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED.value,
+                }:
+                    reason = "PIPELINE_STRUCTURE_CONFIRMED"
+                elif current_archetype == EconomicArchetype.LOSS_MAKING_GROWTH.value:
+                    reason = "PERSISTENT_LOSS_AND_RECOVERY_PATH_CONFIRMED"
+                elif previous_archetype == EconomicArchetype.LOSS_MAKING_GROWTH.value:
+                    reason = "PERSISTENT_LOSS_CONDITION_CLEARED"
+                elif current_archetype == EconomicArchetype.CYCLICAL_OPERATING.value:
+                    reason = "STRUCTURAL_CYCLICAL_CONFIRMED"
+                else:
+                    reason = "STRUCTURAL_ARCHETYPE_EVIDENCE_CHANGED"
+                row["route_change_reason"] = (
+                    f"{reason}:{previous_archetype}->{current_archetype}"
+                )
+            else:
+                row["route_change_reason"] = (
+                    f"METHOD_POLICY_CHANGED:{previous_method}->{current_method}"
+                )
+        prior_by_ticker[str(row["ticker"])] = (
+            str(row["primary_method"]),
+            str(row["economic_archetype"]),
+        )
     write_csv(
         args.output / "routing.csv",
         routing_rows,
@@ -603,8 +778,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "sector_pit_eligible", "sector_evidence_ref", "economic_archetype", "primary_method", "secondary_method",
             "applicability_status", "missing_fields", "profile_sha256", "profile_input_source",
             "valuation_generated",
-            "execution_status", "actual_engine", "valuation_input_source", "valuation_input_refs",
+            "execution_status", "expected_engine", "actual_engine", "route_actual_engine_match",
+            "valuation_input_source", "valuation_input_refs",
             "valuation_reason",
+            "previous_route", "route_change_reason",
         ],
     )
     write_csv(
@@ -613,27 +790,107 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         [
             "date", "ticker", "method", "actual_engine", "economic_archetype", "sector",
             "sector_pit_eligible", "market_price", "primary_fair_value_per_share",
-            "raw_expectation_gap", "method_percentile", "method_archetype_percentile",
-            "unified_value_score", "reference_class",
-            "rank_eligible", "alpha_status", "downside_value_per_share",
+            "raw_value_gap", "method_percentile", "method_archetype_percentile",
+            "unified_value_score", "reference_class", "reference_class_size",
+            "method_archetype_reference_size", "method_reference_size",
+            "model_family_reference_size", "normalization_level",
+            "normalization_fallback_used", "rank_eligible", "alpha_status",
+            "pre_normalization_status", "trust_gate_pass", "downside_value_per_share",
             "base_value_per_share", "upside_value_per_share", "assumption_confidence",
-            "valuation_warning_count", "trust_reason_codes", "possible_pass", "valuation_reason",
+            "valuation_warning_count", "valuation_warning_codes",
+            "valuation_disclosure_count", "valuation_disclosures",
+            "trust_reason_codes", "possible_pass", "valuation_reason",
             "valuation_input_source",
         ],
     )
     method_audit: dict[str, dict[str, int | float]] = {}
-    for method in sorted({row["primary_method"] for row in routing_rows}):
+    for valuation_method in ARCHITECTURE_METHODS:
+        method = valuation_method.value
         routed = [row for row in routing_rows if row["primary_method"] == method]
+        eligible_routes = [
+            row for row in routed if row["applicability_status"] == "ELIGIBLE"
+        ]
         method_signals = [row for row in signals if row["method"] == method]
         generated = sum(int(row["valuation_generated"]) for row in routed)
+        trust_gate_pass = sum(int(row["trust_gate_pass"]) for row in method_signals)
         trusted = sum(int(row["rank_eligible"]) for row in method_signals)
+        max_reference_class_size = max(
+            (int(row["reference_class_size"]) for row in method_signals),
+            default=0,
+        )
+        engine_matches = sum(
+            int(row["route_actual_engine_match"]) for row in routed
+        )
         method_audit[method] = {
             "routed_count": len(routed),
+            "eligible_route_count": len(eligible_routes),
             "route_share": len(routed) / len(routing_rows) if routing_rows else 0.0,
             "valuation_generated_count": generated,
+            "execution_rate": generated / len(eligible_routes) if eligible_routes else 1.0,
+            "generated_route_share": generated / len(routed) if routed else 0.0,
+            "trust_gate_pass_count": trust_gate_pass,
             "rank_eligible_count": trusted,
+            "max_reference_class_size": max_reference_class_size,
             "trusted_route_share": trusted / len(routed) if routed else 0.0,
+            "trusted_generated_share": trust_gate_pass / generated if generated else 0.0,
+            "score_coverage": trusted / len(routed) if routed else 0.0,
+            "actual_engine_match_count": engine_matches,
+            "actual_engine_match_rate": engine_matches / generated if generated else 0.0,
         }
+    generated_count = sum(row["valuation_generated"] for row in routing_rows)
+    engine_match_count = sum(row["route_actual_engine_match"] for row in routing_rows)
+    architecture_failures: list[str] = []
+    if generated_count == 0 or engine_match_count != generated_count:
+        architecture_failures.append("ROUTE_ACTUAL_ENGINE_NOT_100_PERCENT")
+    for method, audit in method_audit.items():
+        eligible_count = int(audit["eligible_route_count"])
+        generated = int(audit["valuation_generated_count"])
+        if generated != eligible_count:
+            architecture_failures.append(f"ELIGIBLE_ROUTE_EXECUTION_GAP:{method}")
+        if int(audit["max_reference_class_size"]) >= normalization_policy.min_reference_class_size and not int(audit["rank_eligible_count"]):
+            architecture_failures.append(f"ZERO_RANK_ELIGIBLE_AT_N20:{method}")
+    route_stability = (
+        stable_transition_count / transition_count if transition_count else 1.0
+    )
+    if route_stability < 0.90:
+        architecture_failures.append("ROUTE_STABILITY_BELOW_90_PERCENT")
+    def token_counts(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+        def tokens(value: Any) -> list[str]:
+            raw = str(value or "")
+            if raw.startswith("["):
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    return [str(token) for token in decoded if str(token)]
+            return [token for token in raw.split(";") if token]
+
+        return dict(
+            sorted(
+                Counter(
+                    token
+                    for row in rows
+                    for token in tokens(row.get(field))
+                    if token
+                ).items()
+            )
+        )
+
+    reason_counts_by_status = {
+        status: token_counts(
+            [row for row in signals if row["alpha_status"] == status],
+            "trust_reason_codes",
+        )
+        for status in sorted({str(row["alpha_status"]) for row in signals})
+    }
+    warning_counts_by_status = {
+        status: token_counts(
+            [row for row in signals if row["alpha_status"] == status],
+            "valuation_warning_codes",
+        )
+        for status in sorted({str(row["alpha_status"]) for row in signals})
+    }
     coverage = {
         "schema_version": SCHEMA_VERSION,
         "row_count": len(routing_rows),
@@ -641,9 +898,48 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "mode": args.mode,
         "method_counts": dict(sorted(Counter(row["primary_method"] for row in routing_rows).items())),
         "applicability_counts": dict(sorted(Counter(row["applicability_status"] for row in routing_rows).items())),
-        "valuation_generated_count": sum(row["valuation_generated"] for row in routing_rows),
+        "pre_normalization_status_counts": dict(
+            sorted(Counter(row["pre_normalization_status"] for row in signals).items())
+        ),
+        "alpha_status_counts": dict(
+            sorted(Counter(row["alpha_status"] for row in signals).items())
+        ),
+        "trust_reason_counts_by_status": reason_counts_by_status,
+        "valuation_warning_counts_by_status": warning_counts_by_status,
+        "valuation_disclosure_counts": token_counts(signals, "valuation_disclosures"),
+        "valuation_generated_count": generated_count,
+        "trust_gate_pass_count": sum(row["trust_gate_pass"] for row in signals),
         "rank_eligible_count": sum(row["rank_eligible"] for row in signals),
+        "normalization_level_counts": dict(
+            sorted(
+                Counter(
+                    row["normalization_level"]
+                    for row in signals
+                    if row["rank_eligible"] and row["normalization_level"]
+                ).items()
+            )
+        ),
+        "score_reference_class_counts": dict(
+            sorted(
+                Counter(
+                    row["reference_class"]
+                    for row in signals
+                    if row["rank_eligible"]
+                ).items()
+            )
+        ),
+        "route_transition_count": transition_count,
+        "stable_route_transition_count": stable_transition_count,
+        "route_stability": route_stability,
+        "route_stability_by_previous_method": {
+            method: {
+                **stats,
+                "stability": stats["stable_count"] / stats["transition_count"],
+            }
+            for method, stats in sorted(method_transitions.items())
+        },
         "method_audit": method_audit,
+        "required_architecture_methods": [method.value for method in ARCHITECTURE_METHODS],
         "actual_engine_counts": dict(
             sorted(
                 Counter(
@@ -660,6 +956,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             row["valuation_input_source"] == "FALLBACK_FCFF" for row in routing_rows
         ),
         "llm_call_count": 0,
+        "route_actual_engine_match_count": engine_match_count,
+        "route_actual_engine_match_rate": (
+            engine_match_count / generated_count if generated_count else 0.0
+        ),
+        "normalization_policy": normalization_policy.model_dump(mode="json"),
+        "trust_policy": trust_policy.model_dump(mode="json"),
+        "gap_field": "raw_value_gap",
+        "gap_semantics": "SUPPORTED_INTRINSIC_VALUE_OVER_PRICE_MINUS_ONE_NOT_MARKET_EXPECTATION_GAP",
+        "architecture_gate_pass": not architecture_failures,
+        "architecture_gate_failures": architecture_failures,
         "pit_sector_count": sum(row["sector_pit_eligible"] for row in routing_rows),
         "routing_payload_sha256": sha256_payload(routing_rows),
         "signal_payload_sha256": sha256_payload(signals),
@@ -678,6 +984,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "route_selected_before_valuation": True,
             "cross_method_fallback_forbidden": True,
             "llm_calls_for_routing_or_valuation": 0,
+            "router_policy_version": ROUTER_CONTRACT_VERSION,
+            "valuation_input_schema_version": ROUTED_VALUATION_INPUT_VERSION,
+            "assumption_policy_version": ASSUMPTION_POLICY_VERSION,
+            "trust_policy_version": trust_policy.contract_version,
+            "normalization_policy_version": normalization_policy.contract_version,
+            "minimum_reference_class_size": normalization_policy.min_reference_class_size,
+            "parent_reference_class_fallback": normalization_policy.parent_class_fallback,
+            "reference_class_hierarchy": list(
+                normalization_policy.reference_class_hierarchy
+            ),
+            "normalization_small_class_action": normalization_policy.small_class_action,
+            "trust_warning_count_basis": trust_policy.warning_count_basis,
+            "benchmark_policy_version": BENCHMARK_POLICY_VERSION,
+            "broad_value_role": "COMPARISON_BASELINE_ONLY_NOT_PRIMARY_RANK",
+            "value_gap_field": "raw_value_gap",
+            "expectation_gap_is_separate_experiment": True,
+            "required_architecture_methods": [method.value for method in ARCHITECTURE_METHODS],
             "expected_date_count": args.expected_date_count,
             "expected_universe_count": args.expected_universe_count,
         },

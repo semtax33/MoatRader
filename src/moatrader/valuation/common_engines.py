@@ -6,7 +6,12 @@ from pydantic import Field, model_validator
 
 from moatrader.canonical.models import ContractModel
 from moatrader.valuation.assumptions import EconomicDcfAssumptions
-from moatrader.valuation.base import ValuationMethod, ValuationResult, eligible
+from moatrader.valuation.base import (
+    ValuationMethod,
+    ValuationResult,
+    eligible,
+    split_valuation_disclosures,
+)
 from moatrader.valuation.biotech_rnpv import BiotechRnpvAssumptions, BiotechRnpvEngine
 from moatrader.valuation.economic_dcf import EconomicDcfEngine
 
@@ -38,6 +43,10 @@ class CommonEconomicFcffEngine:
         values = [downside.fair_value_per_share, base.fair_value_per_share, upside.fair_value_per_share]
         if values != sorted(values):
             raise ValueError("FCFF scenarios must be ordered downside <= base <= upside")
+        disclosures, trust_warnings = split_valuation_disclosures(
+            base.provenance_warnings,
+            assumptions.base.provenance_warnings,
+        )
         return ValuationResult(
             method=assumptions.method,
             applicability=eligible(
@@ -52,8 +61,12 @@ class CommonEconomicFcffEngine:
             upside_value_per_share=values[2],
             assumption_confidence=assumptions.assumption_confidence,
             provenance=assumptions.provenance,
-            warnings=base.provenance_warnings,
-            metadata={"terminal_value_share": str(base.terminal_value_share)},
+            disclosures=disclosures,
+            warnings=trust_warnings + base.screening_exclusion_reasons,
+            metadata={
+                "screening_eligible": base.screening_eligible,
+                "terminal_value_share": str(base.terminal_value_share),
+            },
         )
 
 

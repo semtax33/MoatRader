@@ -162,13 +162,18 @@ $env:MOATRADER_DATA_ROOT = "D:\Programming\python_example\MoatRader\data-lake\ba
 moatrader-api --host 127.0.0.1 --port 8010
 ```
 
-`MOATRADER_DATA_ROOT`를 생략하면 저장소의 `data-lake/backtests`를 사용합니다.
+`MOATRADER_DATA_ROOT`를 생략하면 저장소의 `data-lake/backtests`를 사용합니다. 특정
+전 종목 실행만 열 때는 `data-lake/backtests/kr-all-research-...` 실행 디렉터리를
+직접 지정해도 됩니다. 이 경우 `/api/research`는 기존 상세 분석 산출물과
+`research-reports`의 계산 가능한 전 종목 보고서를 하나의 화면 계약으로 합칩니다.
 
 | Endpoint | 설명 |
 | --- | --- |
 | `GET /health` | 데이터 저장소와 API 상태 |
 | `GET /api/research` | 사용 가능한 최신 기업 보고서 목록 |
 | `GET /api/research/{ticker}?as_of=YYYY-MM-DD` | 지정 시점 이하의 최신 PIT 보고서 |
+| `GET /api/current-research` | 전 종목 원본 current-report 목록 |
+| `GET /api/current-research/{ticker}?as_of=YYYY-MM-DD` | 전 종목 원본 current-report |
 
 응답에는 사업·산업·해자, bear/base/bull valuation, 시장 내재 성장·마진·ROIIC·CAP,
 민감도/Turbo Trigger, thesis breaker, 모니터링 항목, 원문 링크와 계산 provenance가

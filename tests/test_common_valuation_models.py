@@ -25,8 +25,11 @@ from moatrader.valuation import (
     ScenarioDcfAssumptions,
     ScenarioDcfEngine,
     SotpAssumptions,
+    SotpBuildInput,
+    SotpBuilder,
     SotpEngine,
     SotpPart,
+    SotpPartBuildInput,
     SotpValueBasis,
     ValuationMethod,
 )
@@ -66,20 +69,18 @@ def test_economic_fcff_returns_common_ordered_equity_result() -> None:
     assert result.fair_value_per_share == result.base_value_per_share
 
 
-def test_scenario_dcf_returns_probability_weighted_common_result() -> None:
+def test_scenario_dcf_ranks_unweighted_central_and_keeps_weighting_diagnostic() -> None:
     result = ScenarioDcfEngine().value(
         ScenarioDcfAssumptions(
-            downside=_economic_dcf("0.01"),
-            central=_economic_dcf("0.05"),
-            upside=_economic_dcf("0.09"),
-            downside_probability=D("0.20"),
-            central_probability=D("0.50"),
-            upside_probability=D("0.30"),
+            downside=_economic_dcf("0.01").model_copy(update={"scenario": "DOWNSIDE"}),
+            central=_economic_dcf("0.05").model_copy(update={"scenario": "CENTRAL"}),
+            upside=_economic_dcf("0.09").model_copy(update={"scenario": "UPSIDE"}),
         )
     )
 
     assert result.method == ValuationMethod.SCENARIO_DCF
-    assert result.metadata["probability_weighted"] is True
+    assert result.metadata["probability_weighted"] is False
+    assert result.metadata["ranking_basis"] == "CENTRAL_UNWEIGHTED"
     assert result.downside_value_per_share < result.base_value_per_share < result.upside_value_per_share
     assert result.fair_value_per_share == result.base_value_per_share
 
@@ -201,7 +202,15 @@ def _part(name: str, scope: str, value: str, basis: SotpValueBasis) -> SotpPart:
         downside_value=base * D("0.8"),
         base_value=base,
         upside_value=base * D("1.2"),
+        ownership_applied=False,
+        net_debt_adjustment=D("0"),
+        net_debt_scope_id=f"NET_DEBT:{name}",
+        nci_adjustment=D("0"),
+        nci_scope_id=f"NCI:{name}",
+        cashflow_scope_id=f"SCOPE:{name}",
         included_cashflows=[scope],
+        actual_engine="TEST_FIXTURE_ENGINE",
+        submodel_input_sha256="0" * 64,
         provenance=[f"PIT:{name}"],
     )
 
@@ -232,3 +241,45 @@ def test_sotp_aggregates_heterogeneous_parts_without_averaging_methods() -> None
     assert result.method == ValuationMethod.SOTP
     assert result.base_value_per_share == D("130")
     assert result.metadata["part_count"] == 2
+
+
+def test_sotp_builder_executes_each_declared_submodel() -> None:
+    def nav_payload(name: str, value: str) -> dict[str, object]:
+        return NavAssumptions(
+            assets=[
+                NavAsset(
+                    name=name,
+                    base_value=D(value),
+                    downside_haircut=D("0.20"),
+                    upside_premium=D("0.20"),
+                    evidence_ids=[f"PIT:{name}"],
+                )
+            ],
+            diluted_shares=D("10"),
+            provenance=[f"PIT:{name}"],
+        ).model_dump(mode="json")
+
+    source = SotpBuildInput(
+        parts=[
+            SotpPartBuildInput(
+                name=name,
+                method=ValuationMethod.NAV,
+                assumptions=nav_payload(name, value),
+                value_basis=SotpValueBasis.EQUITY,
+                net_debt_scope_id=f"NET_DEBT:{name}",
+                nci_scope_id=f"NCI:{name}",
+                cashflow_scope_id=f"CASHFLOW:{name}",
+                included_cashflows=[name],
+                provenance=[f"PIT:{name}"],
+            )
+            for name, value in (("A", "1000"), ("B", "500"))
+        ],
+        diluted_shares=D("10"),
+        provenance=["PIT:SOTP"],
+    )
+    assumptions = SotpBuilder().build(source)
+    result = SotpEngine().value(assumptions)
+
+    assert result.base_value_per_share == D("150")
+    assert result.metadata["part_actual_engines"] == ["NavEngine", "NavEngine"]
+    assert all(part.execution_status == "VALUED" for part in assumptions.parts)

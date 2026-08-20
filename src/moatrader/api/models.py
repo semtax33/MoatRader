@@ -59,6 +59,15 @@ class MixItem(ApiModel):
     period: str
 
 
+class SegmentTrend(ApiModel):
+    name: str
+    change_pct: float
+    direction: Tone
+    period: str
+    metric_label: str = "전년 동기 대비 매출"
+    source_document_id: str
+
+
 class CompanyProfile(ApiModel):
     ticker: str
     issuer_id: str | None = None
@@ -68,6 +77,7 @@ class CompanyProfile(ApiModel):
     business_model: str
     industry_label: str
     revenue_mix: list[MixItem] = Field(default_factory=list)
+    segment_trends: list[SegmentTrend] = Field(default_factory=list)
     geography: list[MixItem] = Field(default_factory=list)
     key_metrics: list[Metric] = Field(default_factory=list)
 
@@ -262,8 +272,10 @@ class ThesisChange(ApiModel):
 class ThesisAnalysis(ApiModel):
     core_thesis: str
     supporting_evidence_ids: list[str]
+    context_evidence_ids: list[str] = Field(default_factory=list)
     breakers: list[str]
     breaker_evidence_ids: list[str]
+    risk_context_evidence_ids: list[str] = Field(default_factory=list)
     monitor: list[ThesisMonitorItem]
     changes_since_previous: list[ThesisChange]
 

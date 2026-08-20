@@ -2,7 +2,10 @@ from moatrader.expectations.alpha import (
     AlphaSignal,
     AlphaSignalStatus,
     CheapSignal,
+    MODEL_FAMILY_BY_METHOD,
+    UnifiedValueReferenceLevel,
     ValuationTrustPolicy,
+    UnifiedValueNormalizationPolicy,
     assign_method_archetype_percentiles,
 )
 from moatrader.expectations.gap import (
@@ -103,7 +106,10 @@ __all__ = [
     "AlphaSignal",
     "AlphaSignalStatus",
     "CheapSignal",
+    "MODEL_FAMILY_BY_METHOD",
+    "UnifiedValueReferenceLevel",
     "ValuationTrustPolicy",
+    "UnifiedValueNormalizationPolicy",
     "assign_method_archetype_percentiles",
     "ConfirmationStatus",
     "FrozenRiskOverlayPolicy",

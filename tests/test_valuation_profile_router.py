@@ -6,7 +6,11 @@ from decimal import Decimal as D
 import pytest
 from pydantic import ValidationError
 
-from moatrader.expectations import CheapSignal, assign_method_archetype_percentiles
+from moatrader.expectations import (
+    CheapSignal,
+    UnifiedValueNormalizationPolicy,
+    assign_method_archetype_percentiles,
+)
 from moatrader.valuation import (
     ApplicabilityStatus,
     EconomicArchetype,
@@ -74,7 +78,14 @@ def _profile(**updates: object) -> ValuationProfile:
                 economic_archetype=EconomicArchetype.MULTI_BUSINESS,
                 multi_segment=True,
                 segment_heterogeneity_material=True,
-                available_data=["segment_values", "cashflow_scopes", "ownership_pct", "diluted_shares"],
+                available_data=[
+                    "segment_submodel_inputs",
+                    "valuation_basis",
+                    "cashflow_scope_id",
+                    "net_debt_scope_id",
+                    "nci_scope_id",
+                    "diluted_shares",
+                ],
             ),
             ValuationMethod.SOTP,
         ),
@@ -90,9 +101,14 @@ def _profile(**updates: object) -> ValuationProfile:
             _profile(
                 economic_archetype=EconomicArchetype.LOSS_MAKING_GROWTH,
                 ebit_positive=False,
+                persistent_loss=True,
+                path_to_positive_unit_economics=True,
                 available_data=[
                     "revenue",
-                    "scenario_assumptions",
+                    "persistent_loss",
+                        "path_to_positive_unit_economics",
+                        "scenario_policy",
+                        "scenario_assumptions",
                     "valuation_assumptions",
                     "diluted_shares",
                 ],
@@ -117,10 +133,9 @@ def _profile(**updates: object) -> ValuationProfile:
                 economic_archetype=EconomicArchetype.CYCLICAL_OPERATING,
                 materially_cyclical=True,
                 available_data=[
-                    "revenue_history",
-                    "margin_history",
-                    "invested_capital",
-                    "valuation_assumptions",
+                    "history_5y",
+                    "normalization_contract",
+                    "base_invested_capital",
                     "diluted_shares",
                 ],
             ),
@@ -166,8 +181,9 @@ def test_profile_contract_rejects_price_or_return_fields() -> None:
             "segment_heterogeneity_material": False,
         },
         {
-            "economic_archetype": EconomicArchetype.GENERAL_OPERATING,
+            "economic_archetype": EconomicArchetype.LOSS_MAKING_GROWTH,
             "ebit_positive": False,
+            "persistent_loss": False,
         },
         {
             "economic_archetype": EconomicArchetype.ASSET_BACKED,
@@ -178,6 +194,39 @@ def test_profile_contract_rejects_price_or_return_fields() -> None:
 def test_profile_rejects_archetype_flag_mismatch(updates: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         _profile(**updates)
+
+
+def test_structural_cyclical_route_survives_a_transient_ebit_loss() -> None:
+    profile = _profile(
+        economic_archetype=EconomicArchetype.CYCLICAL_OPERATING,
+        ebit_positive=False,
+        materially_cyclical=True,
+        available_data=[
+            "history_5y",
+            "normalization_contract",
+            "base_invested_capital",
+            "diluted_shares",
+        ],
+    )
+
+    assert ValuationProfileRouter().route(profile).primary_method == ValuationMethod.NORMALIZED_FCFF
+
+
+def test_pipeline_candidate_fails_closed_to_rnpv_before_scenario() -> None:
+    profile = _profile(
+        economic_archetype=EconomicArchetype.PIPELINE_ADJUDICATION_REQUIRED,
+        ebit_positive=False,
+        persistent_loss=True,
+        path_to_positive_unit_economics=True,
+        pipeline_adjudication_required=True,
+        available_data=["revenue", "diluted_shares"],
+    )
+
+    route = ValuationProfileRouter().route(profile)
+
+    assert route.primary_method == ValuationMethod.RNPV
+    assert route.applicability.status == ApplicabilityStatus.INSUFFICIENT_DATA
+    assert "pipeline ownership" in route.rationale[0]
 
 
 def _valuation(method: ValuationMethod, fair_value: str) -> ValuationResult:
@@ -206,9 +255,12 @@ def test_common_cheap_is_value_over_price_and_normalized_within_method_archetype
         )
         for fair in ("90", "120", "150")
     ]
-    normalized = assign_method_archetype_percentiles(signals)
+    normalized = assign_method_archetype_percentiles(
+        signals,
+        UnifiedValueNormalizationPolicy(min_reference_class_size=2),
+    )
 
-    assert [item.raw_expectation_gap for item in normalized] == [D("-0.1"), D("0.2"), D("0.5")]
+    assert [item.raw_value_gap for item in normalized] == [D("-0.1"), D("0.2"), D("0.5")]
     assert [item.method_archetype_percentile for item in normalized] == [0.0, 50.0, 100.0]
     assert [item.method_percentile for item in normalized] == [0.0, 50.0, 100.0]
     assert [item.unified_value_score for item in normalized] == [0.0, 50.0, 100.0]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import re
 from dataclasses import dataclass
@@ -191,6 +192,14 @@ class ResearchArtifactRepository:
         *,
         as_of: date | None = None,
     ) -> dict[str, Any]:
+        return self.load_current_report_entry(ticker, as_of=as_of)[1]
+
+    def load_current_report_entry(
+        self,
+        ticker: str,
+        *,
+        as_of: date | None = None,
+    ) -> tuple[Path, dict[str, Any]]:
         candidates: list[tuple[datetime, Path, dict[str, Any]]] = []
         for path in self._current_report_paths(ticker.upper()):
             try:
@@ -206,7 +215,8 @@ class ResearchArtifactRepository:
             raise ResearchArtifactNotFoundError(
                 f"current all-security report not found for {ticker}{suffix}"
             )
-        return max(candidates, key=lambda item: (item[0], str(item[1])))[2]
+        _, path, report = max(candidates, key=lambda item: (item[0], str(item[1])))
+        return path, report
 
     def latest_current_reports(self) -> list[dict[str, Any]]:
         grouped: dict[str, list[tuple[datetime, Path, dict[str, Any]]]] = {}
@@ -223,3 +233,33 @@ class ResearchArtifactRepository:
             for items in grouped.values()
         ]
         return sorted(selected, key=lambda item: str(item["ticker"]))
+
+    def latest_current_report_catalog(self) -> list[dict[str, Any]]:
+        """Read the compact generated catalog instead of thousands of report files."""
+        patterns = (
+            "backtests/*/research-reports/*/report-catalog.csv",
+            "research-reports/*/report-catalog.csv",
+            "report-catalog.csv",
+        )
+        selected: dict[str, dict[str, Any]] = {}
+        for pattern in patterns:
+            for path in self.root.glob(pattern):
+                cutoff = path.parent.name
+                try:
+                    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                        rows = csv.DictReader(handle)
+                        for row in rows:
+                            ticker = str(row.get("ticker") or "").upper()
+                            if not ticker:
+                                continue
+                            item: dict[str, Any] = {
+                                **row,
+                                "ticker": ticker,
+                                "valuation_as_of": cutoff,
+                            }
+                            previous = selected.get(ticker)
+                            if previous is None or str(previous["valuation_as_of"]) <= cutoff:
+                                selected[ticker] = item
+                except (OSError, csv.Error):
+                    continue
+        return [selected[ticker] for ticker in sorted(selected)]

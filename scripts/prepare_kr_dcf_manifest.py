@@ -222,12 +222,16 @@ def financial_metrics(
     rows: list[dict[str, object]],
     *,
     interim: bool,
+    annual_fields: tuple[str, ...] | None = None,
 ) -> dict[str, Decimal | None]:
     # OpenDART documents ``thstrm_amount`` as the three-month value for
     # interim income statements. TTM construction must therefore fail closed
     # when the explicit cumulative field is absent instead of mixing a quarter
     # with year-to-date cash-flow values.
-    flow_fields = ("thstrm_add_amount",) if interim else ("thstrm_amount",)
+    if interim and annual_fields is not None:
+        raise ValueError("comparative annual fields cannot be used for interim metrics")
+    flow_fields = annual_fields or (("thstrm_add_amount",) if interim else ("thstrm_amount",))
+    balance_fields = annual_fields or ("thstrm_amount",)
     revenue = amount(
         rows,
         r"ifrs(?:-full)?_(?:Revenue|SalesRevenue)|dart_Revenue|(?:^|\s)(?:수익\(매출액\)|매출액)(?:$|\s)",
@@ -252,16 +256,37 @@ def financial_metrics(
         {"CF"},
         fields=flow_fields,
     )
-    cash = amount(rows, r"CashAndCashEquivalents|^\s*현금및현금성자산\s*$", {"BS"}) or Decimal(0)
+    cash = amount(
+        rows,
+        r"CashAndCashEquivalents|^\s*현금및현금성자산\s*$",
+        {"BS"},
+        fields=balance_fields,
+    ) or Decimal(0)
     debt = sum_amounts(
         rows,
         r"(?:^|\s)(?:단기차입금|장기차입금|유동성장기차입금|유동성사채|사채|전환사채|신주인수권부사채|유동\s*리스부채|비유동\s*리스부채)(?:$|\s)|"
         r"CurrentLoansReceived|NoncurrentLoansReceived|Borrowings|CurrentLeaseLiabilities|NoncurrentLeaseLiabilities",
         {"BS"},
+        fields=balance_fields,
     )
-    receivables = amount(rows, r"TradeAndOtherCurrentReceivables|매출채권 및 기타유동채권|^\s*매출채권\s*$", {"BS"}) or Decimal(0)
-    inventory = amount(rows, r"Inventories|유동재고자산|^\s*재고자산\s*$", {"BS"}) or Decimal(0)
-    payables = amount(rows, r"TradeAndOtherCurrentPayables|매입채무 및 기타유동채무|^\s*매입채무\s*$", {"BS"}) or Decimal(0)
+    receivables = amount(
+        rows,
+        r"TradeAndOtherCurrentReceivables|매출채권 및 기타유동채권|^\s*매출채권\s*$",
+        {"BS"},
+        fields=balance_fields,
+    ) or Decimal(0)
+    inventory = amount(
+        rows,
+        r"Inventories|유동재고자산|^\s*재고자산\s*$",
+        {"BS"},
+        fields=balance_fields,
+    ) or Decimal(0)
+    payables = amount(
+        rows,
+        r"TradeAndOtherCurrentPayables|매입채무 및 기타유동채무|^\s*매입채무\s*$",
+        {"BS"},
+        fields=balance_fields,
+    ) or Decimal(0)
     return {
         "revenue": revenue,
         "ebit": ebit,
@@ -273,8 +298,12 @@ def financial_metrics(
     }
 
 
-def annual_metrics(rows: list[dict[str, object]]) -> dict[str, Decimal | None]:
-    return financial_metrics(rows, interim=False)
+def annual_metrics(
+    rows: list[dict[str, object]],
+    *,
+    fields: tuple[str, ...] = ("thstrm_amount",),
+) -> dict[str, Decimal | None]:
+    return financial_metrics(rows, interim=False, annual_fields=fields)
 
 
 def file_sha256(path: Path) -> str:
@@ -447,8 +476,8 @@ def pit_annual_history(
     as_of: datetime,
     fs_div: str,
 ) -> tuple[list[tuple[int, dict[str, Decimal | None]]], list[dict[str, object]]]:
-    history: list[tuple[int, dict[str, Decimal | None]]] = []
-    sources: list[dict[str, object]] = []
+    by_year: dict[int, tuple[dict[str, Decimal | None], dict[str, object]]] = {}
+    requested = set(years)
     for year in years:
         report = fetch_report(
             client,
@@ -461,8 +490,26 @@ def pit_annual_history(
         )
         if report is None or report.available_at > as_of:
             continue
-        history.append((year, annual_metrics(report.rows)))
-        sources.append(report_descriptor(report))
+        descriptor = report_descriptor(report)
+        for observation_year, amount_field in (
+            (year - 2, "bfefrmtrm_amount"),
+            (year - 1, "frmtrm_amount"),
+            (year, "thstrm_amount"),
+        ):
+            if observation_year not in requested:
+                continue
+            metrics = annual_metrics(report.rows, fields=(amount_field,))
+            if metrics.get("revenue") is None or metrics["revenue"] <= 0:
+                continue
+            source = {
+                **descriptor,
+                "observation_year": observation_year,
+                "amount_field": amount_field,
+            }
+            # Later filings win so restated comparative values are preserved.
+            by_year[observation_year] = (metrics, source)
+    history = [(year, by_year[year][0]) for year in sorted(by_year)]
+    sources = [by_year[year][1] for year in sorted(by_year)]
     return history, sources
 
 
@@ -907,7 +954,7 @@ def main() -> int:
                     else latest_report.period.business_year - 1
                 )
                 years = requested_years or list(
-                    range(latest_completed_year - 2, latest_completed_year + 1)
+                    range(latest_completed_year - 6, latest_completed_year + 1)
                 )
                 history, annual_sources = pit_annual_history(
                     client,

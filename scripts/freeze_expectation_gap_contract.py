@@ -52,12 +52,25 @@ FROZEN_SOURCES = (
 )
 
 
-ENGINEERING_AUDIT_SCHEMA_VERSION = "expanded-valuation-signal-audit/2"
+ENGINEERING_AUDIT_SCHEMA_VERSION = "expanded-valuation-signal-audit/4"
+REQUIRED_ARCHITECTURE_METHODS = {
+    method.value
+    for method in (
+        ValuationMethod.ECONOMIC_FCFF,
+        ValuationMethod.NORMALIZED_FCFF,
+        ValuationMethod.RIM,
+        ValuationMethod.RNPV,
+        ValuationMethod.SCENARIO_DCF,
+        ValuationMethod.APV,
+        ValuationMethod.NAV,
+        ValuationMethod.SOTP,
+    )
+}
 
 
 def validate_engineering_coverage(coverage: dict[str, object]) -> None:
     if coverage.get("schema_version") != ENGINEERING_AUDIT_SCHEMA_VERSION:
-        raise ValueError("freeze requires routed valuation audit schema v2")
+        raise ValueError("freeze requires routed valuation audit schema v4")
     if coverage.get("row_count") != 600 or coverage.get("pit_sector_count") != 600:
         raise ValueError("freeze requires a complete 600-row PIT-sector engineering audit")
     if coverage.get("return_data_accessed") is not False:
@@ -66,10 +79,24 @@ def validate_engineering_coverage(coverage: dict[str, object]) -> None:
         raise ValueError("freeze forbids fallback FCFF valuations")
     if coverage.get("llm_call_count") != 0:
         raise ValueError("routing and valuation freeze requires zero LLM calls")
+    if coverage.get("route_actual_engine_match_rate") != 1.0:
+        raise ValueError("freeze requires 100% route-to-actual-engine match")
+    if coverage.get("architecture_gate_pass") is not True:
+        raise ValueError("freeze requires a passing architecture calibration gate")
+    if float(coverage.get("route_stability", 0.0)) < 0.90:
+        raise ValueError("freeze requires route stability of at least 90%")
+    normalization = coverage.get("normalization_policy")
+    if not isinstance(normalization, dict):
+        raise ValueError("freeze requires a normalization policy manifest")
+    if normalization.get("min_reference_class_size") != 20:
+        raise ValueError("freeze requires minimum reference class N=20")
+    if normalization.get("parent_class_fallback") is not False:
+        raise ValueError("freeze forbids parent reference-class fallback")
     method_audit = coverage.get("method_audit")
     if not isinstance(method_audit, dict) or not method_audit:
         raise ValueError("freeze requires per-method route/generation/trust audit")
-    dead_routes: list[str] = []
+    execution_gaps: list[str] = []
+    rank_gaps: list[str] = []
     routed_total = 0
     generated_total = 0
     trusted_total = 0
@@ -78,20 +105,30 @@ def validate_engineering_coverage(coverage: dict[str, object]) -> None:
             dead_routes.append(str(method))
             continue
         routed = int(raw.get("routed_count", 0))
+        eligible = int(raw.get("eligible_route_count", 0))
         generated = int(raw.get("valuation_generated_count", 0))
         trusted = int(raw.get("rank_eligible_count", 0))
-        if not 0 <= trusted <= generated <= routed:
+        if not 0 <= trusted <= generated <= eligible <= routed:
             raise ValueError(f"invalid route coverage ordering for {method}")
         routed_total += routed
         generated_total += generated
         trusted_total += trusted
-        if routed > 0 and (generated == 0 or trusted == 0):
-            dead_routes.append(str(method))
-    if dead_routes:
+        if generated != eligible:
+            execution_gaps.append(str(method))
+        if int(raw.get("max_reference_class_size", 0)) >= 20 and trusted == 0:
+            rank_gaps.append(str(method))
+    if execution_gaps:
         raise ValueError(
-            "freeze forbids routed methods with zero generated/trusted valuations: "
-            + ",".join(sorted(dead_routes))
+            "freeze forbids eligible route execution gaps: "
+            + ",".join(sorted(execution_gaps))
         )
+    if rank_gaps:
+        raise ValueError(
+            "freeze requires trusted values for reference classes at N=20: "
+            + ",".join(sorted(rank_gaps))
+        )
+    if set(method_audit) != REQUIRED_ARCHITECTURE_METHODS:
+        raise ValueError("freeze requires all eight routed valuation methods")
     if routed_total != int(coverage["row_count"]):
         raise ValueError("per-method routed counts must sum to audit row_count")
     if generated_total != int(coverage.get("valuation_generated_count", -1)):

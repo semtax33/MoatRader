@@ -65,6 +65,7 @@ class ValuationResult(ContractModel):
     upside_value_per_share: Decimal | None = None
     assumption_confidence: Decimal | None = Field(default=None, ge=0, le=1)
     provenance: list[str] = Field(default_factory=list)
+    disclosures: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     cross_check_method: ValuationMethod | None = None
@@ -99,7 +100,30 @@ class ValuationResult(ContractModel):
             raise ValueError("valuation scenarios must be ordered downside <= base <= upside")
         if (self.cross_check_method is None) != (self.cross_check_value_per_share is None):
             raise ValueError("cross-check method and value must be supplied together")
+        if set(self.disclosures) & set(self.warnings):
+            raise ValueError("valuation disclosures and trust warnings must be disjoint")
         return self
+
+
+def split_valuation_disclosures(
+    observed: list[str],
+    disclosures: list[str],
+) -> tuple[list[str], list[str]]:
+    """Separate assumption caveats from valuation-specific trust warnings.
+
+    Builders attach frozen-policy caveats to every valuation.  Those caveats
+    must remain visible, but counting them as failures makes otherwise valid
+    valuations automatically breach a warning-count trust gate.
+    """
+
+    remaining = list(observed)
+    normalized_disclosures: list[str] = []
+    for disclosure in disclosures:
+        if disclosure in remaining:
+            remaining.remove(disclosure)
+        if disclosure not in normalized_disclosures:
+            normalized_disclosures.append(disclosure)
+    return normalized_disclosures, remaining
 
 
 AssumptionsT = TypeVar("AssumptionsT")

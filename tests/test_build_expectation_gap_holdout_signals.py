@@ -50,7 +50,7 @@ def test_builder_assembles_and_normalizes_all_150_return_blind_signals(
                 "economic_archetype": "GENERAL_OPERATING",
                 "market_price": "100",
                 "primary_fair_value_per_share": str(fair_value),
-                "raw_expectation_gap": str(fair_value / 100 - 1),
+                "raw_value_gap": str(fair_value / 100 - 1),
                 "alpha_status": "VALID",
             }
         )

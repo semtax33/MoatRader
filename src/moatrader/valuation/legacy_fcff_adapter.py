@@ -6,7 +6,12 @@ from pydantic import Field, model_validator
 
 from moatrader.canonical.models import ContractModel
 from moatrader.financial.dcf import DcfAssumptions, DcfEngine
-from moatrader.valuation.base import ValuationMethod, ValuationResult, eligible
+from moatrader.valuation.base import (
+    ValuationMethod,
+    ValuationResult,
+    eligible,
+    split_valuation_disclosures,
+)
 
 
 class LegacyFcffScenarioSet(ContractModel):
@@ -71,6 +76,10 @@ class LegacyFcffCommonEngine:
         ]
         downside_value = min(stressed_values)
         upside_value = max(stressed_values)
+        disclosures, trust_warnings = split_valuation_disclosures(
+            base.provenance_warnings,
+            assumptions.base.provenance_warnings,
+        )
         return ValuationResult(
             method=assumptions.method,
             applicability=eligible(
@@ -85,7 +94,8 @@ class LegacyFcffCommonEngine:
             upside_value_per_share=upside_value,
             assumption_confidence=base.assumption_confidence,
             provenance=assumptions.provenance,
-            warnings=base.provenance_warnings + base.screening_exclusion_reasons,
+            disclosures=disclosures,
+            warnings=trust_warnings + base.screening_exclusion_reasons,
             metadata={
                 "adapter": "LEGACY_FCFF_PIT_TTM",
                 "screening_eligible": base.screening_eligible,

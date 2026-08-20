@@ -17,6 +17,9 @@ from moatrader.valuation import (
     ExecutionStatus,
     NavAsset,
     NavAssumptions,
+    CyclePhase,
+    NormalizationContract,
+    NormalizedFcffAssumptions,
     PipelineAsset,
     RimAssumptions,
     RimScenarioSet,
@@ -120,7 +123,15 @@ def _sotp_part(name: str, scope: str, value: str) -> SotpPart:
         downside_value=base * D("0.8"),
         base_value=base,
         upside_value=base * D("1.2"),
+        ownership_applied=False,
+        net_debt_adjustment=D("0"),
+        net_debt_scope_id=f"NET_DEBT:{name}",
+        nci_adjustment=D("0"),
+        nci_scope_id=f"NCI:{name}",
+        cashflow_scope_id=f"SCOPE:{name}",
         included_cashflows=[scope],
+        actual_engine="TEST_FIXTURE_ENGINE",
+        submodel_input_sha256="0" * 64,
         provenance=[f"PIT:{name}"],
     )
 
@@ -143,8 +154,21 @@ def _case(method: ValuationMethod) -> tuple[ValuationProfile, object, str]:
             economic_archetype=EconomicArchetype.CYCLICAL_OPERATING,
             materially_cyclical=True,
         )
-        assumptions = _fcff(method)
-        engine = "CommonEconomicFcffEngine"
+        assumptions = NormalizedFcffAssumptions(
+            downside=_economic("0.01").model_copy(update={"scenario": "DOWNSIDE"}),
+            base=_economic("0.05").model_copy(update={"scenario": "CENTRAL"}),
+            upside=_economic("0.09").model_copy(update={"scenario": "UPSIDE"}),
+            normalization=NormalizationContract(
+                included_fiscal_years=[2020, 2021, 2022, 2023, 2024],
+                cycle_phase=CyclePhase.MID_CYCLE,
+            ),
+            normalized_revenue_growth=D("0.05"),
+            normalized_nopat_margin=D("0.12"),
+            normalized_sales_to_capital=D("1.25"),
+            assumption_confidence=D("0.8"),
+            provenance=["PIT:NORMALIZED_FCFF"],
+        )
+        engine = "NormalizedFcffEngine"
     elif method == ValuationMethod.RIM:
         common.update(
             economic_archetype=EconomicArchetype.FINANCIAL_INTERMEDIARY,
@@ -168,14 +192,13 @@ def _case(method: ValuationMethod) -> tuple[ValuationProfile, object, str]:
         common.update(
             economic_archetype=EconomicArchetype.LOSS_MAKING_GROWTH,
             ebit_positive=False,
+            persistent_loss=True,
+            path_to_positive_unit_economics=True,
         )
         assumptions = ScenarioDcfAssumptions(
-            downside=_economic("0.01"),
-            central=_economic("0.05"),
-            upside=_economic("0.09"),
-            downside_probability=D("0.2"),
-            central_probability=D("0.5"),
-            upside_probability=D("0.3"),
+            downside=_economic("0.01").model_copy(update={"scenario": "DOWNSIDE"}),
+            central=_economic("0.05").model_copy(update={"scenario": "CENTRAL"}),
+            upside=_economic("0.09").model_copy(update={"scenario": "UPSIDE"}),
             assumption_confidence=D("0.8"),
             provenance=["PIT:SCENARIO"],
         )
@@ -301,7 +324,7 @@ def test_missing_method_input_is_unvalued_not_fallback_fcff() -> None:
 
 
 def test_normalized_fcff_cannot_relabel_economic_fcff_assumptions() -> None:
-    with pytest.raises(ValueError, match="assumptions method must match"):
+    with pytest.raises(ValueError, match="normalization"):
         RoutedValuationExecutor.prepare(
             RoutedValuationInput(
                 issuer_id="C1",

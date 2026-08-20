@@ -14,12 +14,14 @@ from moatrader.financial.pit import (
     trailing_twelve_month_metrics,
 )
 from scripts.prepare_kr_dcf_manifest import (
+    annual_metrics,
     assumptions_from_history,
     build_pit_ttm_input,
     canonical_manifest_rows,
     financial_metrics,
     latest_pit_financial_report,
     market_snapshot_from_universe_row,
+    pit_annual_history,
     resolve_filing_ticker,
 )
 
@@ -315,6 +317,69 @@ def test_interim_metrics_do_not_fall_back_to_three_month_amount() -> None:
     assert interim["revenue"] is None
     assert interim["ebit"] is None
     assert interim["capex"] is None
+
+
+def test_annual_metrics_can_read_filed_comparative_year_columns() -> None:
+    rows = report_rows(
+        receipt_no="20250318001234",
+        report_code=ANNUAL_REPORT_CODE,
+        year=2024,
+        revenue=1000,
+        ebit=100,
+        capex=80,
+        depreciation=40,
+    )
+    for item in rows:
+        item["frmtrm_amount"] = str(Decimal(str(item["thstrm_amount"])) * Decimal("0.8"))
+        item["bfefrmtrm_amount"] = str(Decimal(str(item["thstrm_amount"])) * Decimal("0.6"))
+
+    prior = annual_metrics(rows, fields=("frmtrm_amount",))
+    two_years_prior = annual_metrics(rows, fields=("bfefrmtrm_amount",))
+
+    assert prior["revenue"] == Decimal("800.0")
+    assert prior["ebit"] == Decimal("80.0")
+    assert two_years_prior["revenue"] == Decimal("600.0")
+
+
+def test_pit_history_uses_latest_filed_comparatives_for_seven_year_contract(
+    tmp_path: Path,
+) -> None:
+    payloads: dict[tuple[int, str, str], dict[str, object]] = {}
+    for year, receipt, revenue in (
+        (2022, "20230315001234", 900),
+        (2023, "20240315001234", 1000),
+        (2024, "20250315001234", 1100),
+    ):
+        rows = report_rows(
+            receipt_no=receipt,
+            report_code=ANNUAL_REPORT_CODE,
+            year=year,
+            revenue=revenue,
+            ebit=100,
+            capex=80,
+            depreciation=40,
+        )
+        for item in rows:
+            current = Decimal(str(item["thstrm_amount"]))
+            item["frmtrm_amount"] = str(current - Decimal("100"))
+            item["bfefrmtrm_amount"] = str(current - Decimal("200"))
+        payloads[(year, ANNUAL_REPORT_CODE, "CFS")] = payload(rows)
+
+    history, sources = pit_annual_history(
+        FakeDartClient(payloads),
+        tmp_path,
+        "000001",
+        "00000001",
+        list(range(2018, 2025)),
+        as_of=datetime(2025, 8, 31, 23, 59, tzinfo=KST),
+        fs_div="CFS",
+    )
+
+    assert [year for year, _metrics in history] == [2020, 2021, 2022, 2023, 2024]
+    assert [item["observation_year"] for item in sources] == [2020, 2021, 2022, 2023, 2024]
+    source_2022 = next(item for item in sources if item["observation_year"] == 2022)
+    assert source_2022["business_year"] == 2024
+    assert source_2022["amount_field"] == "bfefrmtrm_amount"
 
 
 def test_ttm_formula_combines_flows_but_keeps_latest_balance_sheet() -> None:

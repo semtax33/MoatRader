@@ -238,7 +238,15 @@ def run_reference_invariant_suite() -> InvariantSuiteReport:
                 base_value=value,
                 upside_value=value * D("1.2"),
                 ownership_pct=D("0.6"),
+                ownership_applied=False,
+                net_debt_adjustment=D("0"),
+                net_debt_scope_id="NET_DEBT:A",
+                nci_adjustment=D("0"),
+                nci_scope_id="NCI:A",
+                cashflow_scope_id="SCOPE:A",
                 included_cashflows=["A"],
+                actual_engine="INVARIANT_FIXTURE_ENGINE",
+                submodel_input_sha256="0" * 64,
                 provenance=["INVARIANT_SUITE"],
             )
             part_b = SotpPart(
@@ -248,7 +256,15 @@ def run_reference_invariant_suite() -> InvariantSuiteReport:
                 downside_value=D("160"),
                 base_value=D("200"),
                 upside_value=D("240"),
+                ownership_applied=False,
+                net_debt_adjustment=D("0"),
+                net_debt_scope_id="NET_DEBT:B",
+                nci_adjustment=D("0"),
+                nci_scope_id="NCI:B",
+                cashflow_scope_id="SCOPE:B",
                 included_cashflows=["B"],
+                actual_engine="INVARIANT_FIXTURE_ENGINE",
+                submodel_input_sha256="0" * 64,
                 provenance=["INVARIANT_SUITE"],
             )
             return SotpEngine().value(

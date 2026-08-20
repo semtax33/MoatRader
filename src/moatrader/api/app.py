@@ -58,7 +58,7 @@ def create_app(*, data_root: Path | None = None) -> FastAPI:
     )
     def list_reports() -> ReportCatalog:
         reports = []
-        for result in repository.latest_results():
+        for result in service.catalog_results():
             dcf = result.get("dcf") or {}
             moat = result.get("moat_score") or {}
             reports.append(

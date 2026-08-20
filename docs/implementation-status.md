@@ -33,7 +33,8 @@
 - Possible/Plausible/Probable assumption validation; numeric probability를 가장하지 않음
 - 현재 가격에 맞는 성장·마진·ROIIC·CAP 조합 전체를 보존하는 Reverse DCF surface
 - intrinsic lane 이후에만 price를 주입하는 타입·PIT invariant와 Expectation Gap 기본 screening
-- 일반/성숙/플랫폼/distressed/금융/바이오 model router와 standalone biotech rNPV
+- 일반/성숙/플랫폼/distressed/금융/바이오 model router, Normalized FCFF·Scenario DCF·RIM·rNPV의 deterministic builder와 실제 실행 경로
+- SOTP part별 실제 sub-model 실행, EV/Equity basis·ownership·cash-flow/net-debt/NCI scope·input hash 강제
 - 기존 MOAT×DCF ranker는 명시적인 `--enable-legacy-moat-ranking` 진단 옵션으로만 실행
 
 ### Runner/audit
@@ -58,8 +59,9 @@
 
 - IR visual extractor는 기존 gold set에서 개선됐지만 unseen-document production gate와 정기 extraction-set 반복 감사가 더 필요
 - DART/SEC taxonomy와 버전별 더 정교한 concept mapping 및 segment economics
-- 금융회사 excess-return equity 엔진은 router만 있고 구현되지 않아 분석을 거부
-- biotech rNPV는 standalone 엔진이며 universe expectation runner 자동 통합은 아직 없음
+- RIM은 실제 DART PIT 입력 41개 issuer까지 생성됐지만, 4개 역사 signal-date 표본에서는 reference class가 20개 미만이라 점수를 만들지 않음
+- rNPV는 FutureChem 3개 PIT signal-date에 실제 입력·실행을 확인했으며, 다른 파이프라인 기업은 role-separated 임상·소유권 evidence가 없으면 fail closed
+- NAV/APV/SOTP는 실제 method-specific evidence가 없는 production route에서 fail closed하며, 임의 숫자나 다른 FCFF fallback으로 coverage를 부풀리지 않음
 - Economic DCF 숫자 가정의 완전 자동 생성은 의도적으로 없음; evidence는 숫자를 직접 bump하지 않음
 - Reverse DCF grid는 민감도 표면이며 연속 최적화나 유일한 implied solution을 주장하지 않음
 - parser 원문/AST/Markdown 동시 비교 viewer와 더 큰 실제 공시 golden corpus

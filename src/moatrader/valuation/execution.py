@@ -17,6 +17,10 @@ from moatrader.valuation.common_engines import (
     RnpvScenarioSet,
 )
 from moatrader.valuation.nav import NavAssumptions, NavEngine
+from moatrader.valuation.normalized_fcff import (
+    NormalizedFcffAssumptions,
+    NormalizedFcffEngine,
+)
 from moatrader.valuation.rim import CommonRimEngine, RimScenarioSet
 from moatrader.valuation.router import REQUIRED_DATA, ValuationRoute
 from moatrader.valuation.scenario_dcf import ScenarioDcfAssumptions, ScenarioDcfEngine
@@ -24,6 +28,7 @@ from moatrader.valuation.sotp import SotpAssumptions, SotpEngine
 
 
 ROUTED_VALUATION_INPUT_VERSION = "routed-valuation-input/1"
+ASSUMPTION_POLICY_VERSION = "unified-value-assumptions/2"
 
 
 class RoutedValuationInput(ContractModel):
@@ -45,6 +50,7 @@ class RoutedValuationInput(ContractModel):
 
 AssumptionSet = (
     EconomicFcffScenarioSet
+    | NormalizedFcffAssumptions
     | RimScenarioSet
     | RnpvScenarioSet
     | ScenarioDcfAssumptions
@@ -98,7 +104,7 @@ class RoutedValuationExecution(ContractModel):
 
 _ASSUMPTION_MODELS: dict[ValuationMethod, type[ContractModel]] = {
     ValuationMethod.ECONOMIC_FCFF: EconomicFcffScenarioSet,
-    ValuationMethod.NORMALIZED_FCFF: EconomicFcffScenarioSet,
+    ValuationMethod.NORMALIZED_FCFF: NormalizedFcffAssumptions,
     ValuationMethod.RIM: RimScenarioSet,
     ValuationMethod.RNPV: RnpvScenarioSet,
     ValuationMethod.SCENARIO_DCF: ScenarioDcfAssumptions,
@@ -110,7 +116,7 @@ _ASSUMPTION_MODELS: dict[ValuationMethod, type[ContractModel]] = {
 
 _ENGINE_NAMES: dict[ValuationMethod, str] = {
     ValuationMethod.ECONOMIC_FCFF: "CommonEconomicFcffEngine",
-    ValuationMethod.NORMALIZED_FCFF: "CommonEconomicFcffEngine",
+    ValuationMethod.NORMALIZED_FCFF: "NormalizedFcffEngine",
     ValuationMethod.RIM: "CommonRimEngine",
     ValuationMethod.RNPV: "CommonRnpvEngine",
     ValuationMethod.SCENARIO_DCF: "ScenarioDcfEngine",
@@ -118,6 +124,24 @@ _ENGINE_NAMES: dict[ValuationMethod, str] = {
     ValuationMethod.NAV: "NavEngine",
     ValuationMethod.SOTP: "SotpEngine",
 }
+
+_COMPATIBLE_ENGINE_NAMES: dict[ValuationMethod, frozenset[str]] = {
+    method: frozenset({engine}) for method, engine in _ENGINE_NAMES.items()
+}
+_COMPATIBLE_ENGINE_NAMES[ValuationMethod.ECONOMIC_FCFF] = frozenset(
+    {"CommonEconomicFcffEngine", "LegacyFcffCommonEngine"}
+)
+
+
+def expected_engine_name(method: ValuationMethod) -> str:
+    try:
+        return _ENGINE_NAMES[method]
+    except KeyError as exc:
+        raise ValueError(f"no executable engine registered for {method.value}") from exc
+
+
+def engine_matches_method(method: ValuationMethod, actual_engine: str) -> bool:
+    return actual_engine in _COMPATIBLE_ENGINE_NAMES.get(method, frozenset())
 
 
 class RoutedValuationExecutor:
@@ -143,7 +167,7 @@ class RoutedValuationExecutor:
         return PreparedValuationInput(
             envelope=envelope,
             assumptions=assumptions,  # type: ignore[arg-type]
-            actual_engine=_ENGINE_NAMES[envelope.method],
+            actual_engine=expected_engine_name(envelope.method),
         )
 
     def execute(
@@ -209,10 +233,14 @@ class RoutedValuationExecutor:
 
     @staticmethod
     def _value(method: ValuationMethod, assumptions: AssumptionSet) -> ValuationResult:
-        if method in {ValuationMethod.ECONOMIC_FCFF, ValuationMethod.NORMALIZED_FCFF}:
+        if method == ValuationMethod.ECONOMIC_FCFF:
             if not isinstance(assumptions, EconomicFcffScenarioSet):
                 raise TypeError("FCFF route requires EconomicFcffScenarioSet")
             return CommonEconomicFcffEngine().value(assumptions)
+        if method == ValuationMethod.NORMALIZED_FCFF:
+            if not isinstance(assumptions, NormalizedFcffAssumptions):
+                raise TypeError("normalized FCFF route requires NormalizedFcffAssumptions")
+            return NormalizedFcffEngine().value(assumptions)
         if method == ValuationMethod.RIM:
             if not isinstance(assumptions, RimScenarioSet):
                 raise TypeError("RIM route requires RimScenarioSet")
