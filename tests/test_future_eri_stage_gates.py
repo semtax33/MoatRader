@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from moatrader.expectations.historical_evidence import sha256_file
 from scripts.audit_historical_future_eri_outcome_eligibility import (
     OutcomeEligibilityInventoryRowV1,
     audit_outcome_eligibility,
@@ -94,6 +95,104 @@ def test_v1_outcome_runner_rejects_v2_seal_without_opening_inputs(tmp_path: Path
     )
 
     assert result["status"] == "BLOCKED_V2_FEATURES_REQUIRE_SPARSE_ERI_RUNNER"
+    assert result["expectation_input_opened"] is False
+    assert result["outcome_vault_opened"] is False
+
+
+def test_outcome_runner_rejects_unsealed_v1r_without_opening_inputs(tmp_path: Path) -> None:
+    feature_build = tmp_path / "v1r-unsealed"
+    feature_build.mkdir()
+    (feature_build / "stage-status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "moatrader-historical-v1r-feasibility-stage/1",
+                "status": "V1R_FEASIBILITY_PASSED_ERI_MECHANISM_ELIGIBLE",
+                "outcome_stage_authorized": True,
+                "pre_outcome_manifest_sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_outcomes(
+        feature_build=feature_build,
+        expectation_input=tmp_path / "does-not-exist-expectations.jsonl",
+        outcome_input=tmp_path / "does-not-exist-outcomes.jsonl",
+        trading_sessions_path=tmp_path / "does-not-exist-calendar.csv",
+        output=tmp_path / "v1r-result",
+    )
+
+    assert result["status"] == "BLOCKED_V1R_FEASIBILITY_GATE"
+    assert result["expectation_input_opened"] is False
+    assert result["outcome_vault_opened"] is False
+
+
+def test_outcome_eligibility_rejects_unsealed_v1r_without_opening_inputs(
+    tmp_path: Path,
+) -> None:
+    feature_build = tmp_path / "v1r-unsealed-eligibility"
+    feature_build.mkdir()
+    (feature_build / "stage-status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "moatrader-historical-v1r-feasibility-stage/1",
+                "status": "V1R_FEASIBILITY_PASSED_ERI_MECHANISM_ELIGIBLE",
+                "outcome_stage_authorized": True,
+                "pre_outcome_manifest_sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = audit_outcome_eligibility(
+        feature_build=feature_build,
+        expectation_input=tmp_path / "does-not-exist-expectations.jsonl",
+        eligibility_inventory_input=tmp_path / "does-not-exist-inventory.jsonl",
+        trading_sessions_path=tmp_path / "does-not-exist-calendar.csv",
+        output=tmp_path / "v1r-unsealed-eligibility-result",
+    )
+
+    assert result["status"] == "BLOCKED_V1R_FEASIBILITY_GATE"
+    assert result["expectation_input_opened"] is False
+    assert result["eligibility_inventory_opened"] is False
+    assert result["outcome_vault_opened"] is False
+
+
+def test_sealed_v1r_requires_eligibility_before_opening_inputs(tmp_path: Path) -> None:
+    feature_build = tmp_path / "v1r-sealed"
+    feature_build.mkdir()
+    pre_outcome = {
+        "status": "V1R_PREOUTCOME_FEASIBILITY_SEALED",
+        "outcome_stage_authorized": True,
+        "original_v1_tag_preserved": True,
+        "per_pbr_role": "NOT_USED",
+        "outcome_vault_opened": False,
+        "return_data_opened": False,
+        "value_data_opened": False,
+    }
+    pre_outcome_path = feature_build / "pre-outcome-manifest.json"
+    pre_outcome_path.write_text(json.dumps(pre_outcome), encoding="utf-8")
+    (feature_build / "stage-status.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "moatrader-historical-v1r-feasibility-stage/1",
+                "status": "V1R_FEASIBILITY_PASSED_ERI_MECHANISM_ELIGIBLE",
+                "outcome_stage_authorized": True,
+                "pre_outcome_manifest_sha256": sha256_file(pre_outcome_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_outcomes(
+        feature_build=feature_build,
+        expectation_input=tmp_path / "does-not-exist-expectations.jsonl",
+        outcome_input=tmp_path / "does-not-exist-outcomes.jsonl",
+        trading_sessions_path=tmp_path / "does-not-exist-calendar.csv",
+        output=tmp_path / "v1r-eligibility-required",
+    )
+
+    assert result["status"] == "BLOCKED_V1R_OUTCOME_ELIGIBILITY_REQUIRED"
     assert result["expectation_input_opened"] is False
     assert result["outcome_vault_opened"] is False
 

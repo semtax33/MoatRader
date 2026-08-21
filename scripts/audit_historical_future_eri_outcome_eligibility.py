@@ -127,6 +127,43 @@ def audit_outcome_eligibility(
         raise FileNotFoundError("feature stage status is missing")
     feature_stage = json.loads(stage_path.read_text(encoding="utf-8"))
     output.mkdir(parents=True, exist_ok=True)
+    is_v1r = (
+        feature_stage.get("schema_version")
+        == "moatrader-historical-v1r-feasibility-stage/1"
+    )
+    if is_v1r:
+        pre_outcome_path = feature_build / "pre-outcome-manifest.json"
+        valid_v1r_stage = (
+            feature_stage.get("status")
+            == "V1R_FEASIBILITY_PASSED_ERI_MECHANISM_ELIGIBLE"
+            and feature_stage.get("outcome_stage_authorized", False)
+            and pre_outcome_path.is_file()
+            and feature_stage.get("pre_outcome_manifest_sha256")
+            == sha256_file(pre_outcome_path)
+        )
+        if valid_v1r_stage:
+            pre_outcome = json.loads(pre_outcome_path.read_text(encoding="utf-8"))
+            valid_v1r_stage = (
+                pre_outcome.get("status") == "V1R_PREOUTCOME_FEASIBILITY_SEALED"
+                and pre_outcome.get("outcome_stage_authorized", False)
+                and pre_outcome.get("original_v1_tag_preserved", False)
+                and pre_outcome.get("per_pbr_role") == "NOT_USED"
+                and not pre_outcome.get("outcome_vault_opened", False)
+                and not pre_outcome.get("return_data_opened", False)
+                and not pre_outcome.get("value_data_opened", False)
+            )
+        if not valid_v1r_stage:
+            status = {
+                "schema_version": "moatrader-outcome-eligibility-stage-v1/1",
+                "status": "BLOCKED_V1R_FEASIBILITY_GATE",
+                "expectation_input_opened": False,
+                "eligibility_inventory_opened": False,
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "outcome_stage_authorized": False,
+            }
+            _write_json(output / "stage-status.json", status)
+            return status
     if not feature_stage.get("outcome_stage_authorized", False):
         status = {
             "schema_version": "moatrader-outcome-eligibility-stage-v1/1",

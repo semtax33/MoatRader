@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import date, datetime
 from itertools import groupby
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Literal, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -63,15 +63,13 @@ DEFAULT_SECTOR_MAP = (
 )
 
 
-FROZEN_FEATURE_CONTRACT: dict[str, Any] = {
+FROZEN_FEATURE_CONTRACT_V1: dict[str, Any] = {
     "schema_version": "moatrader-historical-future-eri-feature-v1/1",
     "research_status": "PSEUDO_OOS_CALIBRATION_EVIDENCE",
     "live_shadow_start": "2026-08-20",
     "source_scope": {
         "included": [
             "Arcana data-lake raw business-info HTML",
-            "Arcana data-lake raw finance-comment HTML",
-            "Arcana data-lake raw finance-statement HTML",
             "MoatRader data-lake original OpenDART archives",
         ],
         "regular_reports_only": ["사업보고서", "반기보고서", "분기보고서"],
@@ -106,6 +104,25 @@ FROZEN_FEATURE_CONTRACT: dict[str, Any] = {
     "primary_ranking_policy": "NONE_MECHANISM_ONLY",
     "per_pbr_role": "NOT_USED_AT_FEATURE_OR_ERI_MECHANISM_STAGE",
 }
+FROZEN_FEATURE_CONTRACT_V1R: dict[str, Any] = {
+    **FROZEN_FEATURE_CONTRACT_V1,
+    "schema_version": "moatrader-historical-future-eri-feature-v1r/1",
+    "research_status": "SOURCE_CORRECTED_V1_REPLICATION_PREOUTCOME",
+    "replication_of": "future-eri-v1-preoutcome",
+    "source_change_only": True,
+    "source_scope": {
+        **FROZEN_FEATURE_CONTRACT_V1["source_scope"],
+        "included": [
+            "Arcana data-lake raw business-info HTML",
+            "Arcana data-lake raw finance-comment HTML",
+            "Arcana data-lake raw finance-statement HTML",
+            "MoatRader data-lake original OpenDART archives",
+        ],
+    },
+    "intended_freeze_tag": "future-eri-v1r-three-section-preoutcome",
+}
+# Backward-compatible import name. New builds default to V1R explicitly below.
+FROZEN_FEATURE_CONTRACT = FROZEN_FEATURE_CONTRACT_V1R
 
 
 def _canonical_hash(payload: object) -> str:
@@ -146,14 +163,40 @@ def _git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def frozen_manifest(*, created_at: datetime) -> dict[str, Any]:
-    tag = "future-eri-v1-preoutcome"
-    tag_commit = _git("rev-list", "-n", "1", tag)
-    tag_timestamp = _git(
-        "for-each-ref",
-        "--format=%(creatordate:iso-strict)",
-        f"refs/tags/{tag}",
+def _git_optional(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
     )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def frozen_manifest(
+    *,
+    created_at: datetime,
+    research_variant: Literal["V1", "V1R"],
+    contract: dict[str, Any],
+) -> dict[str, Any]:
+    tag = (
+        "future-eri-v1-preoutcome"
+        if research_variant == "V1"
+        else "future-eri-v1r-three-section-preoutcome"
+    )
+    tag_commit = _git_optional("rev-list", "-n", "1", tag)
+    tag_timestamp = (
+        _git(
+            "for-each-ref",
+            "--format=%(creatordate:iso-strict)",
+            f"refs/tags/{tag}",
+        )
+        if tag_commit
+        else ""
+    )
+    builder_commit = _git("rev-parse", "HEAD")
     schemas = {
         "EvidenceObservation": EvidenceObservation.model_json_schema(),
         "HistoricalRegularFiling": HistoricalRegularFiling.model_json_schema(),
@@ -162,24 +205,31 @@ def frozen_manifest(*, created_at: datetime) -> dict[str, Any]:
         "AxisPairClassification": AxisPairClassification.model_json_schema(),
     }
     return {
-        "schema_version": "moatrader-future-eri-v1-freeze-manifest/1",
+        "schema_version": "moatrader-future-eri-source-build-freeze-manifest/2",
+        "research_variant": research_variant,
         "freeze_tag": tag,
-        "freeze_tag_commit": tag_commit,
-        "freeze_timestamp": tag_timestamp,
-        "builder_git_commit": _git("rev-parse", "HEAD"),
+        "freeze_tag_exists": bool(tag_commit),
+        "freeze_tag_commit": tag_commit or None,
+        "freeze_timestamp": tag_timestamp or None,
+        "original_v1_tag_preserved": bool(
+            _git("rev-list", "-n", "1", "future-eri-v1-preoutcome")
+        ),
+        "builder_git_commit": builder_commit,
         "builder_execution_timestamp": created_at.isoformat(),
         "feature_schema_hash": _canonical_hash(schemas),
-        "feature_policy_hash": _canonical_hash(FROZEN_FEATURE_CONTRACT["feature"]),
+        "feature_policy_hash": _canonical_hash(contract["feature"]),
         "eri_policy_hash": _canonical_hash(
             {
                 "route": "FCFF",
                 "horizon_trading_days": 63,
                 "label": "log(actual_market_price_t_plus_63/counterfactual_fcff_value_t_plus_63)",
-                "outcome_vault": FROZEN_FEATURE_CONTRACT["outcome_vault"],
+                "outcome_vault": contract["outcome_vault"],
             }
         ),
-        "band_policy_hash": _canonical_hash(FROZEN_FEATURE_CONTRACT["feature_bands"]),
-        "valuation_engine_version": f"moatrader-future-eri-v1@{tag_commit}",
+        "band_policy_hash": _canonical_hash(contract["feature_bands"]),
+        "valuation_engine_version": (
+            f"moatrader-future-eri-{research_variant.lower()}@{tag_commit or builder_commit}"
+        ),
         "signal_timestamp_policy": "same session only before close; otherwise next trading session",
         "primary_ranking_policy": "NONE_MECHANISM_ONLY",
         "per_pbr_role": "NOT_USED",
@@ -320,6 +370,7 @@ def run(
     max_pairs: int | None = None,
     gold_per_axis: int = 40,
     extraction_workers: int = 1,
+    research_variant: Literal["V1", "V1R"] = "V1R",
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"output directory must be new or empty: {output}")
@@ -329,6 +380,16 @@ def run(
         raise ValueError("max_pairs must be positive")
     if extraction_workers < 1:
         raise ValueError("extraction_workers must be positive")
+    contract = (
+        FROZEN_FEATURE_CONTRACT_V1
+        if research_variant == "V1"
+        else FROZEN_FEATURE_CONTRACT_V1R
+    )
+    selected_arcana_sections = (
+        ("business-info",)
+        if research_variant == "V1"
+        else ("business-info", "finance-comment", "finance-statement")
+    )
     created_at = datetime.now(SEOUL)
 
     sessions, calendar_audit = read_trading_sessions(
@@ -347,6 +408,7 @@ def run(
         begin_year=begin_year,
         end_year=end_year,
         tickers=tickers,
+        included_sections=selected_arcana_sections,
     )
     print(
         f"arcana: regular={len(arcana)} amendments={len(amendments)} "
@@ -377,8 +439,15 @@ def run(
     )
 
     output.mkdir(parents=True, exist_ok=True)
-    _write_json(output / "frozen-contract.json", FROZEN_FEATURE_CONTRACT)
-    _write_json(output / "freeze-manifest.json", frozen_manifest(created_at=created_at))
+    _write_json(output / "frozen-contract.json", contract)
+    _write_json(
+        output / "freeze-manifest.json",
+        frozen_manifest(
+            created_at=created_at,
+            research_variant=research_variant,
+            contract=contract,
+        ),
+    )
     _write_json(output / "input-calendar-audit.json", calendar_audit)
     _write_json(output / "sector-map-audit.json", sector_audit)
     _write_json(
@@ -412,6 +481,12 @@ def run(
     extraction_empty_candidate_count: Counter[str] = Counter()
     extraction_axis_window_count: dict[str, Counter[str]] = {}
     packet_excerpt_count: dict[str, Counter[str]] = {}
+    two_period_candidate_by_origin: dict[str, Counter[str]] = {}
+    packet_source_pattern_count: Counter[str] = Counter()
+    incremental_finance_candidate_by_axis: dict[str, Counter[str]] = {
+        "ARCANA_FINANCE_COMMENT_HTML": Counter(),
+        "ARCANA_FINANCE_STATEMENT_HTML": Counter(),
+    }
     gold: dict[OperatingEvidenceAxis, list[PairedAxisPacket]] = {
         axis: [] for axis in OperatingEvidenceAxis
     }
@@ -477,6 +552,44 @@ def run(
                     for excerpt in (*packet.previous_excerpts, *packet.current_excerpts):
                         origin = str(private["sources"][excerpt.source_id]["origin"])
                         packet_excerpt_count.setdefault(origin, Counter())[packet.axis.value] += 1
+                    previous_origins = {
+                        str(private["sources"][excerpt.source_id]["origin"])
+                        for excerpt in packet.previous_excerpts
+                    }
+                    current_origins = {
+                        str(private["sources"][excerpt.source_id]["origin"])
+                        for excerpt in packet.current_excerpts
+                    }
+                    both_origins = previous_origins & current_origins
+                    for origin in both_origins:
+                        two_period_candidate_by_origin.setdefault(origin, Counter())[packet.axis.value] += 1
+                    arcana_origins = (previous_origins | current_origins) & {
+                        "ARCANA_BUSINESS_HTML",
+                        "ARCANA_FINANCE_COMMENT_HTML",
+                        "ARCANA_FINANCE_STATEMENT_HTML",
+                    }
+                    packet_source_pattern_count[
+                        "MULTI_SECTION_EVIDENCE"
+                        if len(arcana_origins) >= 2
+                        else (
+                            next(iter(arcana_origins))
+                            if arcana_origins
+                            else "NO_ARCANA_AXIS_CANDIDATE"
+                        )
+                    ] += 1
+                    legacy_two_period = bool(
+                        {
+                            "ARCANA_BUSINESS_HTML",
+                            "MOATRADER_OPENDART_ARCHIVE",
+                        }
+                        & both_origins
+                    )
+                    if not legacy_two_period:
+                        for origin in incremental_finance_candidate_by_axis:
+                            if origin in both_origins:
+                                incremental_finance_candidate_by_axis[origin][
+                                    packet.axis.value
+                                ] += 1
                     axis_packet_count[packet.axis.value] += 1
                     both = bool(packet.previous_excerpts) and bool(packet.current_excerpts)
                     axis_both_count[packet.axis.value] += int(both)
@@ -532,8 +645,57 @@ def run(
         writer.writeheader()
         writer.writerows(gold_rows)
 
+    filing_origin_patterns: Counter[str] = Counter()
+    for filing in merged:
+        origins = {variant.origin.value for variant in filing.source_variants}
+        has_moatrader = "MOATRADER_OPENDART_ARCHIVE" in origins
+        arcana_count = len(
+            origins
+            & {
+                "ARCANA_BUSINESS_HTML",
+                "ARCANA_FINANCE_COMMENT_HTML",
+                "ARCANA_FINANCE_STATEMENT_HTML",
+            }
+        )
+        filing_origin_patterns[
+            "ARCANA_MOATRADER_OVERLAP" if has_moatrader and arcana_count else (
+                "ARCANA_ONLY" if arcana_count else "MOATRADER_ONLY"
+            )
+        ] += 1
+        filing_origin_patterns["FINANCE_COMMENT_ATTACHED"] += int(
+            "ARCANA_FINANCE_COMMENT_HTML" in origins
+        )
+        filing_origin_patterns["FINANCE_STATEMENT_ATTACHED"] += int(
+            "ARCANA_FINANCE_STATEMENT_HTML" in origins
+        )
+        filing_origin_patterns["ALL_THREE_ARCANA_ATTACHED"] += int(arcana_count == 3)
+    pair_overlap_patterns: Counter[str] = Counter()
+    for pair in pairs:
+        sides = [
+            {variant.origin.value for variant in filing.source_variants}
+            for filing in (pair.previous, pair.current)
+        ]
+        side_has_moatrader = ["MOATRADER_OPENDART_ARCHIVE" in origins for origins in sides]
+        pair_overlap_patterns["BOTH_PERIODS_MOATRADER_OVERLAP"] += int(
+            all(side_has_moatrader)
+        )
+        pair_overlap_patterns["EITHER_PERIOD_MOATRADER_OVERLAP"] += int(
+            any(side_has_moatrader)
+        )
+        pair_overlap_patterns["ARCANA_ONLY_BOTH_PERIODS"] += int(
+            not any(side_has_moatrader)
+        )
+
     source_audit = {
         "schema_version": "moatrader-historical-source-audit-v1/2",
+        "research_variant": research_variant,
+        "source_contract_tag": (
+            "future-eri-v1-preoutcome"
+            if research_variant == "V1"
+            else "future-eri-v1r-three-section-preoutcome"
+        ),
+        "same_feature_rule_as_v1": True,
+        "arcana_section_selection": list(selected_arcana_sections),
         "arcana_regular_filing_count": len(arcana),
         "arcana_amendment_count": len(amendments),
         "arcana_section_audit": arcana_section_audit,
@@ -557,11 +719,14 @@ def run(
             }
             for origin in sorted(set(extraction_read_count) | set(packet_excerpt_count))
         },
-        "all_arcana_sections_discovered": all(
-            arcana_section_audit["sections"][section]["discovered_nonempty_count"] > 0
+        "all_arcana_sections_discovered": research_variant == "V1R" and all(
+            arcana_section_audit["sections"].get(section, {}).get(
+                "discovered_nonempty_count", 0
+            )
+            > 0
             for section in ("business-info", "finance-comment", "finance-statement")
         ),
-        "all_arcana_sections_read_for_pairs": all(
+        "all_arcana_sections_read_for_pairs": research_variant == "V1R" and all(
             extraction_read_count[origin] > 0
             for origin in (
                 "ARCANA_BUSINESS_HTML",
@@ -569,7 +734,7 @@ def run(
                 "ARCANA_FINANCE_STATEMENT_HTML",
             )
         ),
-        "all_arcana_sections_contributed_to_packets": all(
+        "all_arcana_sections_contributed_to_packets": research_variant == "V1R" and all(
             sum(packet_excerpt_count.get(origin, Counter()).values()) > 0
             for origin in (
                 "ARCANA_BUSINESS_HTML",
@@ -577,6 +742,36 @@ def run(
                 "ARCANA_FINANCE_STATEMENT_HTML",
             )
         ),
+        "source_effect_audit": {
+            "interpretation": {
+                "A_TO_B": "SOURCE_COVERAGE_EFFECT_ONLY",
+                "B_TO_C": "FEATURE_CONTRACT_EFFECT_ONLY",
+            },
+            "filing_origin_patterns": dict(sorted(filing_origin_patterns.items())),
+            "pair_overlap_patterns": dict(sorted(pair_overlap_patterns.items())),
+            "packet_source_pattern_counts": dict(
+                sorted(packet_source_pattern_count.items())
+            ),
+            "two_period_candidate_packets_by_origin_and_axis": {
+                origin: {
+                    axis.value: two_period_candidate_by_origin.get(origin, Counter())[
+                        axis.value
+                    ]
+                    for axis in OperatingEvidenceAxis
+                }
+                for origin in sorted(two_period_candidate_by_origin)
+            },
+            "incremental_two_period_candidates_without_business_or_moatrader_baseline": {
+                origin: {
+                    axis.value: incremental_finance_candidate_by_axis[origin][axis.value]
+                    for axis in OperatingEvidenceAxis
+                }
+                for origin in sorted(incremental_finance_candidate_by_axis)
+            },
+            "outcomes_opened": False,
+            "returns_opened": False,
+            "value_data_opened": False,
+        },
         "moatrader_regular_original_filing_count": len(moatrader),
         "moatrader_original_audit": moatrader_audit,
         "merge_audit": merge_audit,
@@ -590,6 +785,7 @@ def run(
         output / "stage-status.json",
         {
             "stage": "HISTORICAL_EVIDENCE_PACKET_BUILD",
+            "research_variant": research_variant,
             "status": "AWAITING_LLM_AND_HUMAN_LABEL_QUALITY",
             "feature_dataset_sealed": False,
             "outcome_vault_opened": False,
@@ -619,6 +815,7 @@ def run(
         output / "build-manifest.json",
         {
             "schema_version": "moatrader-historical-evidence-build-manifest-v1/1",
+            "research_variant": research_variant,
             "artifacts": artifacts,
             "credentials_persisted": False,
             "source_files_modified": False,
@@ -671,6 +868,7 @@ def main() -> int:
     parser.add_argument("--max-pairs", type=int)
     parser.add_argument("--gold-per-axis", type=int, default=40)
     parser.add_argument("--extraction-workers", type=int, default=8)
+    parser.add_argument("--research-variant", choices=["V1", "V1R"], default="V1R")
     args = parser.parse_args()
     tickers = {str(item).zfill(6) for item in args.ticker} or None
     result = run(
@@ -688,6 +886,7 @@ def main() -> int:
         max_pairs=args.max_pairs,
         gold_per_axis=args.gold_per_axis,
         extraction_workers=args.extraction_workers,
+        research_variant=args.research_variant,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

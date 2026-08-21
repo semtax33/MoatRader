@@ -27,6 +27,7 @@ from moatrader.expectations.historical_evidence import (
     build_historical_evidence_feature_row,
     build_regular_filing_pairs,
     discover_arcana_business_sources,
+    discover_arcana_regular_sources,
     discover_moatrader_original_sources,
     merge_historical_sources,
     packet_coverage_report,
@@ -148,7 +149,7 @@ def test_arcana_discovery_keeps_regular_original_and_records_amendment(tmp_path:
         writer.writeheader()
         writer.writerows(rows)
 
-    filings, amendments = discover_arcana_business_sources(
+    filings, amendments, audit = discover_arcana_regular_sources(
         metadata_path=metadata,
         business_html_root=root,
         trading_sessions=TRADING_SESSIONS,
@@ -158,12 +159,36 @@ def test_arcana_discovery_keeps_regular_original_and_records_amendment(tmp_path:
 
     assert len(filings) == 1
     assert len(amendments) == 1
+    assert audit["filing_count_with_all_three_sections"] == 1
     assert {item.origin for item in filings[0].source_variants} == {
         HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
         HistoricalSourceOrigin.ARCANA_FINANCE_COMMENT_HTML,
         HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML,
     }
     assert filings[0].signal_timestamp.date() == date(2020, 3, 31)
+
+    v1_filings, _ = discover_arcana_business_sources(
+        metadata_path=metadata,
+        business_html_root=root,
+        trading_sessions=TRADING_SESSIONS,
+        begin_year=2020,
+        end_year=2020,
+    )
+    assert {item.origin for item in v1_filings[0].source_variants} == {
+        HistoricalSourceOrigin.ARCANA_BUSINESS_HTML
+    }
+
+
+def test_arcana_discovery_rejects_empty_section_selection(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="invalid Arcana DART section selection"):
+        discover_arcana_regular_sources(
+            metadata_path=tmp_path / "unused.csv",
+            business_html_root=tmp_path / "unused",
+            trading_sessions=TRADING_SESSIONS,
+            begin_year=2020,
+            end_year=2020,
+            included_sections=(),
+        )
 
 
 def test_moatrader_discovery_finds_exact_original_and_deduplicates_copies(

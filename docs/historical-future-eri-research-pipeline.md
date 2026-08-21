@@ -1,4 +1,4 @@
-# Historical Evidence → Future ERI V1 tombstone and V2 sparse pipeline
+# Historical Evidence → Future ERI V1, V1R, and V2 pipeline
 
 ## V1 tombstone
 
@@ -28,7 +28,8 @@ future return, or machine learning to define or rank the feature.
 
 ## Read-only source policy
 
-The builder uses both source systems:
+V1R와 V2 builder는 두 source system을 모두 사용한다. V1 재현 모드는 기존 계약대로
+Arcana `business-info`와 MoatRader original disclosure만 사용한다.
 
 1. Arcana `data-lake/bronze/dart`의 `business-info`, `finance-comment`,
    `finance-statement` HTML plus its silver DART metadata. 각 섹션은 별도 provenance로
@@ -50,6 +51,64 @@ finance-comment와 finance-statement는 각각 49,770건이며 세 섹션이 모
 
 Receipt duplicates are deduplicated by receipt and archive hash. Blank, nonnumeric, and
 all-zero tickers are rejected rather than mapped to `000000`.
+
+## V1R source-corrected replication
+
+V1R(V1.1)은 V1을 덮어쓰거나 되살리는 모델 변경이 아니다. V1의 six-axis complete-case
+feature 가설, 방향 규칙, equal-weight F-score, 다섯 band를 그대로 두고 Arcana 정기공시의
+세 HTML 섹션을 모두 읽도록 source coverage만 교정한 자연실험이다.
+
+| Arm | Source contract | Feature contract | Purpose |
+|---|---|---|---|
+| A: V1 | Arcana business-info + Moat original | six-axis complete | 기존 tombstone 기준 |
+| B: V1R | Arcana business-info + finance-comment + finance-statement + Moat original | V1과 동일 | source coverage 효과 |
+| C: V2 | B와 동일 | sparse breadth | feature contract 효과 |
+
+따라서 A→B는 source coverage 효과이고 B→C는 feature contract 효과다. V1 tag
+`future-eri-v1-preoutcome`은 보존하며 V1R은 독립 tag
+`future-eri-v1r-three-section-preoutcome`을 사용한다. V1R LOCKED_TEST도 packet 내용이
+달라졌으므로 V1/DEV packet ID를 재사용하지 않고 다음 네 source stratum을 축별로 검증한다.
+
+- business-info evidence
+- finance-comment evidence
+- finance-statement evidence
+- multi-section evidence
+
+Source-effect audit는 Arcana-only, Arcana+Moat overlap, 새 finance-comment 기여,
+새 finance-statement 기여를 분리한다. Moat original archive와 Arcana가 겹치는 filing은
+Moat archive 안에 이미 전체 공시가 있을 수 있으므로 단순히 "새 섹션"으로 집계하지 않는다.
+
+V1R feature-only feasibility gate는 outcome, return, ERI, Value 데이터를 열지 않고 축별
+`COMPLETE` 비율, six-axis complete 행 수, issuer/month 수, V1 다섯 band 분포만 본다.
+각 band 최소 20행이면 향후 별도 outcome-eligibility 단계로 진행할 수 있고, 미달이면
+complete-case 계약을 tombstone 처리한다. 어느 경우에도 PER+PBR은 feature나 우선 ranking이
+아니며 이 단계에서는 PBR을 포함한 Value 지표를 전혀 사용하지 않는다.
+
+V1R 실행 순서는 다음과 같다.
+
+1. `build_historical_future_eri_evidence.py --research-variant V1R`로 새 three-section source
+   build와 before/after source-integrity audit를 생성한다.
+2. `prepare_historical_v1r_locked_set.py`로 V1/DEV와 비중복인 axis × source-stratum
+   LOCKED_TEST를 만든다.
+3. `evaluate_historical_evidence_parser_v1r.py freeze`, LOCKED classification,
+   `evaluate` 순으로 parser를 single-use 검증한다.
+4. clean commit에서 `freeze_historical_v1r_contract.py`를 실행하고 새 V1R tag를 고정한다.
+   `--allow-dirty-for-dry-run`은 테스트 전용이며 production authorization이 아니다.
+5. 전체 pair×6 분류 뒤 `build_historical_complete_features_v1r.py`로 V1과 같은 complete-case
+   feature를 만들고 `audit_historical_v1r_feasibility.py`로 band당 최소 20행을 감사한다.
+6. PASS하더라도 outcome runner는 봉인된 V1R manifest와 별도의 value-free
+   outcome-eligibility build 없이는 expectation/outcome 입력을 열지 않는다.
+
+예시 source build:
+
+```powershell
+python scripts\build_historical_future_eri_evidence.py `
+  --research-variant V1R `
+  --output data-lake\experiments\future-eri-v1r-three-section-source
+```
+
+기존 V1을 재현해야 할 때만 `--research-variant V1`을 명시한다. 두 모드는 항상 서로 다른
+새 output directory에 기록한다.
 
 ## Stage gates
 

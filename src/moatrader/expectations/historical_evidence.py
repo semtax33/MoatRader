@@ -560,6 +560,7 @@ def discover_arcana_regular_sources(
     begin_year: int,
     end_year: int,
     tickers: set[str] | None = None,
+    included_sections: Sequence[str] | None = None,
 ) -> tuple[list[HistoricalRegularFiling], list[dict[str, Any]], dict[str, Any]]:
     metadata_file = Path(metadata_path)
     business_root = Path(business_html_root)
@@ -576,6 +577,15 @@ def discover_arcana_regular_sources(
             else business_root.parent / "finance-statement"
         ),
     }
+    known_sections = {item[0] for item in ARCANA_DART_SECTION_SPECS}
+    selected_sections = (
+        set(known_sections) if included_sections is None else set(included_sections)
+    )
+    if not selected_sections or not selected_sections.issubset(known_sections):
+        raise ValueError(f"invalid Arcana DART section selection: {sorted(selected_sections)}")
+    section_specs = tuple(
+        item for item in ARCANA_DART_SECTION_SPECS if item[0] in selected_sections
+    )
     candidates: dict[tuple[str, date], list[dict[str, str]]] = defaultdict(list)
     amendments: list[dict[str, Any]] = []
     with metadata_file.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -605,14 +615,14 @@ def discover_arcana_regular_sources(
     metadata_sha256 = sha256_file(metadata_file)
     filings: list[HistoricalRegularFiling] = []
     section_counts: dict[str, Counter[str]] = {
-        section: Counter() for section, _, _ in ARCANA_DART_SECTION_SPECS
+        section: Counter() for section, _, _ in section_specs
     }
-    all_three = 0
+    all_required = 0
     skipped_without_business = 0
     for (ticker, period), rows in sorted(candidates.items()):
         row = min(rows, key=lambda item: str(item["rcept_no"]))
         available: list[tuple[Path, HistoricalSourceOrigin, str]] = []
-        for section, prefix, origin in ARCANA_DART_SECTION_SPECS:
+        for section, prefix, origin in section_specs:
             source = (
                 section_roots[section]
                 / ticker
@@ -633,8 +643,8 @@ def discover_arcana_regular_sources(
         ):
             skipped_without_business += 1
             continue
-        if len(available) == len(ARCANA_DART_SECTION_SPECS):
-            all_three += 1
+        if len(available) == len(section_specs):
+            all_required += 1
 
         variants: list[HistoricalSourceVariant] = []
         seen_hashes: set[str] = set()
@@ -676,11 +686,14 @@ def discover_arcana_regular_sources(
     candidate_count = len(candidates)
     audit = {
         "schema_version": "moatrader-arcana-dart-section-audit-v1/1",
-        "required_sections": [item[0] for item in ARCANA_DART_SECTION_SPECS],
+        "required_sections": [item[0] for item in section_specs],
         "anchor_policy": "BUSINESS_INFO_REQUIRED_FOR_BACKWARD_COMPATIBLE_FILING_UNIVERSE",
         "candidate_regular_filing_count": candidate_count,
         "regular_filing_count": len(filings),
-        "filing_count_with_all_three_sections": all_three,
+        "filing_count_with_all_required_sections": all_required,
+        "filing_count_with_all_three_sections": (
+            all_required if selected_sections == known_sections else 0
+        ),
         "filing_count_skipped_without_business_info": skipped_without_business,
         "sections": {
             section: {
@@ -698,7 +711,7 @@ def discover_arcana_regular_sources(
                     else 0.0
                 ),
             }
-            for section, _, _ in ARCANA_DART_SECTION_SPECS
+            for section, _, _ in section_specs
         },
         "source_files_modified": False,
     }
@@ -723,6 +736,7 @@ def discover_arcana_business_sources(
         begin_year=begin_year,
         end_year=end_year,
         tickers=tickers,
+        included_sections=("business-info",),
     )
     return filings, amendments
 
