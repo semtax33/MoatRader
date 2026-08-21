@@ -41,6 +41,11 @@ LOCKED_CONFIG = {
         "contract": "V2_NATURAL_FREQUENCY_LOCKED_RETEST_1",
         "packet_hash_key": "natural_retest_packet_sha256",
     },
+    "BALANCED_RETEST_1": {
+        "split": "V2_BALANCED_LOCKED_RETEST_1",
+        "contract": "V2_DIRECTIONAL_BALANCED_LOCKED_RETEST_1",
+        "packet_hash_key": "balanced_retest_packet_sha256",
+    },
 }
 V2_STRATA = (
     "COMPLETE_NEGATIVE",
@@ -224,7 +229,9 @@ def evaluate_v2_locked_parser(
     parser_freeze_manifest: Path,
     locked_consumption_record: Path,
     output: Path,
-    locked_kind: Literal["NATURAL", "BALANCED", "NATURAL_RETEST_1"] = "BALANCED",
+    locked_kind: Literal[
+        "NATURAL", "BALANCED", "NATURAL_RETEST_1", "BALANCED_RETEST_1"
+    ] = "BALANCED",
     minimum_per_axis_stratum: int = 5,
     minimum_natural_per_axis: int = 20,
     minimum_overall_directional_agreement: float = 0.80,
@@ -235,6 +242,7 @@ def evaluate_v2_locked_parser(
 ) -> dict[str, Any]:
     config = LOCKED_CONFIG[locked_kind]
     natural_kind = locked_kind in {"NATURAL", "NATURAL_RETEST_1"}
+    retest_kind = locked_kind in {"NATURAL_RETEST_1", "BALANCED_RETEST_1"}
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"output directory must be new or empty: {output}")
     if locked_consumption_record.exists():
@@ -251,21 +259,21 @@ def evaluate_v2_locked_parser(
         if not path.is_file():
             raise FileNotFoundError(path)
     freeze = json.loads(parser_freeze_manifest.read_text(encoding="utf-8"))
-    if locked_kind == "NATURAL_RETEST_1":
+    if retest_kind:
         if freeze.get("schema_version") != (
             "moatrader-historical-evidence-parser-retest-freeze-v2/1"
         ):
-            raise ValueError("Natural retest requires its derived measurement freeze")
-        if freeze.get("status") != (
-            "V2_NATURAL_RETEST_1_FROZEN_AWAITING_SINGLE_USE_TEST"
-        ):
-            raise ValueError("Natural retest measurement is not frozen")
+            raise ValueError(f"{locked_kind} requires its derived measurement freeze")
+        expected_retest_status = f"V2_{locked_kind}_FROZEN_AWAITING_SINGLE_USE_TEST"
+        if freeze.get("status") != expected_retest_status:
+            raise ValueError(f"{locked_kind} measurement is not frozen")
         if not str(freeze.get("semantic_parser_root_freeze_sha256") or ""):
-            raise ValueError("Natural retest freeze lacks root parser-freeze lineage")
-        if freeze.get("first_natural_test_remains_consumed") is not True or freeze.get(
-            "first_natural_result_superseded"
+            raise ValueError(f"{locked_kind} freeze lacks root parser-freeze lineage")
+        first_role = "natural" if locked_kind == "NATURAL_RETEST_1" else "balanced"
+        if freeze.get(f"first_{first_role}_test_remains_consumed") is not True or freeze.get(
+            f"first_{first_role}_result_superseded"
         ) is not False:
-            raise ValueError("Natural retest attempted to reopen the first consumed test")
+            raise ValueError(f"{locked_kind} attempted to reopen the first consumed test")
     else:
         if freeze.get("schema_version") != (
             "moatrader-historical-evidence-parser-freeze-v2/2"
@@ -447,7 +455,11 @@ def evaluate_v2_locked_parser(
         "locked_kind": locked_kind,
         "gate_passed": gate,
         "natural_frequency_gate_passed": natural_gate if natural_kind else False,
-        "directional_strata_gate_passed": balanced_gate if locked_kind == "BALANCED" else False,
+        "directional_strata_gate_passed": (
+            balanced_gate
+            if locked_kind in {"BALANCED", "BALANCED_RETEST_1"}
+            else False
+        ),
         "reviewed_count": len(reviewed),
         "minimum_per_axis_stratum": minimum_per_axis_stratum,
         "minimum_natural_per_axis": minimum_natural_per_axis,
@@ -492,7 +504,11 @@ def evaluate_v2_locked_parser(
         "locked_kind": locked_kind,
         "gate_passed": gate,
         "natural_frequency_gate_passed": natural_gate if natural_kind else False,
-        "directional_strata_gate_passed": balanced_gate if locked_kind == "BALANCED" else False,
+        "directional_strata_gate_passed": (
+            balanced_gate
+            if locked_kind in {"BALANCED", "BALANCED_RETEST_1"}
+            else False
+        ),
         "parser_version": classification_stage["parser_version"],
         "parser_profile": classification_stage["parser_profile"],
         "prompt_sha256": classification_stage["prompt_sha256"],
@@ -516,6 +532,15 @@ def evaluate_v2_locked_parser(
             retest_number=1,
             first_natural_test_remains_consumed=True,
             first_natural_result_superseded=False,
+        )
+    elif locked_kind == "BALANCED_RETEST_1":
+        stage.update(
+            semantic_parser_root_freeze_sha256=freeze[
+                "semantic_parser_root_freeze_sha256"
+            ],
+            retest_number=1,
+            first_balanced_test_remains_consumed=True,
+            first_balanced_result_superseded=False,
         )
     _write_json(output / "stage-status.json", stage)
     consumption = json.loads(locked_consumption_record.read_text(encoding="utf-8"))
@@ -558,7 +583,11 @@ def combine_v2_locked_evaluations(
     }
     if natural.get("status") not in valid_natural_statuses:
         raise ValueError("Natural-frequency V2 LOCKED test has not passed")
-    if balanced.get("status") != "V2_BALANCED_LOCKED_TEST_PASSED":
+    valid_balanced_statuses = {
+        "V2_BALANCED_LOCKED_TEST_PASSED",
+        "V2_BALANCED_RETEST_1_LOCKED_TEST_PASSED",
+    }
+    if balanced.get("status") not in valid_balanced_statuses:
         raise ValueError("Directional-balanced V2 LOCKED test has not passed")
     if not natural.get("natural_frequency_gate_passed", False):
         raise ValueError("Natural-frequency LOCKED gate flag is false")
@@ -571,9 +600,15 @@ def combine_v2_locked_evaluations(
         if natural.get("locked_kind") == "NATURAL_RETEST_1"
         else natural.get("parser_freeze_sha256")
     )
-    if natural_root_freeze_hash != expected_freeze_hash or balanced.get(
-        "parser_freeze_sha256"
-    ) != expected_freeze_hash:
+    balanced_root_freeze_hash = (
+        balanced.get("semantic_parser_root_freeze_sha256")
+        if balanced.get("locked_kind") == "BALANCED_RETEST_1"
+        else balanced.get("parser_freeze_sha256")
+    )
+    if (
+        natural_root_freeze_hash != expected_freeze_hash
+        or balanced_root_freeze_hash != expected_freeze_hash
+    ):
         raise ValueError("LOCKED evaluations do not share the supplied root parser freeze")
     if natural.get("locked_kind") == "NATURAL_RETEST_1" and (
         natural.get("retest_number") != 1
@@ -581,6 +616,12 @@ def combine_v2_locked_evaluations(
         or natural.get("first_natural_result_superseded") is not False
     ):
         raise ValueError("Natural retest evaluation lacks consumed-test lineage")
+    if balanced.get("locked_kind") == "BALANCED_RETEST_1" and (
+        balanced.get("retest_number") != 1
+        or balanced.get("first_balanced_test_remains_consumed") is not True
+        or balanced.get("first_balanced_result_superseded") is not False
+    ):
+        raise ValueError("Balanced retest evaluation lacks consumed-test lineage")
     for manifest, description in (
         (natural, "Natural"),
         (balanced, "Balanced"),
@@ -628,6 +669,8 @@ def combine_v2_locked_evaluations(
         "balanced_locked_packet_sha256": balanced["input_blinded_packet_sha256"],
         "natural_locked_kind": natural.get("locked_kind"),
         "natural_retest_number": natural.get("retest_number"),
+        "balanced_locked_kind": balanced.get("locked_kind"),
+        "balanced_retest_number": balanced.get("retest_number"),
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
@@ -653,7 +696,7 @@ def main() -> int:
     evaluate_parser = subparsers.add_parser("evaluate")
     evaluate_parser.add_argument(
         "--locked-kind",
-        choices=["NATURAL", "BALANCED", "NATURAL_RETEST_1"],
+        choices=["NATURAL", "BALANCED", "NATURAL_RETEST_1", "BALANCED_RETEST_1"],
         required=True,
     )
     evaluate_parser.add_argument("--packet-input", type=Path, required=True)

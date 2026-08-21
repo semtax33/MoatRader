@@ -338,6 +338,7 @@ def prepare_prelock_cost_preflight(
         "NATURAL_LOCKED",
         "NATURAL_RETEST_1",
         "BALANCED_LOCKED",
+        "BALANCED_RETEST_1",
     }
     if len(observed_stage_manifests) < 2:
         raise ValueError("prelock estimate requires at least two distinct observed stages")

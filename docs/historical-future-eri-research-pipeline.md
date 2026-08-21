@@ -452,6 +452,48 @@ python scripts\merge_historical_human_review_decisions_v2.py `
 세 명령은 입력 파일을 덮어쓰지 않고 새 output만 허용하며, packet 중복·해시 계보·
 `outcome_vault_opened=false`·`return_data_opened=false`를 검증한다.
 
+첫 Balanced LOCKED가 단일사용 평가에서 실패하면 그 결과와 consumption record를
+그대로 보존한다. Retest 1은 실패 분류나 불일치 행을 읽지 않고, 이미 사용한
+V1·DEV·Natural·Balanced·기타 retest ID를 명시적으로 제외한다. 방향성 후보는
+outcome-blind 실현 문장 cue를 우선하고 부족분만 사전 정의된 광범위 텍스트 cue로
+채운다. 기존 HUMAN strata는 비방향 후보 sampling에만 사용할 수 있으며 새 retest
+gold로 재사용하지 않는다. 모든 후보는 selection hint를 보지 않은 HUMAN이 새로
+판정해야 한다.
+
+```powershell
+python -m scripts.prepare_historical_balanced_retest_v2 `
+  --packet-input <semantic-packets.jsonl> `
+  --prior-v1-input <v1-input.jsonl> `
+  --dev-input <semantic-dev.jsonl> `
+  --prior-v2-locked-input <first-natural.jsonl> `
+  --prior-v2-locked-input <first-balanced.jsonl> `
+  --prior-human-gold <prior-human-gold.csv> `
+  --prior-human-gold-materialization-manifest <prior-human-manifest.json> `
+  --failed-balanced-evaluation-manifest <failed-balanced-stage.json> `
+  --failed-balanced-consumption-record <balanced-consumption.json> `
+  --parser-freeze-manifest <root-parser-freeze.json> `
+  --output <new-balanced-retest-candidates>
+
+python -m scripts.materialize_historical_balanced_retest_v2 materialize `
+  --candidate-build <new-balanced-retest-candidates> `
+  --review-decisions <fresh-human-review-decisions.json> `
+  --output <new-balanced-retest-human-gold>
+
+python -m scripts.materialize_historical_balanced_retest_v2 freeze `
+  --parser-freeze-manifest <root-parser-freeze.json> `
+  --candidate-build <new-balanced-retest-candidates> `
+  --human-gold-build <new-balanced-retest-human-gold> `
+  --output <new-balanced-retest-freeze.json>
+```
+
+Materialization은 축별 `COMPLETE_NEGATIVE`, `COMPLETE_NEUTRAL`,
+`COMPLETE_POSITIVE`, `INSUFFICIENT_EVIDENCE`, `AMBIGUOUS`를 최소 5개씩
+확보한 경우에만 50행 retest를 고정한다. `BALANCED_RETEST_1` 평가는 파생 freeze와
+단일사용 consumption record를 요구하며 첫 Balanced 결과를 재점수화하거나
+supersede하지 않는다. Dual manifest는 통과한 Natural/Natural Retest 1과
+Balanced/Balanced Retest 1의 root parser-freeze 및 classification-stage SHA 계보가
+정확히 일치할 때만 생성된다.
+
 최종 Natural/Balanced LOCKED를 확정한 뒤 DEV도 같은 HUMAN 리뷰 풀에서 만들 수 있다.
 이때 두 LOCKED의 packet ID를 모두 제외하고, COMPLETE·AMBIGUOUS를 최소 포함한 축별
 30건을 outcome-blind하게 고정한다.
