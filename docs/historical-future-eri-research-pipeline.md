@@ -441,6 +441,22 @@ python scripts\merge_historical_human_review_decisions_v2.py `
 세 명령은 입력 파일을 덮어쓰지 않고 새 output만 허용하며, packet 중복·해시 계보·
 `outcome_vault_opened=false`·`return_data_opened=false`를 검증한다.
 
+최종 Natural/Balanced LOCKED를 확정한 뒤 DEV도 같은 HUMAN 리뷰 풀에서 만들 수 있다.
+이때 두 LOCKED의 packet ID를 모두 제외하고, COMPLETE·AMBIGUOUS를 최소 포함한 축별
+30건을 outcome-blind하게 고정한다.
+
+```powershell
+python scripts\prepare_historical_semantic_dev_v2.py `
+  --candidate-build <extended-v2-candidates> `
+  --adjudicated-human-gold <materialized-human-gold.csv> `
+  --human-gold-materialization-manifest <human-gold-materialization-manifest.json> `
+  --locked-set-build <final-v2-locked-sets> `
+  --output <new-v2-semantic-dev>
+```
+
+DEV 준비 manifest는 LOCKED overlap 0, HUMAN authority, 입력 해시, Value/return/outcome 미개방,
+`per_pbr_role=NOT_USED`를 기록한다.
+
 V2 semantic `--execute`는 실행 범위를 반드시 명시한다. DEV·LOCKED 검증은 최대
 2,000 packet으로 제한되며, 전체 historical 실행은 통과한 dual LOCKED manifest와
 사전 작성한 selection/cost manifest 없이는 transport를 열지 않는다.
