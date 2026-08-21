@@ -414,6 +414,33 @@ python scripts\prepare_historical_semantic_packets_v2.py `
   --output <new-v2-semantic-input>
 ```
 
+HUMAN 판정에서 축별 negative/positive 최소 5건이 부족하면 gate를 낮추지 않는다.
+원래 Natural/Balanced와 V1/DEV packet ID를 모두 제외한 outcome-blind 보충 후보를 만들고,
+보충 HUMAN 판정이 끝난 뒤 기존 결정과 합친다. `selection_hint`는 검토 라우팅일 뿐 gold가
+아니며 보충 후보도 반드시 HUMAN이 판정한다.
+
+```powershell
+python scripts\prepare_historical_locked_sets_v2.py prepare-supplement `
+  --packet-input <semantic-packets.jsonl> `
+  --base-candidate-build <base-v2-candidates> `
+  --prior-v1-input <v1-locked.jsonl> `
+  --dev-input <dev-packets.jsonl> `
+  --output <new-supplement-candidates>
+
+python scripts\prepare_historical_locked_sets_v2.py extend-candidates `
+  --base-candidate-build <base-v2-candidates> `
+  --supplemental-candidate-build <new-supplement-candidates> `
+  --output <new-extended-v2-candidates>
+
+python scripts\merge_historical_human_review_decisions_v2.py `
+  --input <base-human-decisions.json> `
+  --input <supplement-human-decisions.json> `
+  --output <new-merged-human-decisions.json>
+```
+
+세 명령은 입력 파일을 덮어쓰지 않고 새 output만 허용하며, packet 중복·해시 계보·
+`outcome_vault_opened=false`·`return_data_opened=false`를 검증한다.
+
 Outcome-blind coverage 진단 예시:
 
 ```powershell
