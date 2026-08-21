@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from pydantic import Field, model_validator
 
@@ -13,13 +14,12 @@ from moatrader.expectations.future_eri import OperatingEvidenceAxis
 from moatrader.expectations.historical_evidence import canonical_payload_sha256, sha256_file
 from moatrader.expectations.historical_evidence_v2 import (
     AxisApplicabilityV2,
-    GroundedAxisStateSnapshotV2,
     PITApplicabilityRulesV2,
     PITOperatingSnapshotV2,
+    PreviousEvidenceBasisV2,
     SparseAxisAvailabilityV2,
     SparseAxisEvidenceV2,
     build_deterministic_pit_axis_evidence,
-    build_last_grounded_axis_evidence,
 )
 from scripts.build_historical_sparse_features_v2 import (
     AxisApplicabilityDecisionInputV2,
@@ -44,22 +44,48 @@ class PITOperatingPairInputV2(ContractModel):
         return self
 
 
-class LastGroundedAxisPairInputV2(ContractModel):
-    schema_version: str = "moatrader-last-grounded-axis-pair-input-v2/1"
+class LastGroundedDeterministicBasisInputV2(ContractModel):
+    schema_version: str = "moatrader-last-grounded-deterministic-basis-v2/1"
     pair_id: str = Field(pattern=r"^PAIR_[0-9a-f]{24}$")
+    issuer_id: str = Field(pattern=r"^[0-9]{6}$")
     axis: OperatingEvidenceAxis
-    current: GroundedAxisStateSnapshotV2 | None = None
-    history: list[GroundedAxisStateSnapshotV2]
+    previous: PITOperatingSnapshotV2
+    current_fiscal_period_end: date
+    current_available_at: datetime
+    prior_age_days: int = Field(ge=0, le=450)
+    staleness_limit_days: Literal[450] = 450
     applicability_rule_id: str = Field(min_length=1)
-    outcome_data_accessed: bool = False
-    return_data_accessed: bool = False
+    selection_policy: Literal[
+        "LATEST_GROUNDABLE_PREVIOUS_FILING_WITHIN_450D"
+    ] = "LATEST_GROUNDABLE_PREVIOUS_FILING_WITHIN_450D"
+    current_evidence_carried_forward: Literal[False] = False
+    outcome_data_accessed: Literal[False] = False
+    return_data_accessed: Literal[False] = False
 
     @model_validator(mode="after")
-    def blind_input(self) -> "LastGroundedAxisPairInputV2":
-        if self.outcome_data_accessed or self.return_data_accessed:
-            raise ValueError("last-grounded input must be outcome and return blind")
-        if self.current is not None and self.current.axis != self.axis:
-            raise ValueError("last-grounded current evidence axis mismatch")
+    def valid_previous_basis(self) -> "LastGroundedDeterministicBasisInputV2":
+        if self.axis not in {
+            OperatingEvidenceAxis.MARGIN,
+            OperatingEvidenceAxis.INVENTORY_MISMATCH,
+            OperatingEvidenceAxis.BACKLOG,
+            OperatingEvidenceAxis.CAPACITY_CAPEX,
+        }:
+            raise ValueError("last-grounded deterministic basis supports only four numeric axes")
+        if self.previous.issuer_id != self.issuer_id:
+            raise ValueError("last-grounded previous basis issuer mismatch")
+        if self.current_available_at.tzinfo is None or self.current_available_at.utcoffset() is None:
+            raise ValueError("last-grounded current_available_at must be timezone-aware")
+        if self.previous.fiscal_period_end >= self.current_fiscal_period_end:
+            raise ValueError("last-grounded previous basis must precede the current fiscal period")
+        if self.previous.available_at >= self.current_available_at:
+            raise ValueError("last-grounded previous basis was not PIT-available before current")
+        expected_age = (
+            self.current_available_at.date() - self.previous.available_at.date()
+        ).days
+        if self.prior_age_days != expected_age:
+            raise ValueError("last-grounded prior_age_days does not match availability dates")
+        if self.prior_age_days > self.staleness_limit_days:
+            raise ValueError("last-grounded previous basis exceeds the 450-day limit")
         return self
 
 
@@ -100,7 +126,7 @@ def build_pit_evidence(
     if len({row.pair_id for row in pairs}) != len(pairs):
         raise ValueError("PIT operating pair IDs must be unique")
     last_rows = (
-        _read_jsonl(last_grounded_input, LastGroundedAxisPairInputV2)
+        _read_jsonl(last_grounded_input, LastGroundedDeterministicBasisInputV2)
         if last_grounded_input is not None
         else []
     )
@@ -120,15 +146,35 @@ def build_pit_evidence(
         for axis in OperatingEvidenceAxis:
             candidate: SparseAxisEvidenceV2 | None = pit.get(axis)
             last = last_by_key.get((pair.pair_id, axis))
-            if last is not None and (
-                candidate is None or candidate.availability == SparseAxisAvailabilityV2.NA
+            if last is not None and candidate is not None and (
+                candidate.availability == SparseAxisAvailabilityV2.NA
             ):
-                candidate = build_last_grounded_axis_evidence(
-                    current=last.current,
-                    history=last.history,
-                    staleness_limit_days=rules.last_grounded_staleness_days,
-                    applicability_rule_id=last.applicability_rule_id,
-                    axis=axis,
+                if last.issuer_id != pair.current.issuer_id:
+                    raise ValueError("last-grounded basis does not match pair issuer")
+                if last.current_fiscal_period_end != pair.current.fiscal_period_end:
+                    raise ValueError("last-grounded basis current period anchor mismatch")
+                if last.current_available_at != pair.current.available_at:
+                    raise ValueError("last-grounded basis current availability anchor mismatch")
+                if last.staleness_limit_days != rules.last_grounded_staleness_days:
+                    raise ValueError("last-grounded basis does not match the frozen staleness rule")
+                replacement = build_deterministic_pit_axis_evidence(
+                    previous=last.previous,
+                    current=pair.current,
+                    rules=rules,
+                )[axis]
+                if replacement.availability != SparseAxisAvailabilityV2.GROUNDED:
+                    raise ValueError(
+                        f"last-grounded basis cannot ground {pair.pair_id}/{axis.value}"
+                    )
+                candidate = replacement.model_copy(
+                    update={
+                        "previous_evidence_basis": (
+                            PreviousEvidenceBasisV2.LAST_GROUNDED_WITHIN_STALENESS
+                        ),
+                        "prior_age_days": last.prior_age_days,
+                        "staleness_limit_days": last.staleness_limit_days,
+                        "applicability_rule_id": last.applicability_rule_id,
+                    }
                 )
                 used_last.add((pair.pair_id, axis))
             if candidate is not None:
@@ -179,6 +225,11 @@ def build_pit_evidence(
         provenance = Counter(
             item.provenance.value for item in values if item.provenance is not None
         )
+        previous_basis = Counter(
+            item.previous_evidence_basis.value
+            for item in values
+            if item.previous_evidence_basis is not None
+        )
         metrics = Counter(
             item.deterministic_metric_name
             for item in values
@@ -199,6 +250,7 @@ def build_pit_evidence(
             "deterministic_extraction_failure": reasons["TABLE_EXTRACTION_FAIL"],
             "reason_distribution": dict(sorted(reasons.items())),
             "source_type_distribution": dict(sorted(provenance.items())),
+            "previous_evidence_basis_distribution": dict(sorted(previous_basis.items())),
             "deterministic_metric_distribution": dict(sorted(metrics.items())),
             "signed_score_role_distribution": dict(sorted(signed_score_roles.items())),
             "primary_signed_score_included": axis != OperatingEvidenceAxis.CAPACITY_CAPEX,
@@ -226,8 +278,12 @@ def build_pit_evidence(
         "deterministic_or_last_grounded_row_count": len(deterministic_rows),
         "applicability_row_count": len(applicability_rows),
         "last_grounded_row_count": len(used_last),
+        "last_grounded_row_count_by_axis": dict(
+            sorted(Counter(axis.value for _, axis in used_last).items())
+        ),
         "last_grounded_staleness_days": rules.last_grounded_staleness_days,
         "last_grounded_role": "PREVIOUS_COMPARISON_BASIS_ONLY_NEVER_CURRENT_EVIDENCE",
+        "current_evidence_carry_forward": False,
         "evidence_priority": [
             "DETERMINISTIC_NUMERIC",
             "STRUCTURED_TABLE",

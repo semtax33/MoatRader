@@ -51,6 +51,14 @@ from scripts.audit_historical_evidence_abstentions_v2 import (
     prepare_abstention_audit,
     validate_abstention_audit,
 )
+from scripts.audit_historical_deterministic_measurement_v2 import (
+    _direction as inventory_economic_direction,
+)
+from scripts.build_historical_deterministic_pit_evidence_v2 import (
+    LastGroundedDeterministicBasisInputV2,
+    PITOperatingPairInputV2,
+    build_pit_evidence,
+)
 from scripts.build_historical_sparse_features_v2 import (
     AxisApplicabilityDecisionInputV2,
     DeterministicAxisEvidenceInputV2,
@@ -73,6 +81,9 @@ from scripts.prepare_historical_deterministic_pit_inputs_v2 import (
     FilingTask,
     _extract_task,
     extract_pit_metrics_from_html,
+)
+from scripts.prepare_historical_last_grounded_inputs_v2 import (
+    prepare_last_grounded_inputs,
 )
 from scripts.prepare_historical_semantic_packets_v2 import prepare_semantic_packets
 
@@ -413,6 +424,59 @@ def test_pit_html_extractor_uses_current_cumulative_values_and_structured_backlo
     assert embedded_unit_metrics["operating_profit"] == D(100_000_000)
 
 
+def test_pit_html_extractor_ignores_row_indices_and_trailing_note_references() -> None:
+    metrics = extract_pit_metrics_from_html(
+        """
+        <html><body><p>(단위 : 백만원)</p>
+          <table><tbody>
+            <tr><td>(6)재고자산</td><td>50</td><td>45</td></tr>
+            <tr><td>(4)유형자산 (주11, 14)</td><td>200</td><td>180</td></tr>
+            <tr><td>자산총계</td><td>500</td><td>450</td></tr>
+          </tbody></table>
+          <table><tbody>
+            <tr><td>Ⅰ.매출액 (주34)</td><td>100</td><td>90</td></tr>
+            <tr><td>V.영업이익(손실) (주35)</td><td>10</td><td>8</td></tr>
+          </tbody></table>
+          <table><tbody>
+            <tr><td>(20)유형자산의 취득 (주14)</td><td>(30)</td><td>(25)</td></tr>
+            <tr><td>(21)무형자산의 취득 [주석 15]</td><td>(5)</td><td>(4)</td></tr>
+          </tbody></table>
+        </body></html>
+        """,
+        fiscal_period_end=date(2024, 12, 31),
+    )
+
+    assert metrics["revenue"] == D(100_000_000)
+    assert metrics["operating_profit"] == D(10_000_000)
+    assert metrics["inventory"] == D(50_000_000)
+    assert metrics["assets"] == D(500_000_000)
+    assert metrics["ppe"] == D(200_000_000)
+    assert metrics["capex"] == D(35_000_000)
+
+    exact_variant_metrics = extract_pit_metrics_from_html(
+        """
+        <html><body><table>
+          <tr><td>매출액 계</td><td>120</td></tr>
+          <tr><td>영업손익</td><td>(12)</td></tr>
+        </table></body></html>
+        """,
+        fiscal_period_end=date(2024, 12, 31),
+    )
+    duplicate_label_metrics = extract_pit_metrics_from_html(
+        """
+        <html><body><table>
+          <tr><td>매출액(매출액)</td><td>130</td></tr>
+          <tr><td>영업이익</td><td>13</td></tr>
+        </table></body></html>
+        """,
+        fiscal_period_end=date(2024, 12, 31),
+    )
+    assert exact_variant_metrics["revenue"] == D(120)
+    assert exact_variant_metrics["operating_profit"] == D(-12)
+    assert duplicate_label_metrics["revenue"] == D(130)
+    assert duplicate_label_metrics["operating_profit"] == D(13)
+
+
 def test_pit_filing_task_reads_all_arcana_sections_and_moatrader_original(
     tmp_path: Path,
 ) -> None:
@@ -546,6 +610,132 @@ def test_last_grounded_never_replaces_missing_current_evidence() -> None:
     assert result.availability == SparseAxisAvailabilityV2.NA
     assert result.direction is None
     assert result.abstention_reason == AbstentionReasonV2.TRUE_NO_MENTION
+
+
+def test_inventory_economic_polarity_is_inverted_from_raw_mismatch() -> None:
+    assert inventory_economic_direction(D("-0.051"), D("0.05")) == EvidenceState.IMPROVING
+    assert inventory_economic_direction(D("0.051"), D("0.05")) == EvidenceState.WEAKENING
+    assert inventory_economic_direction(D("0.05"), D("0.05")) == EvidenceState.STABLE
+
+
+def test_selection_2_uses_last_grounded_only_as_previous_numeric_basis(
+    tmp_path: Path,
+) -> None:
+    def snapshot(
+        *,
+        period: date,
+        available_at: datetime,
+        revenue: int,
+        inventory: int | None,
+    ) -> PITOperatingSnapshotV2:
+        values = {
+            "revenue": D(revenue),
+            "operating_profit": D(revenue) / D(10),
+            "inventory": D(inventory) if inventory is not None else None,
+            "assets": D(500),
+            "backlog": D(revenue),
+            "capex": D(20),
+            "ppe": D(200),
+        }
+        return PITOperatingSnapshotV2(
+            issuer_id="000001",
+            fiscal_period_end=period,
+            available_at=available_at,
+            source_ids={
+                metric: [f"SRC_{period.strftime('%Y%m%d')}_{metric}"]
+                for metric, value in values.items()
+                if value is not None
+            },
+            backlog_disclosed=True,
+            capacity_disclosed=True,
+            **values,
+        )
+
+    q1 = snapshot(
+        period=date(2023, 3, 31),
+        available_at=datetime(2023, 5, 15, 16, tzinfo=SEOUL),
+        revenue=100,
+        inventory=20,
+    )
+    q2 = snapshot(
+        period=date(2023, 6, 30),
+        available_at=datetime(2023, 8, 14, 16, tzinfo=SEOUL),
+        revenue=110,
+        inventory=None,
+    )
+    q3 = snapshot(
+        period=date(2023, 9, 30),
+        available_at=datetime(2023, 11, 14, 16, tzinfo=SEOUL),
+        revenue=130,
+        inventory=18,
+    )
+    pairs = [
+        PITOperatingPairInputV2(pair_id=f"PAIR_{1:024x}", previous=q1, current=q2),
+        PITOperatingPairInputV2(pair_id=f"PAIR_{2:024x}", previous=q2, current=q3),
+    ]
+    pair_input = tmp_path / "pit-pairs.jsonl"
+    pair_input.write_text(
+        "".join(pair.model_dump_json() + "\n" for pair in pairs),
+        encoding="utf-8",
+    )
+    rules_input = tmp_path / "rules.json"
+    rules_input.write_text(PITApplicabilityRulesV2().model_dump_json(), encoding="utf-8")
+    prepared_output = tmp_path / "last-grounded"
+    prepared = prepare_last_grounded_inputs(
+        pit_pair_input=pair_input,
+        rules_input=rules_input,
+        output=prepared_output,
+    )
+    last_input = prepared_output / "last-grounded-deterministic-bases.jsonl"
+    rows = [
+        LastGroundedDeterministicBasisInputV2.model_validate_json(line)
+        for line in last_input.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert prepared["recovered_count"] == 1
+    assert len(rows) == 1
+    assert rows[0].pair_id == pairs[1].pair_id
+    assert rows[0].axis == OperatingEvidenceAxis.INVENTORY_MISMATCH
+    assert rows[0].previous.fiscal_period_end == q1.fiscal_period_end
+    assert rows[0].current_evidence_carried_forward is False
+
+    evidence_output = tmp_path / "evidence"
+    stage = build_pit_evidence(
+        pit_pair_input=pair_input,
+        rules_input=rules_input,
+        last_grounded_input=last_input,
+        output=evidence_output,
+    )
+    evidence_rows = [
+        DeterministicAxisEvidenceInputV2.model_validate_json(line)
+        for line in (evidence_output / "deterministic-axis-evidence.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    recovered = next(
+        row.evidence
+        for row in evidence_rows
+        if row.pair_id == pairs[1].pair_id
+        and row.evidence.axis == OperatingEvidenceAxis.INVENTORY_MISMATCH
+    )
+    missing_current = next(
+        row.evidence
+        for row in evidence_rows
+        if row.pair_id == pairs[0].pair_id
+        and row.evidence.axis == OperatingEvidenceAxis.INVENTORY_MISMATCH
+    )
+
+    assert stage["last_grounded_row_count"] == 1
+    assert recovered.availability == SparseAxisAvailabilityV2.GROUNDED
+    assert recovered.previous_evidence_basis == (
+        PreviousEvidenceBasisV2.LAST_GROUNDED_WITHIN_STALENESS
+    )
+    assert recovered.previous_evidence_at == q1.available_at
+    assert recovered.current_evidence_at == q3.available_at
+    assert missing_current.availability == SparseAxisAvailabilityV2.NA
+    assert missing_current.direction is None
 
 
 def test_numeric_beats_table_and_llm_without_averaging() -> None:

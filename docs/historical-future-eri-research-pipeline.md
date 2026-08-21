@@ -337,15 +337,26 @@ count, coverage를 별도 필드로 보존한다. score와 coverage/confidence�
 2. `build_historical_deterministic_pit_evidence_v2.py`
    - 전체 43,752 pair에서 margin, inventory mismatch, backlog, capex/capacity 네 축을
      outcome-blind PIT 규칙으로 먼저 측정한다.
+   - PIT 입력 추출은 Arcana `business-info`, `finance-comment`, `finance-statement`와
+     MoatRader OpenDART original regular disclosure를 모두 읽고 원본 SHA-256을 검증한다.
+     DART 표 계정명의 선행 행 번호와 후행 주석 참조는 표시 메타데이터로만 제거하며,
+     계정 의미 자체를 넓혀 매칭하지 않는다.
    - 축별 applicable, grounded, -1/0/+1, NA, N/A, stale, extraction failure와 reason/source
      분포를 저장한다.
    - provenance 우선순위는
      `DETERMINISTIC_NUMERIC > STRUCTURED_TABLE > LLM_NARRATIVE`이며 평균하지 않는다.
+   - deterministic primary SignedBreadth/Nobs는 `MARGIN`, `INVENTORY_MISMATCH`,
+     `BACKLOG` 세 축만 사용한다. `CAPACITY_CAPEX`는 raw investment-direction 진단이고
+     primary signed score에 포함하지 않는다.
+   - 선택 2는 `prepare_historical_last_grounded_inputs_v2.py`로 현재 증거가 존재하는
+     deterministic NA 행에 한해 가장 최근의 groundable 이전 공시를 최대 450일까지
+     비교 기준으로 구성한다. 현재 증거를 과거 값으로 이월하지 않으며 outcome, return,
+     ERI, Value를 열지 않는다.
 3. `prepare_historical_locked_sets_v2.py`와
    `evaluate_historical_evidence_parser_v2.py`
    - 기존 V1/DEV packet ID를 명시적으로 제외한 새 Natural-frequency LOCKED와 별도
      directional-balanced LOCKED를 만든다.
-   - semantic parser 축 Demand, Price/Mix, Capacity/Capex 각각에 Balanced
+   - semantic parser 축 Demand, Price/Mix 각각에 Balanced
      negative/neutral/positive/insufficient/ambiguous를 최소 5건씩 요구한다.
    - 두 세트는 상호 비중복 single-use이며 human neutral → machine bullish 편향도 gate한다.
 4. `audit_historical_evidence_abstentions_v2.py`
@@ -356,8 +367,8 @@ count, coverage를 별도 필드로 보존한다. score와 coverage/confidence�
    - retrieval/table/period upstream failure rate를 별도 gate하여 sparse 설계 문제처럼
      숨기지 않는다.
 5. `prepare_historical_semantic_packets_v2.py`
-   - 모든 43,752×6 packet을 LLM에 보내지 않는다. 기본은 Demand, Price/Mix와
-     deterministic Capacity/Capex가 NA인 fallback만 선택한다.
+   - 모든 43,752×6 packet을 LLM에 보내지 않는다. semantic 대상은 Demand와
+     Price/Mix만 선택한다. Capacity/Capex는 deterministic raw 진단으로 유지한다.
    - deterministic grounded 또는 N/A 결과는 semantic parser가 덮어쓰지 않는다.
 6. `build_historical_sparse_features_v2.py`
    - 모든 filing pair를 보존하고 미분류/abstained 축은 `NA`로 둔다.

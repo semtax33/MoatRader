@@ -29,13 +29,25 @@ D = Decimal
 _XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*\?>", re.I)
 _SPACE_RE = re.compile(r"\s+")
 _NON_LABEL_RE = re.compile(r"[\s\u3000ㆍ·:：.,_\-/]")
+_LEADING_ROW_INDEX_RE = re.compile(
+    r"^(?:(?:\(\s*\d+\s*\)|\d+\s*[.)]|[IVXLCDMⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ]+\s*[.)])\s*)+",
+    re.I,
+)
+_TRAILING_NOTE_REFERENCE_RE = re.compile(
+    r"\s*[\[(]\s*(?:주|주석|note)\s*\d+(?:\s*[,;]\s*\d+)*\s*[])]\s*$",
+    re.I,
+)
 _NUMBER_RE = re.compile(r"^\(?-?\d[\d,]*(?:\.\d+)?\)?$")
 _UNIT_RE = re.compile(r"단위\s*[:：]?\s*(백만원|천원|억원|원)", re.I)
 _CAPACITY_RE = re.compile(r"생산능력|생산설비|설비능력|증설|공장|CAPA|capacity", re.I)
 _BACKLOG_RE = re.compile(r"수주잔고|계약잔액|기말수주잔고|잔여계약", re.I)
 _TOTAL_RE = re.compile(r"합계|총계")
-_REVENUE_RE = re.compile(r"^(?:수익\(?매출액\)?|매출액|매출|영업수익|수익)$")
-_OPERATING_PROFIT_RE = re.compile(r"^(?:영업이익(?:\(?손실\)?)?|영업손실)$")
+_REVENUE_RE = re.compile(
+    r"^(?:수익\(?매출액\)?|매출액(?:계|\(매출액\))?|매출|영업수익|수익)$"
+)
+_OPERATING_PROFIT_RE = re.compile(
+    r"^(?:영업이익(?:\(?손실\)?)?|영업손실|영업손익)$"
+)
 _INVENTORY_RE = re.compile(r"^(?:재고자산|유동재고자산)$")
 _ASSETS_RE = re.compile(r"^자산총계$")
 _PPE_RE = re.compile(r"^유형자산$")
@@ -90,7 +102,13 @@ def _text(element: etree._Element) -> str:
 
 
 def _label(value: str) -> str:
-    return _NON_LABEL_RE.sub("", value)
+    # DART table rows commonly decorate canonical account names with a display
+    # index ("Ⅰ.", "III.", "(6)") and/or a trailing note reference.  Those
+    # decorations are presentation metadata, not part of the accounting label.
+    # Strip only those anchored forms so concept matching remains conservative.
+    without_index = _LEADING_ROW_INDEX_RE.sub("", value.strip())
+    without_note = _TRAILING_NOTE_REFERENCE_RE.sub("", without_index)
+    return _NON_LABEL_RE.sub("", without_note)
 
 
 def _number(value: str) -> Decimal | None:
