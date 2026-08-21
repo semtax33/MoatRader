@@ -4,14 +4,21 @@ import csv
 import hashlib
 import json
 import zipfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from moatrader.expectations.future_eri import EvidenceState, OperatingEvidenceAxis
+from moatrader.expectations.future_eri import (
+    CurrentExpectationStateV1,
+    EvidenceState,
+    FutureEriOutcomeInputV1,
+    OperatingEvidenceAxis,
+    RealizedFcffStateV1,
+    target_trading_session,
+)
 from moatrader.expectations.historical_evidence import (
     AxisClassificationStatus,
     AxisPairClassification,
@@ -53,9 +60,13 @@ from moatrader.expectations.historical_evidence_v2 import (
     sparse_band_diagnostics_v2,
     sparse_feature_coverage_report,
 )
+from moatrader.valuation.assumptions import EconomicDcfAssumptions
 from scripts.audit_historical_evidence_abstentions_v2 import (
     prepare_abstention_audit,
     validate_abstention_audit,
+)
+from scripts.audit_historical_future_eri_outcome_eligibility import (
+    OutcomeEligibilityInventoryRowV1,
 )
 from scripts.audit_historical_deterministic_measurement_v2 import (
     _direction as inventory_economic_direction,
@@ -71,6 +82,7 @@ from scripts.build_historical_sparse_features_v2 import (
     build_sparse_features,
 )
 from scripts.calibrate_historical_sparse_features_v2 import calibrate_sparse_features
+from scripts.classify_historical_future_eri_evidence import ParserProfile, parser_spec
 from scripts.evaluate_historical_evidence_parser_v2 import (
     combine_v2_locked_evaluations,
     create_v2_parser_freeze,
@@ -83,8 +95,11 @@ from scripts.seal_historical_full_evidence_index_v2 import (
     full_evidence_index_diagnostics_v2,
     seal_full_evidence_index_v2,
 )
+from scripts.run_historical_evidence_index_eri_v2 import run_evidence_index_eri_v2
 from scripts.prepare_historical_evidence_classification_subset import prepare_subset
 from scripts.prepare_historical_locked_sets_v2 import (
+    _classification,
+    _review_row_is_blank,
     finalize_locked_sets,
     prepare_locked_candidates,
 )
@@ -534,6 +549,390 @@ def test_full_index_seal_fails_before_features_when_dual_locked_gate_has_not_pas
             dry_run=True,
         )
     assert not (tmp_path / "full-seal").exists()
+
+
+def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
+    tmp_path: Path,
+) -> None:
+    sparse_rows = [
+        _breadth_row(201, (EvidenceState.WEAKENING, EvidenceState.WEAKENING)),
+        _breadth_row(202, (EvidenceState.WEAKENING, EvidenceState.STABLE)),
+        _breadth_row(203, (EvidenceState.STABLE, EvidenceState.STABLE)),
+        _breadth_row(204, (EvidenceState.IMPROVING, EvidenceState.STABLE)),
+        _breadth_row(205, (EvidenceState.IMPROVING, EvidenceState.IMPROVING)),
+    ]
+    sparse_input = tmp_path / "sparse-features.jsonl"
+    sparse_input.write_text(
+        "".join(row.model_dump_json() + "\n" for row in sparse_rows),
+        encoding="utf-8",
+    )
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
+    classification_sha = "c" * 64
+    packet_sha = "b" * 64
+
+    def write_manifest(name: str, payload: dict[str, object]) -> Path:
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    sparse_manifest = write_manifest(
+        "sparse-stage",
+        {
+            "status": "SPARSE_FEATURES_BUILT_AWAITING_OUTCOME_BLIND_CALIBRATION",
+            "pair_count": len(sparse_rows),
+            "parser_directional_validation_passed": True,
+            "missing_is_neutral": False,
+            "deterministic_pit_priority_applied": True,
+            "input_hashes": {
+                "sparse_features": sha256_file(sparse_input),
+                "classifications": classification_sha,
+            },
+        },
+    )
+    locked_manifest = write_manifest(
+        "dual-locked",
+        {
+            "status": "V2_LOCKED_TESTS_PASSED",
+            "natural_frequency_gate_passed": True,
+            "directional_strata_gate_passed": True,
+            "parser_version": spec.parser_version,
+            "prompt_sha256": spec.prompt_sha256,
+            "requested_model": "gpt-5.6-luna",
+        },
+    )
+    classification_manifest = write_manifest(
+        "classification-stage",
+        {
+            "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+            "parser_profile": spec.profile.value,
+            "parser_version": spec.parser_version,
+            "prompt_sha256": spec.prompt_sha256,
+            "requested_model": "gpt-5.6-luna",
+            "classification_count": 5,
+            "packet_count": 5,
+            "input_blinded_packet_sha256": packet_sha,
+            "classification_sha256": classification_sha,
+        },
+    )
+    selection_manifest = write_manifest(
+        "semantic-selection",
+        {"output_packet_sha256": packet_sha, "selected_packet_count": 5},
+    )
+    cost_manifest = write_manifest(
+        "cost",
+        {
+            "status": "FULL_SEMANTIC_RUN_COST_PRESPECIFIED_NO_EXTERNAL_CALL",
+            "api_calls_executed": False,
+            "parser_profile": spec.profile.value,
+            "parser_version": spec.parser_version,
+            "prompt_sha256": spec.prompt_sha256,
+            "model": "gpt-5.6-luna",
+            "exact_packet_count": 5,
+        },
+    )
+    core_manifest = write_manifest(
+        "core",
+        {
+            "status": "V2_EVIDENCE_INDEX_CONTRACT_FROZEN_OUTCOMES_CLOSED",
+            "deterministic_core_materialized": True,
+            "per_pbr_role": "NOT_USED",
+            "source_provenance_gate": {
+                "arcana_business_info_read": True,
+                "arcana_finance_comment_read": True,
+                "arcana_finance_statement_read": True,
+                "moatrader_original_regular_filings_read": True,
+                "all_expected_source_paths_verified": True,
+                "source_files_modified": False,
+            },
+        },
+    )
+    output = tmp_path / "full-seal"
+    status = seal_full_evidence_index_v2(
+        workspace=Path.cwd(),
+        sparse_feature_input=sparse_input,
+        sparse_stage_manifest=sparse_manifest,
+        dual_locked_manifest=locked_manifest,
+        semantic_classification_stage_manifest=classification_manifest,
+        semantic_selection_manifest=selection_manifest,
+        cost_manifest=cost_manifest,
+        core_pre_outcome_manifest=core_manifest,
+        output=output,
+        seal_tag="SYNTHETIC_SUCCESS_PATH",
+        dry_run=True,
+        coverage_policy=FullEvidenceIndexCoveragePolicyV2(
+            minimum_rows_per_band=1,
+            minimum_unique_issuers_per_band=1,
+            minimum_unique_signal_months_per_band=1,
+            minimum_total_unique_issuers=5,
+            minimum_total_unique_signal_months=1,
+            maximum_top_issuer_share_per_band=D(1),
+            maximum_top_month_share_per_band=D(1),
+            maximum_top_year_share_per_band=D(1),
+        ),
+    )
+
+    assert status["status"] == (
+        "DRY_RUN_V2_FULL_EVIDENCE_INDEX_VALIDATED_OUTCOMES_CLOSED"
+    )
+    assert status["full_index_materialized"] is True
+    assert status["coverage_gate_passed"] is True
+    assert status["outcome_stage_authorized"] is False
+    assert status["primary_index"] == "FULL_EVIDENCE_SIGNED_BREADTH_V2"
+    assert status["secondary_index"] == "DETERMINISTIC_CORE_SIGNED_BREADTH_V2"
+    assert status["capex_included"] is False
+    assert status["per_pbr_role"] == "NOT_USED"
+    assert status["future_eri_role"] == "DOWNSTREAM_OUTCOME_ONLY_NOT_SIGNAL_OR_RANKING"
+    assert (output / "full-evidence-index-eligible-nobs2.jsonl").is_file()
+
+
+def test_t63_runner_opens_outcomes_only_after_full_primary_and_core_secondary_seals(
+    tmp_path: Path,
+) -> None:
+    direction_rows = (
+        (EvidenceState.WEAKENING,) * 5,
+        (
+            EvidenceState.WEAKENING,
+            EvidenceState.WEAKENING,
+            EvidenceState.WEAKENING,
+            EvidenceState.STABLE,
+            EvidenceState.STABLE,
+        ),
+        (
+            EvidenceState.WEAKENING,
+            EvidenceState.IMPROVING,
+            EvidenceState.WEAKENING,
+            EvidenceState.IMPROVING,
+            EvidenceState.STABLE,
+        ),
+        (
+            EvidenceState.IMPROVING,
+            EvidenceState.IMPROVING,
+            EvidenceState.IMPROVING,
+            EvidenceState.STABLE,
+            EvidenceState.STABLE,
+        ),
+        (EvidenceState.IMPROVING,) * 5,
+    )
+    core_directions = (
+        (EvidenceState.WEAKENING,) * 3,
+        (EvidenceState.WEAKENING, EvidenceState.WEAKENING, EvidenceState.STABLE),
+        (EvidenceState.WEAKENING, EvidenceState.IMPROVING, EvidenceState.STABLE),
+        (EvidenceState.IMPROVING, EvidenceState.IMPROVING, EvidenceState.STABLE),
+        (EvidenceState.IMPROVING,) * 3,
+    )
+    full_rows = [
+        _full_row(index, directions)
+        for index, directions in zip(range(301, 306), direction_rows, strict=True)
+    ]
+    core_rows = [
+        _core_row(index, directions)
+        for index, directions in zip(range(301, 306), core_directions, strict=True)
+    ]
+    assert [row.band.value for row in full_rows] == [
+        "STRONG_BEAR",
+        "BEAR",
+        "NEUTRAL",
+        "BULL",
+        "STRONG_BULL",
+    ]
+    assert [row.band.value for row in core_rows] == [
+        "STRONG_BEAR",
+        "BEAR",
+        "NEUTRAL",
+        "BULL",
+        "STRONG_BULL",
+    ]
+
+    def write_jsonl(path: Path, rows: list[object]) -> None:
+        path.write_text(
+            "".join(
+                json.dumps(
+                    row.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+                for row in rows
+            ),
+            encoding="utf-8",
+        )
+
+    full_build = tmp_path / "full-index"
+    core_build = tmp_path / "core-index"
+    full_build.mkdir()
+    core_build.mkdir()
+    full_path = full_build / "full-evidence-index-eligible-nobs2.jsonl"
+    core_path = core_build / "deterministic-core-index-eligible-nobs2.jsonl"
+    write_jsonl(full_path, full_rows)
+    write_jsonl(core_path, core_rows)
+    core_manifest_path = core_build / "pre-outcome-index-manifest.json"
+    core_manifest_path.write_text(
+        json.dumps(
+            {
+                "status": "V2_EVIDENCE_INDEX_CONTRACT_FROZEN_OUTCOMES_CLOSED",
+                "deterministic_core_materialized": True,
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "per_pbr_role": "NOT_USED",
+                "artifact_hashes": {
+                    "deterministic_core_index_eligible_nobs2": sha256_file(core_path)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    full_seal_path = full_build / "full-evidence-index-seal.json"
+    full_seal_path.write_text(
+        json.dumps(
+            {
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "per_pbr_role": "NOT_USED",
+                "artifact_hashes": {
+                    "full_evidence_index_eligible_nobs2": sha256_file(full_path)
+                },
+                "input_hashes": {
+                    "core_pre_outcome_manifest": sha256_file(core_manifest_path)
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (full_build / "stage-status.json").write_text(
+        json.dumps(
+            {
+                "status": "V2_FULL_EVIDENCE_INDEX_SEALED_OUTCOMES_CLOSED",
+                "outcome_stage_authorized": True,
+                "full_index_materialized": True,
+                "coverage_gate_passed": True,
+                "semantic_parser_gate_passed": True,
+                "full_evidence_index_seal_sha256": sha256_file(full_seal_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assumptions = EconomicDcfAssumptions(
+        base_period="2020Q2",
+        base_revenue=D("1000"),
+        base_nopat_margin=D("0.10"),
+        base_invested_capital=D("800"),
+        revenue_growth=D("0.08"),
+        target_nopat_margin=D("0.12"),
+        roiic=D("0.20"),
+        competitive_advantage_period_years=6,
+        fade_years=4,
+        explicit_forecast_years=10,
+        stable_growth=D("0.025"),
+        stable_nopat_margin=D("0.10"),
+        stable_roic=D("0.12"),
+        wacc=D("0.09"),
+        net_debt=D("100"),
+        diluted_shares=D("10"),
+    )
+    session_dates = [full_rows[0].signal_timestamp.date() + timedelta(days=i) for i in range(100)]
+    target = target_trading_session(full_rows[0].signal_timestamp.date(), session_dates)
+    target_price_at = datetime.combine(target, time(15, 30), tzinfo=SEOUL)
+    realized_at = datetime.combine(target, time(8, 0), tzinfo=SEOUL)
+    expectations: list[dict[str, object]] = []
+    inventory: list[OutcomeEligibilityInventoryRowV1] = []
+    outcomes: list[FutureEriOutcomeInputV1] = []
+    for rank, row in enumerate(full_rows, start=1):
+        expectations.append(
+            {
+                "observation_id": row.observation_id,
+                "expectation_state": CurrentExpectationStateV1(
+                    issuer_id=row.issuer_id,
+                    signal_timestamp=row.signal_timestamp,
+                    market_price=D("100"),
+                    market_price_at=row.signal_timestamp,
+                    market_price_source_id=f"KRX:{row.issuer_id}:SIGNAL",
+                    implied_growth=D("0.08"),
+                    implied_margin=D("0.12"),
+                    implied_roiic=D("0.20"),
+                    implied_cap_years=D("6"),
+                    reverse_dcf_method="FCFF_FROZEN_PATH_V1",
+                    reverse_dcf_input_sha256=f"{rank:x}" * 64,
+                ).model_dump(mode="json"),
+                "frozen_expectation_assumptions": assumptions.model_dump(mode="json"),
+            }
+        )
+        inventory.append(
+            OutcomeEligibilityInventoryRowV1(
+                observation_id=row.observation_id,
+                target_session=target,
+                target_price_at=target_price_at,
+                target_price_source_id=f"KRX:{row.issuer_id}:{target}:CLOSE",
+                realized_financials_available_at=realized_at,
+                realized_financial_source_ids=[f"DART:{row.issuer_id}:2020Q3"],
+                net_debt_source_id=f"DART:{row.issuer_id}:NET_DEBT",
+                diluted_shares_source_id=f"DART:{row.issuer_id}:SHARES",
+                wacc_source_id="FROZEN_WACC_POLICY",
+            )
+        )
+        outcomes.append(
+            FutureEriOutcomeInputV1(
+                observation_id=row.observation_id,
+                target_session=target,
+                target_price_at=target_price_at,
+                actual_market_price=D(80 + rank * 10),
+                target_price_source_id=f"KRX:{row.issuer_id}:{target}:CLOSE",
+                realized_state=RealizedFcffStateV1(
+                    available_at=realized_at,
+                    base_period="2020Q3",
+                    base_revenue=D("1040"),
+                    base_nopat_margin=D("0.11"),
+                    base_invested_capital=D("820"),
+                    net_debt=D("90"),
+                    diluted_shares=D("10"),
+                    wacc=D("0.085"),
+                    wacc_source_id="FROZEN_WACC_POLICY",
+                    source_document_ids=[f"DART:{row.issuer_id}:2020Q3"],
+                ),
+            )
+        )
+
+    expectation_path = tmp_path / "expectations.jsonl"
+    expectation_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in expectations),
+        encoding="utf-8",
+    )
+    inventory_path = tmp_path / "eligibility.jsonl"
+    outcome_path = tmp_path / "outcomes.jsonl"
+    write_jsonl(inventory_path, inventory)
+    write_jsonl(outcome_path, outcomes)
+    sessions_path = tmp_path / "sessions.json"
+    sessions_path.write_text(
+        json.dumps([value.isoformat() for value in session_dates]),
+        encoding="utf-8",
+    )
+    output = tmp_path / "t63-result"
+    status = run_evidence_index_eri_v2(
+        full_index_build=full_build,
+        core_index_build=core_build,
+        expectation_input=expectation_path,
+        eligibility_inventory_input=inventory_path,
+        outcome_input=outcome_path,
+        trading_sessions_path=sessions_path,
+        output=output,
+        minimum_observations_per_band=1,
+        hac_lag_months=1,
+    )
+
+    assert status["label_count"] == 5
+    assert status["common_full_core_panel"] is True
+    assert status["primary_endpoint"] == "FULL_EVIDENCE_INDEX_TO_FUTURE_ERI_T63"
+    assert status["secondary_endpoint"] == "CORE_EVIDENCE_INDEX_TO_FUTURE_ERI_T63"
+    assert status["outcome_vault_opened"] is True
+    assert status["future_eri_used_as_signal"] is False
+    assert status["future_eri_used_as_ranking"] is False
+    assert status["return_data_opened"] is False
+    assert status["per_pbr_role"] == "NOT_USED"
+    build_manifest = json.loads((output / "build-manifest.json").read_text(encoding="utf-8"))
+    assert build_manifest["outcome_opened_only_after_common_feature_seal"] is True
+    assert (output / "feature-seal-pre-outcome.json").is_file()
 
 
 def test_deterministic_core_diagnostics_report_all_fixed_bands() -> None:
@@ -1853,6 +2252,33 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
     assert parser_freeze["locked_set_preparation_manifest_sha256"] == sha256_file(
         final / "locked-set-preparation-manifest.json"
     )
+
+
+def test_human_review_rows_distinguish_unreviewed_candidates_from_abstentions() -> None:
+    assert _review_row_is_blank({"packet_id": "candidate", "human_status": ""}) is True
+    assert (
+        _review_row_is_blank(
+            {
+                "packet_id": "candidate",
+                "human_status": "INSUFFICIENT_EVIDENCE",
+                "reviewer": "HUMAN",
+            }
+        )
+        is False
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="must leave every state/source field blank",
+    ):
+        _classification(
+            {
+                "packet_id": "candidate",
+                "axis": "DEMAND",
+                "human_status": "AMBIGUOUS",
+                "human_previous_source_id": "SRC_must_not_survive_abstention",
+            }
+        )
 
 
 def test_abstention_reason_audit_requires_200_grounded_human_reasons(tmp_path: Path) -> None:

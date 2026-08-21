@@ -46,6 +46,20 @@ GOLD_FIELDS = (
     "reviewer",
     "review_notes",
 )
+HUMAN_EVIDENCE_FIELDS = (
+    "human_previous_state",
+    "human_current_state",
+    "human_previous_source_id",
+    "human_current_source_id",
+    "human_previous_source_span",
+    "human_current_source_span",
+)
+HUMAN_REVIEW_FIELDS = (
+    "human_status",
+    *HUMAN_EVIDENCE_FIELDS,
+    "reviewer",
+    "review_notes",
+)
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -428,6 +442,12 @@ def prepare_locked_candidates(
 
 def _classification(row: dict[str, str]) -> AxisPairClassification:
     status = AxisClassificationStatus(str(row.get("human_status") or "").strip())
+    if status != AxisClassificationStatus.COMPLETE and any(
+        str(row.get(name) or "").strip() for name in HUMAN_EVIDENCE_FIELDS
+    ):
+        raise ValueError(
+            "INSUFFICIENT_EVIDENCE and AMBIGUOUS rows must leave every state/source field blank"
+        )
     payload: dict[str, Any] = {
         "packet_id": str(row.get("packet_id") or "").strip(),
         "axis": str(row.get("axis") or "").strip(),
@@ -444,6 +464,10 @@ def _classification(row: dict[str, str]) -> AxisPairClassification:
             current_source_span=str(row.get("human_current_source_span") or "").strip(),
         )
     return AxisPairClassification.model_validate(payload)
+
+
+def _review_row_is_blank(row: dict[str, str]) -> bool:
+    return not any(str(row.get(field) or "").strip() for field in HUMAN_REVIEW_FIELDS)
 
 
 def _stratum(value: AxisPairClassification) -> str:
@@ -495,6 +519,8 @@ def finalize_locked_sets(
         for number, raw in enumerate(csv.DictReader(handle), start=2):
             packet_id = str(raw.get("packet_id") or "").strip()
             if packet_id not in packet_lookup:
+                continue
+            if _review_row_is_blank(raw):
                 continue
             if packet_id in human_rows:
                 raise ValueError(f"duplicate human gold packet ID at row {number}: {packet_id}")
