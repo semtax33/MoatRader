@@ -485,6 +485,7 @@ def build_sparse_features(
         "measurement_contract_frozen": measurement_contract.get("status")
         == "V2_PRE_OUTCOME_CONTRACT_FROZEN",
         "input_hashes": {
+            "sparse_features": sha256_file(feature_path),
             "filing_pairs": sha256_file(pair_path),
             "blinded_packets": sha256_file(packet_path),
             "classifications": sha256_file(classification_path),

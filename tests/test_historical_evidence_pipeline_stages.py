@@ -18,10 +18,15 @@ from moatrader.expectations.historical_evidence import (
 from moatrader.llm import FunctionTransport
 from scripts.classify_historical_future_eri_evidence import (
     AxisPairClassificationPayload,
+    ParserProfile,
+    SEMANTIC_PARSER_VERSION_V2,
+    SEMANTIC_PROMPT_SHA256_V2,
+    build_request,
     run as run_classifier,
 )
 from scripts.evaluate_historical_evidence_parser import evaluate_parser
 from scripts.prepare_historical_evidence_classification_subset import prepare_subset
+from scripts.prepare_historical_semantic_cost_manifest_v2 import prepare_cost_manifest
 from scripts.seal_historical_future_eri_features import evaluate_human_gold_quality
 
 
@@ -86,6 +91,55 @@ def test_classifier_runs_packet_subset_concurrently_and_replays_without_key(
     assert second["classification_count"] == 6
     assert second["usage"]["input_tokens"] == 0
     assert [item["packet_id"] for item in stored] == [packet.packet_id for packet in packets]
+
+
+def test_semantic_v2_profile_is_demand_price_mix_only_and_never_defaults_na_to_zero(
+    tmp_path: Path,
+) -> None:
+    demand = _packet(1, OperatingEvidenceAxis.DEMAND)
+    request = build_request(
+        demand,
+        parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+    )
+
+    assert request.metadata["parser_version"] == SEMANTIC_PARSER_VERSION_V2
+    assert "Missing is NA, never neutral" in request.system
+    assert "current_state minus previous_state" in request.system
+    assert "Revenue alone is not demand" in request.system
+    assert "Pricing policy" in request.system
+    assert request.prompt_cache_key == "moatrader:historical-demand-price-mix-v2-0"
+
+    with pytest.raises(ValueError, match="only Demand and PriceMix"):
+        build_request(
+            _packet(2, OperatingEvidenceAxis.MARGIN),
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+        )
+
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(packet_input, [demand, _packet(3, OperatingEvidenceAxis.PRICE_MIX)])
+    status = run_classifier(
+        input_build=tmp_path,
+        packet_input=packet_input,
+        output=tmp_path / "semantic-prep",
+        parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+    )
+    assert status["parser_profile"] == ParserProfile.DEMAND_PRICE_MIX_V2.value
+    assert status["parser_version"] == SEMANTIC_PARSER_VERSION_V2
+    assert status["prompt_sha256"] == SEMANTIC_PROMPT_SHA256_V2
+    assert status["outcome_vault_opened"] is False
+
+
+def test_semantic_v2_profile_rejects_nonsemantic_packet_file(tmp_path: Path) -> None:
+    packet_input = tmp_path / "forbidden.jsonl"
+    _write_packets(packet_input, [_packet(1, OperatingEvidenceAxis.BACKLOG)])
+
+    with pytest.raises(ValueError, match="forbidden axis"):
+        run_classifier(
+            input_build=tmp_path,
+            packet_input=packet_input,
+            output=tmp_path / "semantic-prep",
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+        )
 
 
 def test_classifier_retries_non_verbatim_grounding_before_cache(tmp_path: Path) -> None:
@@ -452,6 +506,101 @@ def _write_packets(path: Path, packets: list[PairedAxisPacket]) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
+    tmp_path: Path,
+) -> None:
+    packet_input = tmp_path / "semantic.jsonl"
+    packets = [
+        _packet(1, OperatingEvidenceAxis.DEMAND),
+        _packet(2, OperatingEvidenceAxis.PRICE_MIX),
+    ]
+    _write_packets(packet_input, packets)
+    selection = tmp_path / "semantic.jsonl.manifest.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected_packet_count": 2,
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pilot_paths: list[Path] = []
+    for index in range(2):
+        path = tmp_path / f"pilot-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+                    "packet_count": 1,
+                    "classification_count": 1,
+                    "parser_version": "pilot-v1",
+                    "prompt_sha256": "a" * 64,
+                    "requested_model": "gpt-5.6-luna",
+                    "outcome_vault_opened": False,
+                    "return_data_opened": False,
+                    "credentials_persisted": False,
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 20,
+                        "cache_write_tokens": 10,
+                        "output_tokens": 30,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        pilot_paths.append(path)
+
+    result = prepare_cost_manifest(
+        semantic_packet_input=packet_input,
+        semantic_selection_manifest=selection,
+        pilot_stage_manifests=pilot_paths,
+        output=tmp_path / "cost.json",
+    )
+
+    assert result["exact_expected_api_calls_without_retries"] == 2
+    assert result["axis_counts"] == {"DEMAND": 1, "PRICE_MIX": 1}
+    assert result["parser_profile"] == "DEMAND_PRICE_MIX_V2"
+    assert result["token_estimation"]["expected_tokens"] == {
+        "input_tokens": 200,
+        "cached_input_tokens": 40,
+        "cache_write_tokens": 20,
+        "output_tokens": 60,
+    }
+    assert result["pricing"]["expected_cost"]["total"] == "0.000106"
+    assert result["api_calls_executed"] is False
+    assert result["outcome_vault_opened"] is False
+    assert result["per_pbr_role"] == "NOT_USED"
+
+
+def test_semantic_cost_manifest_rejects_nonsemantic_axis(tmp_path: Path) -> None:
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(packet_input, [_packet(1, OperatingEvidenceAxis.MARGIN)])
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected_packet_count": 1,
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="only Demand and PriceMix"):
+        prepare_cost_manifest(
+            semantic_packet_input=packet_input,
+            semantic_selection_manifest=selection,
+            pilot_stage_manifests=[tmp_path / "missing-a", tmp_path / "missing-b"],
+            output=tmp_path / "cost.json",
+        )
 
 
 def test_gold_subset_is_exactly_twenty_per_axis(tmp_path: Path) -> None:

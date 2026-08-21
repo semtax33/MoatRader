@@ -387,6 +387,72 @@ class FutureEriFeatureRowV1(ContractModel):
         return self
 
 
+class EvidenceIndexFutureEriFeatureRowV2(ContractModel):
+    schema_version: str = "moatrader-evidence-index-future-eri-feature-v2/1"
+    observation_id: str = Field(min_length=1)
+    issuer_id: str = Field(min_length=1)
+    signal_timestamp: datetime
+    full_evidence_index: Decimal = Field(ge=-1, le=1)
+    full_nobs: int = Field(ge=2, le=5)
+    core_evidence_index: Decimal = Field(ge=-1, le=1)
+    core_nobs: int = Field(ge=2, le=3)
+    full_index_row_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    core_index_row_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    full_index_seal_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expectation_state: CurrentExpectationStateV1
+    frozen_expectation_assumptions: EconomicDcfAssumptions
+    downstream_outcome_role: Literal["EVIDENCE_INDEX_PREDICTS_T63_ERI"] = (
+        "EVIDENCE_INDEX_PREDICTS_T63_ERI"
+    )
+    outcome_value_used_as_signal: Literal[False] = False
+    outcome_value_used_as_ranking: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    per_pbr_role: Literal["NOT_USED"] = "NOT_USED"
+
+    @model_validator(mode="after")
+    def one_point_in_time_index_state(self) -> "EvidenceIndexFutureEriFeatureRowV2":
+        _aware(self.signal_timestamp, field="signal_timestamp")
+        if self.issuer_id != self.expectation_state.issuer_id:
+            raise ValueError("Evidence Index and expectation state issuer mismatch")
+        if self.signal_timestamp != self.expectation_state.signal_timestamp:
+            raise ValueError("Evidence Index and expectation state signal mismatch")
+        expected = self.expectation_state
+        frozen = self.frozen_expectation_assumptions
+        if (
+            expected.implied_growth != frozen.revenue_growth
+            or expected.implied_margin != frozen.target_nopat_margin
+            or expected.implied_roiic != frozen.roiic
+            or expected.implied_cap_years != D(frozen.competitive_advantage_period_years)
+        ):
+            raise ValueError("frozen DCF path must match the current implied expectation state")
+        return self
+
+
+class EvidenceIndexFeatureDatasetSealV2(ContractModel):
+    schema_version: str = "moatrader-evidence-index-future-eri-feature-seal-v2/1"
+    sealed_at: datetime
+    feature_count: int = Field(gt=0)
+    observation_ids: list[str] = Field(min_length=1)
+    feature_dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    feature_row_sha256: dict[str, str]
+    full_index_seal_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome_source_opened_before_seal: Literal[False] = False
+    forbidden_outcome_fields_present: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    per_pbr_role: Literal["NOT_USED"] = "NOT_USED"
+
+    @model_validator(mode="after")
+    def valid_index_feature_seal(self) -> "EvidenceIndexFeatureDatasetSealV2":
+        _aware(self.sealed_at, field="sealed_at")
+        if self.feature_count != len(self.observation_ids):
+            raise ValueError("feature_count does not match observation_ids")
+        if self.observation_ids != sorted(set(self.observation_ids)):
+            raise ValueError("observation_ids must be sorted and unique")
+        if set(self.feature_row_sha256) != set(self.observation_ids):
+            raise ValueError("feature row hashes do not match observation IDs")
+        return self
+
+
 class FeatureDatasetSealV1(ContractModel):
     schema_version: str = "moatrader-future-eri-feature-seal-v1/1"
     sealed_at: datetime
@@ -451,6 +517,40 @@ def seal_feature_dataset(
             item.observation_id: _sha256_payload(item.model_dump(mode="json"))
             for item in rows
         },
+    )
+
+
+def seal_evidence_index_feature_dataset_v2(
+    rows: Sequence[EvidenceIndexFutureEriFeatureRowV2],
+    *,
+    sealed_at: datetime,
+    full_index_seal_sha256: str,
+) -> EvidenceIndexFeatureDatasetSealV2:
+    _aware(sealed_at, field="sealed_at")
+    if not rows:
+        raise ValueError("cannot seal an empty Evidence Index feature dataset")
+    ids = sorted(item.observation_id for item in rows)
+    if len(ids) != len(set(ids)):
+        raise ValueError("feature observation_id values must be unique")
+    if any(item.full_index_seal_sha256 != full_index_seal_sha256 for item in rows):
+        raise ValueError("feature rows do not share the supplied Full Index seal")
+    payload = [
+        item.model_dump(mode="json")
+        for item in sorted(rows, key=lambda row: row.observation_id)
+    ]
+    _assert_no_outcome_fields(payload)
+    if any(item.signal_timestamp > sealed_at for item in rows):
+        raise ValueError("sealed_at cannot precede a signal timestamp")
+    return EvidenceIndexFeatureDatasetSealV2(
+        sealed_at=sealed_at,
+        feature_count=len(rows),
+        observation_ids=ids,
+        feature_dataset_sha256=_sha256_payload(payload),
+        feature_row_sha256={
+            item.observation_id: _sha256_payload(item.model_dump(mode="json"))
+            for item in rows
+        },
+        full_index_seal_sha256=full_index_seal_sha256,
     )
 
 
@@ -691,6 +791,106 @@ def build_future_eri_label(
     if outcome.target_session != expected_target:
         raise ValueError("outcome target is not exactly t+63 trading sessions")
     counterfactual = roll_forward_frozen_expectations(feature, outcome)
+    valuation = (engine or EconomicDcfEngine()).value(counterfactual)
+    value = valuation.fair_value_per_share
+    if value <= 0:
+        raise ValueError("counterfactual equity value per share must be positive")
+    eri = (outcome.actual_market_price / value).ln()
+    actual_equity = outcome.actual_market_price * outcome.realized_state.diluted_shares
+    actual_enterprise = actual_equity + outcome.realized_state.net_debt
+    if actual_enterprise <= 0 or valuation.enterprise_value <= 0:
+        raise ValueError("actual and counterfactual enterprise values must be positive")
+    enterprise_eri = (actual_enterprise / valuation.enterprise_value).ln()
+    bridge = EnterpriseEquityBridgeV1(
+        counterfactual_enterprise_value=valuation.enterprise_value,
+        counterfactual_net_debt=outcome.realized_state.net_debt,
+        counterfactual_equity_value=valuation.equity_value,
+        actual_equity_value=actual_equity,
+        actual_enterprise_value=actual_enterprise,
+        diluted_shares=outcome.realized_state.diluted_shares,
+        counterfactual_value_per_share=value,
+        actual_market_price=outcome.actual_market_price,
+        enterprise_future_eri=enterprise_eri,
+        equity_future_eri=eri,
+        capital_structure_bridge_effect=eri - enterprise_eri,
+        capital_structure_source_ids=outcome.realized_state.source_document_ids,
+    )
+    return FutureEriLabelV1(
+        observation_id=feature.observation_id,
+        target_session=outcome.target_session,
+        target_price_at=outcome.target_price_at,
+        actual_market_price=outcome.actual_market_price,
+        counterfactual_value_per_share=value,
+        future_eri=eri,
+        enterprise_future_eri=enterprise_eri,
+        capital_structure_bridge_effect=eri - enterprise_eri,
+        enterprise_equity_bridge=bridge,
+        feature_dataset_sha256=feature_seal.feature_dataset_sha256,
+        frozen_assumptions_sha256=model_sha256(feature.frozen_expectation_assumptions),
+        counterfactual_assumptions_sha256=model_sha256(counterfactual),
+        realized_fundamentals_available_at=outcome.realized_state.available_at,
+    )
+
+
+def roll_forward_evidence_index_expectations_v2(
+    feature: EvidenceIndexFutureEriFeatureRowV2,
+    outcome: FutureEriOutcomeInputV1,
+) -> EconomicDcfAssumptions:
+    signal_date = feature.signal_timestamp.date()
+    target = outcome.target_session
+    completed_years = target.year - signal_date.year
+    if (target.month, target.day) < (signal_date.month, signal_date.day):
+        completed_years -= 1
+    completed_years = max(completed_years, 0)
+    frozen = feature.frozen_expectation_assumptions
+    remaining_cap = max(frozen.competitive_advantage_period_years - completed_years, 0)
+    remaining_forecast = max(
+        frozen.explicit_forecast_years - completed_years,
+        remaining_cap + frozen.fade_years,
+        1,
+    )
+    realized = outcome.realized_state
+    payload = frozen.model_dump()
+    payload.update(
+        {
+            "base_period": realized.base_period,
+            "base_revenue": realized.base_revenue,
+            "base_nopat_margin": realized.base_nopat_margin,
+            "base_invested_capital": realized.base_invested_capital,
+            "net_debt": realized.net_debt,
+            "diluted_shares": realized.diluted_shares,
+            "wacc": realized.wacc,
+            "competitive_advantage_period_years": remaining_cap,
+            "explicit_forecast_years": remaining_forecast,
+        }
+    )
+    return EconomicDcfAssumptions.model_validate(payload)
+
+
+def build_evidence_index_future_eri_label_v2(
+    *,
+    feature: EvidenceIndexFutureEriFeatureRowV2,
+    outcome: FutureEriOutcomeInputV1,
+    feature_seal: EvidenceIndexFeatureDatasetSealV2,
+    trading_sessions: Sequence[date],
+    engine: EconomicDcfEngine | None = None,
+) -> FutureEriLabelV1:
+    if outcome.observation_id != feature.observation_id:
+        raise ValueError("feature and outcome observation_id mismatch")
+    if feature.observation_id not in feature_seal.observation_ids:
+        raise ValueError("feature is not part of the sealed Evidence Index dataset")
+    if feature_seal.feature_row_sha256[feature.observation_id] != model_sha256(feature):
+        raise ValueError("Evidence Index feature changed after sealing")
+    if feature.full_index_seal_sha256 != feature_seal.full_index_seal_sha256:
+        raise ValueError("feature does not match the sealed Full Evidence Index")
+    expected_target = target_trading_session(
+        feature.signal_timestamp.date(),
+        trading_sessions,
+        horizon=63,
+    )
+    if outcome.target_session != expected_target:
+        raise ValueError("outcome target is not exactly t+63 trading sessions")
+    counterfactual = roll_forward_evidence_index_expectations_v2(feature, outcome)
     valuation = (engine or EconomicDcfEngine()).value(counterfactual)
     value = valuation.fair_value_per_share
     if value <= 0:

@@ -33,6 +33,7 @@ from moatrader.expectations.historical_evidence_v2 import (
     AxisSignedScoreRoleV2,
     DeterministicCoreIndexCoveragePolicyV2,
     EvidenceIndexContractV2,
+    FullEvidenceIndexCoveragePolicyV2,
     GroundedAxisStateSnapshotV2,
     PITApplicabilityRulesV2,
     PITOperatingSnapshotV2,
@@ -42,6 +43,7 @@ from moatrader.expectations.historical_evidence_v2 import (
     SparseCoverageGatePolicyV2,
     build_deterministic_pit_axis_evidence,
     build_deterministic_core_index_row_v2,
+    build_full_evidence_index_row_v2,
     build_last_grounded_axis_evidence,
     build_sparse_feature_row_v2,
     calibrate_sparse_band_contract_v2,
@@ -76,6 +78,10 @@ from scripts.evaluate_historical_evidence_parser_v2 import (
 )
 from scripts.freeze_historical_evidence_index_v2 import (
     deterministic_core_diagnostics_v2,
+)
+from scripts.seal_historical_full_evidence_index_v2 import (
+    full_evidence_index_diagnostics_v2,
+    seal_full_evidence_index_v2,
 )
 from scripts.prepare_historical_evidence_classification_subset import prepare_subset
 from scripts.prepare_historical_locked_sets_v2 import (
@@ -349,6 +355,185 @@ def test_deterministic_core_requires_nobs_two_before_assigning_a_band() -> None:
     assert row.core_evidence_index == D(1)
     assert row.eligible is False
     assert row.band is None
+
+
+def test_full_evidence_index_uses_exactly_five_axes_and_never_imputes_na() -> None:
+    pair = _pair(104)
+    capex = _grounded(
+        OperatingEvidenceAxis.CAPACITY_CAPEX,
+        EvidenceState.IMPROVING,
+        pair=pair,
+    ).model_copy(
+        update={
+            "deterministic_metric_name": "CAPEX_TO_REVENUE",
+            "deterministic_previous_value": D("0.1"),
+            "deterministic_current_value": D("0.2"),
+            "deterministic_delta": D("0.1"),
+        }
+    )
+    sparse = build_sparse_feature_row_v2(
+        pair=pair,
+        axis_evidence=[
+            _grounded(OperatingEvidenceAxis.DEMAND, EvidenceState.IMPROVING, pair=pair),
+            _na(OperatingEvidenceAxis.PRICE_MIX),
+            _grounded(OperatingEvidenceAxis.MARGIN, EvidenceState.WEAKENING, pair=pair),
+            _grounded(OperatingEvidenceAxis.INVENTORY_MISMATCH, EvidenceState.STABLE, pair=pair),
+            _not_applicable(OperatingEvidenceAxis.BACKLOG),
+            capex,
+        ],
+    )
+
+    full = build_full_evidence_index_row_v2(sparse)
+
+    assert full.nobs == 3
+    assert full.net_evidence == 0
+    assert full.full_evidence_index == D(0)
+    assert full.coverage == D(3) / D(4)
+    assert full.semantic_grounded_axis_count == 1
+    assert full.deterministic_core_grounded_axis_count == 2
+    assert full.full_axis_states[OperatingEvidenceAxis.PRICE_MIX].value == "NA"
+    assert full.full_axis_states[OperatingEvidenceAxis.BACKLOG].value == "NOT_APPLICABLE"
+    assert full.capex_in_index is False
+    assert full.band.value == "NEUTRAL"
+    assert full.per_pbr_role == "NOT_USED"
+
+
+def test_full_evidence_index_requires_nobs_two_for_band() -> None:
+    pair = _pair(105)
+    sparse = build_sparse_feature_row_v2(
+        pair=pair,
+        axis_evidence=[
+            _grounded(OperatingEvidenceAxis.DEMAND, EvidenceState.IMPROVING, pair=pair),
+            _na(OperatingEvidenceAxis.PRICE_MIX),
+            _na(OperatingEvidenceAxis.MARGIN),
+            _na(OperatingEvidenceAxis.INVENTORY_MISMATCH),
+            _not_applicable(OperatingEvidenceAxis.BACKLOG),
+            _na(OperatingEvidenceAxis.CAPACITY_CAPEX),
+        ],
+    )
+
+    full = build_full_evidence_index_row_v2(sparse)
+
+    assert full.nobs == 1
+    assert full.full_evidence_index == D(1)
+    assert full.eligible is False
+    assert full.band is None
+
+
+def _full_row(
+    index: int,
+    directions: tuple[
+        EvidenceState | None,
+        EvidenceState | None,
+        EvidenceState | None,
+        EvidenceState | None,
+        EvidenceState | None,
+    ],
+):
+    pair = _pair(index)
+    evidence = [
+        _grounded(axis, direction, pair=pair) if direction is not None else _na(axis)
+        for axis, direction in zip(
+            (
+                OperatingEvidenceAxis.DEMAND,
+                OperatingEvidenceAxis.PRICE_MIX,
+                OperatingEvidenceAxis.MARGIN,
+                OperatingEvidenceAxis.INVENTORY_MISMATCH,
+                OperatingEvidenceAxis.BACKLOG,
+            ),
+            directions,
+            strict=True,
+        )
+    ]
+    evidence.append(_na(OperatingEvidenceAxis.CAPACITY_CAPEX))
+    return build_full_evidence_index_row_v2(
+        build_sparse_feature_row_v2(pair=pair, axis_evidence=evidence)
+    )
+
+
+def test_full_evidence_index_coverage_gate_reports_all_fixed_bands() -> None:
+    rows = [
+        _full_row(121, (EvidenceState.WEAKENING, EvidenceState.WEAKENING, None, None, None)),
+        _full_row(122, (EvidenceState.WEAKENING, EvidenceState.STABLE, None, None, None)),
+        _full_row(123, (EvidenceState.WEAKENING, EvidenceState.IMPROVING, None, None, None)),
+        _full_row(124, (EvidenceState.IMPROVING, EvidenceState.STABLE, None, None, None)),
+        _full_row(125, (EvidenceState.IMPROVING, EvidenceState.IMPROVING, None, None, None)),
+    ]
+    report = full_evidence_index_diagnostics_v2(
+        rows,
+        policy=FullEvidenceIndexCoveragePolicyV2(
+            minimum_rows_per_band=1,
+            minimum_unique_issuers_per_band=1,
+            minimum_unique_signal_months_per_band=1,
+            minimum_total_unique_issuers=5,
+            minimum_total_unique_signal_months=1,
+            maximum_top_issuer_share_per_band=D(1),
+            maximum_top_month_share_per_band=D(1),
+            maximum_top_year_share_per_band=D(1),
+        ),
+    )
+
+    assert report["coverage_gate_passed"] is True
+    assert report["eligible_row_count"] == 5
+    assert set(report["by_band"]) == {
+        "STRONG_BEAR",
+        "BEAR",
+        "NEUTRAL",
+        "BULL",
+        "STRONG_BULL",
+    }
+    assert report["capex_included"] is False
+    assert report["per_pbr_role"] == "NOT_USED"
+
+
+def test_full_index_seal_fails_before_features_when_dual_locked_gate_has_not_passed(
+    tmp_path: Path,
+) -> None:
+    manifests = {}
+    payloads = {
+        "sparse": {"outcome_vault_opened": False, "return_data_opened": False},
+        "locked": {
+            "status": "V2_LOCKED_TESTS_FAILED",
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+        },
+        "classification": {
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+        },
+        "selection": {"outcome_vault_opened": False, "return_data_opened": False},
+        "cost": {
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+        },
+        "core": {
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+        },
+    }
+    for name, payload in payloads.items():
+        path = tmp_path / f"{name}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        manifests[name] = path
+
+    with pytest.raises(ValueError, match="dual LOCKED tests have not passed"):
+        seal_full_evidence_index_v2(
+            workspace=tmp_path,
+            sparse_feature_input=tmp_path / "must-not-be-opened.jsonl",
+            sparse_stage_manifest=manifests["sparse"],
+            dual_locked_manifest=manifests["locked"],
+            semantic_classification_stage_manifest=manifests["classification"],
+            semantic_selection_manifest=manifests["selection"],
+            cost_manifest=manifests["cost"],
+            core_pre_outcome_manifest=manifests["core"],
+            output=tmp_path / "full-seal",
+            seal_tag="TEST",
+            dry_run=True,
+        )
+    assert not (tmp_path / "full-seal").exists()
 
 
 def test_deterministic_core_diagnostics_report_all_fixed_bands() -> None:

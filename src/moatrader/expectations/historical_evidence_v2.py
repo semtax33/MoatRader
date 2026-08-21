@@ -186,6 +186,22 @@ class DeterministicCoreIndexCoveragePolicyV2(ContractModel):
     value_data_accessed: Literal[False] = False
 
 
+class FullEvidenceIndexCoveragePolicyV2(ContractModel):
+    schema_version: str = "moatrader-full-evidence-index-coverage-policy-v2/1"
+    minimum_rows_per_band: int = Field(ge=1)
+    minimum_unique_issuers_per_band: int = Field(ge=1)
+    minimum_unique_signal_months_per_band: int = Field(ge=1)
+    minimum_total_unique_issuers: int = Field(ge=1)
+    minimum_total_unique_signal_months: int = Field(ge=1)
+    maximum_top_issuer_share_per_band: Decimal = Field(gt=0, le=1)
+    maximum_top_month_share_per_band: Decimal = Field(gt=0, le=1)
+    maximum_top_year_share_per_band: Decimal = Field(gt=0, le=1)
+    selected_outcome_blind: Literal[True] = True
+    outcome_data_accessed: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    value_data_accessed: Literal[False] = False
+
+
 class DeterministicCoreIndexRowV2(ContractModel):
     schema_version: str = "moatrader-deterministic-core-index-row-v2/1"
     observation_id: str = Field(pattern=r"^OBS_[0-9a-f]{24}$")
@@ -531,6 +547,145 @@ class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
         actual_hash = str(payload.pop("feature_hash"))
         if actual_hash != canonical_payload_sha256(payload):
             raise ValueError("V2 feature hash does not match row payload")
+        return self
+
+
+class FullEvidenceIndexRowV2(ContractModel):
+    schema_version: str = "moatrader-full-evidence-index-row-v2/1"
+    observation_id: str = Field(pattern=r"^OBS_[0-9a-f]{24}$")
+    pair_id: str = Field(pattern=r"^PAIR_[0-9a-f]{24}$")
+    issuer_id: str = Field(pattern=r"^[0-9]{6}$")
+    signal_timestamp: datetime
+    full_axis_states: dict[OperatingEvidenceAxis, EvidenceIndexAxisStateV2]
+    applicable_axis_count: int = Field(ge=0, le=5)
+    nobs: int = Field(ge=0, le=5)
+    unavailable_axis_count: int = Field(ge=0, le=5)
+    not_applicable_axis_count: int = Field(ge=0, le=5)
+    positive_axis_count: int = Field(ge=0, le=5)
+    neutral_axis_count: int = Field(ge=0, le=5)
+    negative_axis_count: int = Field(ge=0, le=5)
+    net_evidence: int = Field(ge=-5, le=5)
+    full_evidence_index: Decimal | None = Field(default=None, ge=-1, le=1)
+    full_evidence_index_fraction: str | None = None
+    coverage: Decimal | None = Field(default=None, ge=0, le=1)
+    minimum_observed_axes: Literal[2] = 2
+    eligible: bool
+    band: SparseBreadthBandV2 | None = None
+    semantic_grounded_axis_count: int = Field(ge=0, le=2)
+    deterministic_core_grounded_axis_count: int = Field(ge=0, le=3)
+    capex_availability: SparseAxisAvailabilityV2
+    capex_raw_direction: EvidenceState | None = None
+    capex_raw_metric_name: str | None = None
+    capex_raw_delta: Decimal | None = None
+    capex_in_index: Literal[False] = False
+    score_and_coverage_separate: Literal[True] = True
+    index_multiplied_by_coverage: Literal[False] = False
+    row_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome_data_accessed: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    value_data_accessed: Literal[False] = False
+    primary_ranking_policy: Literal["NONE_MECHANISM_ONLY"] = "NONE_MECHANISM_ONLY"
+    per_pbr_role: Literal["NOT_USED"] = "NOT_USED"
+
+    @model_validator(mode="after")
+    def full_index_arithmetic(self) -> "FullEvidenceIndexRowV2":
+        if self.signal_timestamp.tzinfo is None or self.signal_timestamp.utcoffset() is None:
+            raise ValueError("signal_timestamp must be timezone-aware")
+        if set(self.full_axis_states) != set(FULL_EVIDENCE_INDEX_AXES_V2):
+            raise ValueError("Full Index row must contain exactly the prespecified five axes")
+        states = list(self.full_axis_states.values())
+        scored = [
+            int(state.value)
+            for state in states
+            if state
+            in {
+                EvidenceIndexAxisStateV2.NEGATIVE,
+                EvidenceIndexAxisStateV2.NEUTRAL,
+                EvidenceIndexAxisStateV2.POSITIVE,
+            }
+        ]
+        not_applicable = states.count(EvidenceIndexAxisStateV2.NOT_APPLICABLE)
+        expected_nobs = len(scored)
+        expected_net = sum(scored)
+        expected_index = D(expected_net) / D(expected_nobs) if expected_nobs else None
+        expected_fraction = (
+            str(Fraction(expected_net, expected_nobs)) if expected_nobs else None
+        )
+        expected_coverage = (
+            D(expected_nobs) / D(5 - not_applicable)
+            if 5 - not_applicable
+            else None
+        )
+        expected_eligible = expected_nobs >= self.minimum_observed_axes
+        expected_band = (
+            fixed_economic_breadth_band_v2(expected_index)
+            if expected_eligible and expected_index is not None
+            else None
+        )
+        expected = (
+            5 - not_applicable,
+            expected_nobs,
+            states.count(EvidenceIndexAxisStateV2.NA),
+            not_applicable,
+            sum(value > 0 for value in scored),
+            sum(value == 0 for value in scored),
+            sum(value < 0 for value in scored),
+            expected_net,
+            expected_index,
+            expected_fraction,
+            expected_coverage,
+            expected_eligible,
+            expected_band,
+            sum(
+                self.full_axis_states[axis]
+                not in {EvidenceIndexAxisStateV2.NA, EvidenceIndexAxisStateV2.NOT_APPLICABLE}
+                for axis in SEMANTIC_EVIDENCE_AXES_V2
+            ),
+            sum(
+                self.full_axis_states[axis]
+                not in {EvidenceIndexAxisStateV2.NA, EvidenceIndexAxisStateV2.NOT_APPLICABLE}
+                for axis in DETERMINISTIC_CORE_AXES_V2
+            ),
+        )
+        actual = (
+            self.applicable_axis_count,
+            self.nobs,
+            self.unavailable_axis_count,
+            self.not_applicable_axis_count,
+            self.positive_axis_count,
+            self.neutral_axis_count,
+            self.negative_axis_count,
+            self.net_evidence,
+            self.full_evidence_index,
+            self.full_evidence_index_fraction,
+            self.coverage,
+            self.eligible,
+            self.band,
+            self.semantic_grounded_axis_count,
+            self.deterministic_core_grounded_axis_count,
+        )
+        if actual != expected:
+            raise ValueError("Full Evidence Index arithmetic does not match axis states")
+        if self.capex_availability == SparseAxisAvailabilityV2.GROUNDED:
+            if (
+                self.capex_raw_direction is None
+                or self.capex_raw_metric_name is None
+                or self.capex_raw_delta is None
+            ):
+                raise ValueError("grounded CAPEX diagnostic requires raw values")
+        elif any(
+            value is not None
+            for value in (
+                self.capex_raw_direction,
+                self.capex_raw_metric_name,
+                self.capex_raw_delta,
+            )
+        ):
+            raise ValueError("unavailable CAPEX diagnostic cannot contain raw values")
+        payload = self.model_dump(mode="json")
+        actual_hash = str(payload.pop("row_sha256"))
+        if actual_hash != canonical_payload_sha256(payload):
+            raise ValueError("Full Evidence Index row hash mismatch")
         return self
 
 
@@ -1263,6 +1418,89 @@ def build_deterministic_core_index_row_v2(
     )
     payload = draft.model_dump(mode="json", exclude={"row_sha256"})
     return DeterministicCoreIndexRowV2.model_validate(
+        {**payload, "row_sha256": canonical_payload_sha256(payload)}
+    )
+
+
+def build_full_evidence_index_row_v2(
+    feature: HistoricalSparseEvidenceFeatureRowV2,
+) -> FullEvidenceIndexRowV2:
+    states: dict[OperatingEvidenceAxis, EvidenceIndexAxisStateV2] = {}
+    for axis in FULL_EVIDENCE_INDEX_AXES_V2:
+        evidence = feature.axis_evidence[axis]
+        if evidence.signed_score_role != AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE:
+            raise ValueError(f"{axis.value} must be a primary signed-score axis")
+        if evidence.availability == SparseAxisAvailabilityV2.GROUNDED:
+            assert evidence.direction is not None
+            states[axis] = EvidenceIndexAxisStateV2(
+                "+1" if evidence.direction.value > 0 else str(evidence.direction.value)
+            )
+        elif evidence.availability == SparseAxisAvailabilityV2.NOT_APPLICABLE:
+            states[axis] = EvidenceIndexAxisStateV2.NOT_APPLICABLE
+        else:
+            states[axis] = EvidenceIndexAxisStateV2.NA
+    scored = [
+        int(state.value)
+        for state in states.values()
+        if state
+        in {
+            EvidenceIndexAxisStateV2.NEGATIVE,
+            EvidenceIndexAxisStateV2.NEUTRAL,
+            EvidenceIndexAxisStateV2.POSITIVE,
+        }
+    ]
+    nobs = len(scored)
+    not_applicable = sum(
+        state == EvidenceIndexAxisStateV2.NOT_APPLICABLE for state in states.values()
+    )
+    net = sum(scored)
+    index = D(net) / D(nobs) if nobs else None
+    eligible = nobs >= 2
+    capex = feature.axis_evidence[OperatingEvidenceAxis.CAPACITY_CAPEX]
+    if capex.signed_score_role != AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY:
+        raise ValueError("CAPEX must remain a raw-direction diagnostic")
+    capex_grounded = capex.availability == SparseAxisAvailabilityV2.GROUNDED
+    draft = FullEvidenceIndexRowV2.model_construct(
+        observation_id=feature.observation_id,
+        pair_id=feature.pair_id,
+        issuer_id=feature.issuer_id,
+        signal_timestamp=feature.signal_timestamp,
+        full_axis_states=states,
+        applicable_axis_count=5 - not_applicable,
+        nobs=nobs,
+        unavailable_axis_count=sum(
+            state == EvidenceIndexAxisStateV2.NA for state in states.values()
+        ),
+        not_applicable_axis_count=not_applicable,
+        positive_axis_count=sum(value > 0 for value in scored),
+        neutral_axis_count=sum(value == 0 for value in scored),
+        negative_axis_count=sum(value < 0 for value in scored),
+        net_evidence=net,
+        full_evidence_index=index,
+        full_evidence_index_fraction=str(Fraction(net, nobs)) if nobs else None,
+        coverage=D(nobs) / D(5 - not_applicable) if 5 - not_applicable else None,
+        eligible=eligible,
+        band=fixed_economic_breadth_band_v2(index) if eligible and index is not None else None,
+        semantic_grounded_axis_count=sum(
+            states[axis]
+            not in {EvidenceIndexAxisStateV2.NA, EvidenceIndexAxisStateV2.NOT_APPLICABLE}
+            for axis in SEMANTIC_EVIDENCE_AXES_V2
+        ),
+        deterministic_core_grounded_axis_count=sum(
+            states[axis]
+            not in {EvidenceIndexAxisStateV2.NA, EvidenceIndexAxisStateV2.NOT_APPLICABLE}
+            for axis in DETERMINISTIC_CORE_AXES_V2
+        ),
+        capex_availability=capex.availability,
+        capex_raw_direction=capex.direction if capex_grounded else None,
+        capex_raw_metric_name=(
+            capex.deterministic_metric_name if capex_grounded else None
+        ),
+        capex_raw_delta=capex.deterministic_delta if capex_grounded else None,
+        row_sha256="0" * 64,
+    )
+    payload = draft.model_dump(mode="json", exclude={"row_sha256"})
+    return FullEvidenceIndexRowV2.model_validate(
         {**payload, "row_sha256": canonical_payload_sha256(payload)}
     )
 

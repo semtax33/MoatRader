@@ -12,6 +12,9 @@ from scripts.audit_historical_future_eri_outcome_eligibility import (
 )
 from scripts.run_future_eri_downstream_validation import run as run_downstream
 from scripts.run_historical_future_eri_outcomes import run as run_outcomes
+from scripts.run_historical_evidence_index_eri_v2 import (
+    run_evidence_index_eri_v2,
+)
 
 
 def test_outcome_eligibility_audit_does_not_open_inputs_when_feature_gate_is_closed(
@@ -97,6 +100,31 @@ def test_v1_outcome_runner_rejects_v2_seal_without_opening_inputs(tmp_path: Path
     assert result["status"] == "BLOCKED_V2_FEATURES_REQUIRE_SPARSE_ERI_RUNNER"
     assert result["expectation_input_opened"] is False
     assert result["outcome_vault_opened"] is False
+
+
+def test_v2_index_runner_does_not_open_inputs_before_full_index_seal(
+    tmp_path: Path,
+) -> None:
+    full_build = tmp_path / "full-index"
+    full_build.mkdir()
+
+    result = run_evidence_index_eri_v2(
+        full_index_build=full_build,
+        core_index_build=tmp_path / "missing-core",
+        expectation_input=tmp_path / "missing-expectations.jsonl",
+        eligibility_inventory_input=tmp_path / "missing-inventory.jsonl",
+        outcome_input=tmp_path / "missing-outcomes.jsonl",
+        trading_sessions_path=tmp_path / "missing-sessions.csv",
+        output=tmp_path / "v2-result",
+    )
+
+    assert result["status"] == "BLOCKED_FULL_INDEX_SEAL_MISSING"
+    assert result["expectation_input_opened"] is False
+    assert result["eligibility_inventory_opened"] is False
+    assert result["outcome_vault_opened"] is False
+    assert result["future_eri_used_as_signal"] is False
+    assert result["future_eri_used_as_ranking"] is False
+    assert result["per_pbr_role"] == "NOT_USED"
 
 
 def test_outcome_runner_rejects_unsealed_v1r_without_opening_inputs(tmp_path: Path) -> None:

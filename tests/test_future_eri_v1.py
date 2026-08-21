@@ -10,6 +10,7 @@ import pytest
 from moatrader.canonical.models import StatementType
 from moatrader.expectations.future_eri import (
     CurrentExpectationStateV1,
+    EvidenceIndexFutureEriFeatureRowV2,
     EriMechanismObservationV1,
     EriMonotonicityPolicyV1,
     EvidenceObservation,
@@ -23,12 +24,14 @@ from moatrader.expectations.future_eri import (
     OperatingEvidenceAxis,
     RealizedFcffStateV1,
     build_fcff_evidence_vector,
+    build_evidence_index_future_eri_label_v2,
     build_future_eri_label,
     evaluate_future_eri_monotonicity,
     next_usable_signal_timestamp,
     roll_forward_frozen_expectations,
     scaled_materiality,
     seal_feature_dataset,
+    seal_evidence_index_feature_dataset_v2,
     target_trading_session,
 )
 from moatrader.valuation.assumptions import EconomicDcfAssumptions
@@ -307,6 +310,53 @@ def test_future_eri_label_is_exactly_63_sessions_and_not_a_return_label() -> Non
             trading_sessions=_sessions(),
         )
 
+
+def test_v2_evidence_index_feature_is_sealed_before_exact_t63_future_eri() -> None:
+    base = _feature()
+    feature = EvidenceIndexFutureEriFeatureRowV2(
+        observation_id=base.observation_id,
+        issuer_id=base.expectation_state.issuer_id,
+        signal_timestamp=base.expectation_state.signal_timestamp,
+        full_evidence_index=D("0.5"),
+        full_nobs=4,
+        core_evidence_index=D("0"),
+        core_nobs=3,
+        full_index_row_sha256="b" * 64,
+        core_index_row_sha256="c" * 64,
+        full_index_seal_sha256="d" * 64,
+        expectation_state=base.expectation_state,
+        frozen_expectation_assumptions=base.frozen_expectation_assumptions,
+    )
+    seal = seal_evidence_index_feature_dataset_v2(
+        [feature],
+        sealed_at=SIGNAL_AT + timedelta(minutes=1),
+        full_index_seal_sha256="d" * 64,
+    )
+    label = build_evidence_index_future_eri_label_v2(
+        feature=feature,
+        outcome=_outcome(base),
+        feature_seal=seal,
+        trading_sessions=_sessions(),
+    )
+
+    assert label.horizon_trading_days == 63
+    assert feature.downstream_outcome_role == "EVIDENCE_INDEX_PREDICTS_T63_ERI"
+    assert feature.outcome_value_used_as_signal is False
+    assert feature.outcome_value_used_as_ranking is False
+    assert feature.per_pbr_role == "NOT_USED"
+    assert seal.outcome_source_opened_before_seal is False
+    assert label.return_data_accessed is False
+
+    wrong_target = _outcome(base).model_copy(
+        update={"target_session": _outcome(base).target_session + timedelta(days=1)}
+    )
+    with pytest.raises(ValueError, match=r"exactly t\+63"):
+        build_evidence_index_future_eri_label_v2(
+            feature=feature,
+            outcome=wrong_target,
+            feature_seal=seal,
+            trading_sessions=_sessions(),
+        )
 
 def _null_case_label(realized: RealizedFcffStateV1):
     feature = _feature()
