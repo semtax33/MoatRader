@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import heapq
 import json
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -21,7 +23,6 @@ from moatrader.expectations.historical_evidence import (
 SEMANTIC_AXES = (
     OperatingEvidenceAxis.DEMAND,
     OperatingEvidenceAxis.PRICE_MIX,
-    OperatingEvidenceAxis.CAPACITY_CAPEX,
 )
 STRATA = (
     "COMPLETE_NEGATIVE",
@@ -70,6 +71,17 @@ def _read_packets(path: Path) -> list[PairedAxisPacket]:
     return rows
 
 
+def _iter_packets(path: Path) -> Iterable[PairedAxisPacket]:
+    with path.open("r", encoding="utf-8") as handle:
+        for number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield PairedAxisPacket.model_validate_json(line)
+            except ValueError as exc:
+                raise ValueError(f"invalid packet at line {number}: {exc}") from exc
+
+
 def _packet_ids(path: Path) -> set[str]:
     if path.suffix.lower() == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -92,6 +104,96 @@ def _packet_ids(path: Path) -> set[str]:
 
 def _selection_key(packet: PairedAxisPacket, seed: str) -> str:
     return hashlib.sha256(f"{seed}|{packet.packet_id}".encode("utf-8")).hexdigest()
+
+
+_DIRECTION_POSITIVE_RE = re.compile(
+    r"증가|성장|확대|상승|호조|회복|개선|급증|인상|상향",
+    flags=re.I,
+)
+_DIRECTION_NEGATIVE_RE = re.compile(
+    r"감소|하락|축소|둔화|부진|침체|급감|악화|인하|하향",
+    flags=re.I,
+)
+_DIRECTION_STABLE_RE = re.compile(
+    r"유지|보합|정체|동일|변동\s*(?:이\s*)?없",
+    flags=re.I,
+)
+_DEMAND_SUBJECT_RE = re.compile(
+    r"수요|매출(?:액)?|판매량|판매실적|출하량|고객\s*주문|주문량",
+    flags=re.I,
+)
+_PRICE_MIX_SUBJECT_RE = re.compile(
+    r"평균\s*판매가격|판매가격|판가|\bASP\b|제품\s*(?:믹스|mix)|"
+    r"고부가(?:가치)?(?:\s*제품)?|프리미엄(?:\s*제품)?",
+    flags=re.I,
+)
+
+
+def _side_direction_hint(packet: PairedAxisPacket, *, previous: bool) -> int | str | None:
+    """Produce an outcome-blind review hint, never a gold label."""
+
+    excerpts = packet.previous_excerpts if previous else packet.current_excerpts
+    subject_re = (
+        _DEMAND_SUBJECT_RE
+        if packet.axis == OperatingEvidenceAxis.DEMAND
+        else _PRICE_MIX_SUBJECT_RE
+    )
+    observed_axis_language = False
+    states: set[int] = set()
+    for excerpt in excerpts:
+        text = re.sub(r"\s+", " ", excerpt.text)
+        matches = list(subject_re.finditer(text))
+        if not matches:
+            continue
+        observed_axis_language = True
+        for match in matches:
+            start = max(0, match.start() - 180)
+            end = min(len(text), match.end() + 180)
+            window = text[start:end]
+            positive = bool(_DIRECTION_POSITIVE_RE.search(window))
+            negative = bool(_DIRECTION_NEGATIVE_RE.search(window))
+            stable = bool(_DIRECTION_STABLE_RE.search(window))
+            if positive and not negative:
+                states.add(1)
+            elif negative and not positive:
+                states.add(-1)
+            elif stable and not positive and not negative:
+                states.add(0)
+    if len(states) == 1:
+        return next(iter(states))
+    if len(states) > 1:
+        return "AMBIGUOUS"
+    if observed_axis_language:
+        return "AXIS_LANGUAGE_ONLY"
+    return None
+
+
+def _directional_review_hint(packet: PairedAxisPacket) -> str:
+    """Route candidate review only; a HUMAN must still adjudicate every row."""
+
+    previous = _side_direction_hint(packet, previous=True)
+    current = _side_direction_hint(packet, previous=False)
+    if previous == "AMBIGUOUS" or current == "AMBIGUOUS":
+        return "AMBIGUOUS"
+    if previous == "AXIS_LANGUAGE_ONLY" and current == "AXIS_LANGUAGE_ONLY":
+        return "AMBIGUOUS"
+    if not isinstance(previous, int) or not isinstance(current, int):
+        return "INSUFFICIENT_EVIDENCE"
+    return {
+        -1: "COMPLETE_NEGATIVE",
+        0: "COMPLETE_NEUTRAL",
+        1: "COMPLETE_POSITIVE",
+    }[max(-1, min(1, current - previous))]
+
+
+def _directional_review_priority(packet: PairedAxisPacket, hint: str) -> int:
+    """Prefer genuinely conflicting cues over mere axis-language for AMBIGUOUS review."""
+
+    if hint != "AMBIGUOUS":
+        return 0
+    previous = _side_direction_hint(packet, previous=True)
+    current = _side_direction_hint(packet, previous=False)
+    return 0 if "AMBIGUOUS" in (previous, current) else 1
 
 
 def _blank_gold_rows(
@@ -133,6 +235,7 @@ def prepare_locked_candidates(
     output: Path,
     natural_per_axis: int = 40,
     balanced_candidates_per_axis: int = 250,
+    directional_candidate_stratification: bool = False,
     seed: str = "MOATRADER_V2_LOCKED_20260821",
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()):
@@ -143,29 +246,105 @@ def prepare_locked_candidates(
         raise ValueError("explicit DEV inputs are required to keep LOCKED rows independent")
     if natural_per_axis < 1 or balanced_candidates_per_axis < 5:
         raise ValueError("LOCKED candidate sample sizes are too small")
-    packets = _read_packets(packet_input)
-    if any(packet.axis not in SEMANTIC_AXES for packet in packets):
-        raise ValueError("V2 LOCKED candidate input may contain only semantic-parser axes")
     prior_ids = set().union(*(_packet_ids(path) for path in prior_v1_inputs))
     dev_ids = set().union(*(_packet_ids(path) for path in dev_inputs))
     excluded = prior_ids | dev_ids
-    eligible = [packet for packet in packets if packet.packet_id not in excluded]
-    by_axis: dict[OperatingEvidenceAxis, list[PairedAxisPacket]] = defaultdict(list)
-    for packet in eligible:
-        by_axis[packet.axis].append(packet)
+    general_keep_per_axis = natural_per_axis + balanced_candidates_per_axis
+    general_heaps: dict[OperatingEvidenceAxis, list[tuple[int, str, PairedAxisPacket]]] = {
+        axis: [] for axis in SEMANTIC_AXES
+    }
+    cue_keep_per_stratum = natural_per_axis + balanced_candidates_per_axis
+    cue_heaps: dict[
+        tuple[OperatingEvidenceAxis, str], list[tuple[int, str, PairedAxisPacket]]
+    ] = {
+        (axis, stratum): [] for axis in SEMANTIC_AXES for stratum in STRATA
+    }
+    cue_population_counts: Counter[str] = Counter()
+    seen_ids: set[str] = set()
+    total_packet_count = 0
+    nonsemantic_packet_count = 0
+    excluded_packet_count = 0
+    eligible_axis_counts: Counter[str] = Counter()
+    for packet in _iter_packets(packet_input):
+        total_packet_count += 1
+        if packet.packet_id in seen_ids:
+            raise ValueError(f"packet IDs must be unique: {packet.packet_id}")
+        seen_ids.add(packet.packet_id)
+        if packet.axis not in SEMANTIC_AXES:
+            nonsemantic_packet_count += 1
+            continue
+        if packet.packet_id in excluded:
+            excluded_packet_count += 1
+            continue
+        eligible_axis_counts[packet.axis.value] += 1
+        key = int(_selection_key(packet, seed), 16)
+        item = (-key, packet.packet_id, packet)
+        heap = general_heaps[packet.axis]
+        if len(heap) < general_keep_per_axis:
+            heapq.heappush(heap, item)
+        elif key < -heap[0][0]:
+            heapq.heapreplace(heap, item)
+        if directional_candidate_stratification:
+            cue = _directional_review_hint(packet)
+            cue_population_counts[f"{packet.axis.value}/{cue}"] += 1
+            cue_heap = cue_heaps[(packet.axis, cue)]
+            cue_rank_key = (
+                _directional_review_priority(packet, cue) * (1 << 256) + key
+            )
+            cue_item = (-cue_rank_key, packet.packet_id, packet)
+            if len(cue_heap) < cue_keep_per_stratum:
+                heapq.heappush(cue_heap, cue_item)
+            elif cue_rank_key < -cue_heap[0][0]:
+                heapq.heapreplace(cue_heap, cue_item)
 
     natural: list[PairedAxisPacket] = []
     balanced_candidates: list[PairedAxisPacket] = []
+    selected_hints: dict[str, str] = {}
     for axis in SEMANTIC_AXES:
-        ordered = sorted(by_axis[axis], key=lambda row: _selection_key(row, seed))
-        if len(ordered) < natural_per_axis + balanced_candidates_per_axis:
+        general_ordered = sorted(
+            (item[2] for item in general_heaps[axis]),
+            key=lambda row: _selection_key(row, seed),
+        )
+        if len(general_ordered) < natural_per_axis + balanced_candidates_per_axis:
             raise ValueError(
                 f"not enough independent {axis.value} packets for Natural and Balanced pools"
             )
-        natural.extend(ordered[:natural_per_axis])
-        balanced_candidates.extend(
-            ordered[natural_per_axis : natural_per_axis + balanced_candidates_per_axis]
-        )
+        axis_natural = general_ordered[:natural_per_axis]
+        natural.extend(axis_natural)
+        natural_axis_ids = {row.packet_id for row in axis_natural}
+        axis_candidates: list[PairedAxisPacket] = []
+        if directional_candidate_stratification:
+            base, remainder = divmod(balanced_candidates_per_axis, len(STRATA))
+            targets = {
+                stratum: base + (1 if index < remainder else 0)
+                for index, stratum in enumerate(STRATA)
+            }
+            for stratum in STRATA:
+                cue_ordered = sorted(
+                    (item[2] for item in cue_heaps[(axis, stratum)]),
+                    key=lambda row: _selection_key(row, seed),
+                )
+                chosen = [
+                    row
+                    for row in cue_ordered
+                    if row.packet_id not in natural_axis_ids
+                    and row.packet_id not in selected_hints
+                ][: targets[stratum]]
+                axis_candidates.extend(chosen)
+                selected_hints.update({row.packet_id: stratum for row in chosen})
+        selected_axis_ids = {row.packet_id for row in axis_candidates}
+        if len(axis_candidates) < balanced_candidates_per_axis:
+            fallback = [
+                row
+                for row in general_ordered
+                if row.packet_id not in natural_axis_ids
+                and row.packet_id not in selected_axis_ids
+            ][: balanced_candidates_per_axis - len(axis_candidates)]
+            axis_candidates.extend(fallback)
+            selected_hints.update(
+                {row.packet_id: _directional_review_hint(row) for row in fallback}
+            )
+        balanced_candidates.extend(axis_candidates)
     natural.sort(key=lambda row: (row.axis.value, row.packet_id))
     balanced_candidates.sort(key=lambda row: (row.axis.value, row.packet_id))
     natural_ids = {row.packet_id for row in natural}
@@ -185,6 +364,25 @@ def prepare_locked_candidates(
             contract="V2_NATURAL_FREQUENCY_LOCKED",
         ),
     )
+    hint_path = output / "balanced-candidate-selection-hints.jsonl"
+    with hint_path.open("w", encoding="utf-8", newline="\n") as handle:
+        for packet in balanced_candidates:
+            handle.write(
+                json.dumps(
+                    {
+                        "packet_id": packet.packet_id,
+                        "axis": packet.axis.value,
+                        "selection_hint": selected_hints.get(
+                            packet.packet_id, _directional_review_hint(packet)
+                        ),
+                        "gold_label": False,
+                        "human_review_required": True,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
     _write_gold(
         output / "balanced-candidate-human-gold-template.csv",
         _blank_gold_rows(
@@ -198,6 +396,17 @@ def prepare_locked_candidates(
         "status": "V2_INDEPENDENT_LOCKED_CANDIDATES_PREPARED_OUTCOME_BLIND",
         "selection_seed": seed,
         "semantic_parser_axes": [axis.value for axis in SEMANTIC_AXES],
+        "source_packet_count": total_packet_count,
+        "nonsemantic_packets_ignored": nonsemantic_packet_count,
+        "excluded_prior_or_dev_packet_count": excluded_packet_count,
+        "eligible_semantic_axis_counts": dict(sorted(eligible_axis_counts.items())),
+        "selection_memory_policy": (
+            "STREAMING_DIRECTION_CUE_STRATIFIED_HASH_KEYS_PER_AXIS"
+            if directional_candidate_stratification
+            else "STREAMING_SMALLEST_HASH_KEYS_PER_AXIS"
+        ),
+        "directional_candidate_stratification": directional_candidate_stratification,
+        "directional_cue_population_counts": dict(sorted(cue_population_counts.items())),
         "natural_per_axis": natural_per_axis,
         "balanced_candidates_per_axis": balanced_candidates_per_axis,
         "source_packet_sha256": sha256_file(packet_input),
@@ -207,6 +416,7 @@ def prepare_locked_candidates(
         "dev_packet_id_count": len(dev_ids),
         "natural_locked_packet_sha256": sha256_file(natural_path),
         "balanced_candidate_packet_sha256": sha256_file(balanced_path),
+        "balanced_candidate_selection_hint_sha256": sha256_file(hint_path),
         "locked_sets_disjoint": True,
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
@@ -289,6 +499,10 @@ def finalize_locked_sets(
             if packet_id in human_rows:
                 raise ValueError(f"duplicate human gold packet ID at row {number}: {packet_id}")
             row = dict(raw)
+            if str(row.get("reviewer") or "").strip() != "HUMAN":
+                raise ValueError(
+                    f"V2 gold reviewer must be tagged exactly HUMAN at row {number}"
+                )
             label = _classification(row)
             validate_classification_grounding(label, packet_lookup[packet_id])
             human_rows[packet_id] = row
@@ -358,6 +572,8 @@ def finalize_locked_sets(
         "balanced_stratum_counts": stratum_counts,
         "minimum_per_axis_stratum": minimum_per_axis_stratum,
         "semantic_parser_axes": [axis.value for axis in SEMANTIC_AXES],
+        "gold_label_authority": "HUMAN",
+        "model_manual_labels_accepted_as_human": False,
         "locked_sets_disjoint": True,
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
@@ -379,6 +595,7 @@ def main() -> int:
     prepare.add_argument("--output", type=Path, required=True)
     prepare.add_argument("--natural-per-axis", type=int, default=40)
     prepare.add_argument("--balanced-candidates-per-axis", type=int, default=250)
+    prepare.add_argument("--directional-candidate-stratification", action="store_true")
     prepare.add_argument("--seed", default="MOATRADER_V2_LOCKED_20260821")
     finalize = subparsers.add_parser("finalize")
     finalize.add_argument("--candidate-build", type=Path, required=True)
@@ -395,6 +612,7 @@ def main() -> int:
             output=args.output,
             natural_per_axis=args.natural_per_axis,
             balanced_candidates_per_axis=args.balanced_candidates_per_axis,
+            directional_candidate_stratification=args.directional_candidate_stratification,
             seed=args.seed,
         )
     else:

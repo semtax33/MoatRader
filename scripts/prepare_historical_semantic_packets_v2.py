@@ -143,11 +143,7 @@ def prepare_semantic_packets(
                 if not both_periods:
                     decision_counts["SKIP_NO_TWO_PERIOD_SEMANTIC_CANDIDATE"] += 1
                     continue
-                selected = axis in SEMANTIC_PRIMARY_AXES or (
-                    axis == OperatingEvidenceAxis.CAPACITY_CAPEX
-                    and deterministic_item is not None
-                    and deterministic_item.availability == SparseAxisAvailabilityV2.NA
-                )
+                selected = axis in SEMANTIC_PRIMARY_AXES
                 if include_qualitative_diagnostics and axis in DETERMINISTIC_PRIORITY_AXES:
                     selected = selected or (
                         deterministic_item is not None
@@ -177,7 +173,8 @@ def prepare_semantic_packets(
         },
         "decision_counts": dict(sorted(decision_counts.items())),
         "semantic_primary_axes": sorted(axis.value for axis in SEMANTIC_PRIMARY_AXES),
-        "capacity_narrative_fallback_enabled": True,
+        "capacity_narrative_fallback_enabled": False,
+        "capacity_signed_score_policy": "RAW_DIRECTION_ONLY_NOT_IN_PRIMARY_SIGNED_SCORE",
         "qualitative_diagnostics_for_numeric_axes": include_qualitative_diagnostics,
         "evidence_priority": [
             "DETERMINISTIC_NUMERIC",
@@ -202,7 +199,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Select only semantic packets still needed after deterministic PIT coverage: "
-            "Demand, Price/Mix, and Capacity narrative fallback by default."
+            "Demand and Price/Mix only; Capacity/Capex remains deterministic raw direction."
         )
     )
     parser.add_argument("--filing-pair-input", type=Path, required=True)

@@ -179,6 +179,12 @@ def build_pit_evidence(
         provenance = Counter(
             item.provenance.value for item in values if item.provenance is not None
         )
+        metrics = Counter(
+            item.deterministic_metric_name
+            for item in values
+            if item.deterministic_metric_name is not None
+        )
+        signed_score_roles = Counter(item.signed_score_role.value for item in values)
         by_axis[axis.value] = {
             "applicable": sum(item.applicability == AxisApplicabilityV2.APPLICABLE for item in values),
             "grounded": sum(item.availability == SparseAxisAvailabilityV2.GROUNDED for item in values),
@@ -193,6 +199,9 @@ def build_pit_evidence(
             "deterministic_extraction_failure": reasons["TABLE_EXTRACTION_FAIL"],
             "reason_distribution": dict(sorted(reasons.items())),
             "source_type_distribution": dict(sorted(provenance.items())),
+            "deterministic_metric_distribution": dict(sorted(metrics.items())),
+            "signed_score_role_distribution": dict(sorted(signed_score_roles.items())),
+            "primary_signed_score_included": axis != OperatingEvidenceAxis.CAPACITY_CAPEX,
         }
     report = {
         "schema_version": "moatrader-historical-deterministic-pit-coverage-v2/1",
@@ -204,6 +213,7 @@ def build_pit_evidence(
             "LLM_NARRATIVE",
         ],
         "score_averaging_across_source_types": False,
+        "capacity_signed_score_policy": "RAW_DIRECTION_ONLY_NOT_IN_PRIMARY_SIGNED_SCORE",
         "outcome_vault_opened": False,
         "return_data_opened": False,
     }

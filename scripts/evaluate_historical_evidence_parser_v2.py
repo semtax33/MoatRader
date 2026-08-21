@@ -42,7 +42,6 @@ V2_STRATA = (
 SEMANTIC_PARSER_AXES = (
     OperatingEvidenceAxis.DEMAND,
     OperatingEvidenceAxis.PRICE_MIX,
-    OperatingEvidenceAxis.CAPACITY_CAPEX,
 )
 
 
@@ -193,6 +192,8 @@ def evaluate_v2_locked_parser(
     minimum_overall_directional_agreement: float = 0.80,
     minimum_axis_directional_agreement: float = 0.70,
     maximum_neutral_to_bullish_rate: float = 0.10,
+    maximum_false_stable_rate: float = 0.05,
+    maximum_opposite_direction_count: int = 0,
 ) -> dict[str, Any]:
     config = LOCKED_CONFIG[locked_kind]
     if output.exists() and any(output.iterdir()):
@@ -270,6 +271,8 @@ def evaluate_v2_locked_parser(
             try:
                 if str(raw.get("gold_contract_version") or "").strip() != config["contract"]:
                     raise ValueError(f"row is not from the V2 {locked_kind} gold contract")
+                if str(raw.get("reviewer") or "").strip() != "HUMAN":
+                    raise ValueError("V2 gold reviewer must be tagged exactly HUMAN")
                 human = _human_classification(dict(raw))
                 if human.packet_id in seen:
                     raise ValueError(f"duplicate human-gold packet ID: {human.packet_id}")
@@ -294,6 +297,10 @@ def evaluate_v2_locked_parser(
     directional_matches = 0
     neutral_human_count = 0
     neutral_to_bullish_count = 0
+    human_missing_count = 0
+    false_stable_count = 0
+    human_directional_count = 0
+    opposite_direction_count = 0
     for human, predicted in reviewed:
         human_stratum = _stratum(human)
         predicted_stratum = _stratum(predicted)
@@ -303,6 +310,18 @@ def evaluate_v2_locked_parser(
         if human_stratum == "COMPLETE_NEUTRAL":
             neutral_human_count += 1
             neutral_to_bullish_count += int(predicted_stratum == "COMPLETE_POSITIVE")
+        if human_stratum in {"INSUFFICIENT_EVIDENCE", "AMBIGUOUS"}:
+            human_missing_count += 1
+            false_stable_count += int(predicted_stratum == "COMPLETE_NEUTRAL")
+        if human_stratum in {"COMPLETE_NEGATIVE", "COMPLETE_POSITIVE"}:
+            human_directional_count += 1
+            opposite_direction_count += int(
+                (human_stratum, predicted_stratum)
+                in {
+                    ("COMPLETE_NEGATIVE", "COMPLETE_POSITIVE"),
+                    ("COMPLETE_POSITIVE", "COMPLETE_NEGATIVE"),
+                }
+            )
     for axis in SEMANTIC_PARSER_AXES:
         values = [(human, pred) for human, pred in reviewed if human.axis == axis]
         matches = sum(_stratum(human) == _stratum(pred) for human, pred in values)
@@ -323,11 +342,17 @@ def evaluate_v2_locked_parser(
     neutral_to_bullish_rate = (
         neutral_to_bullish_count / neutral_human_count if neutral_human_count else 0.0
     )
+    false_stable_rate = false_stable_count / human_missing_count if human_missing_count else 0.0
+    opposite_direction_rate = (
+        opposite_direction_count / human_directional_count if human_directional_count else 0.0
+    )
     common_quality = (
         bool(reviewed)
         and not invalid_rows
         and overall >= minimum_overall_directional_agreement
         and neutral_to_bullish_rate <= maximum_neutral_to_bullish_rate
+        and false_stable_rate <= maximum_false_stable_rate
+        and opposite_direction_count <= maximum_opposite_direction_count
         and all(row["agreement_passed"] for row in by_axis.values())
     )
     natural_gate = common_quality and all(
@@ -354,6 +379,14 @@ def evaluate_v2_locked_parser(
         "neutral_human_count": neutral_human_count,
         "neutral_to_bullish_count": neutral_to_bullish_count,
         "neutral_to_bullish_rate": neutral_to_bullish_rate,
+        "maximum_false_stable_rate": maximum_false_stable_rate,
+        "human_missing_count": human_missing_count,
+        "false_stable_count": false_stable_count,
+        "false_stable_rate": false_stable_rate,
+        "maximum_opposite_direction_count": maximum_opposite_direction_count,
+        "human_directional_count": human_directional_count,
+        "opposite_direction_count": opposite_direction_count,
+        "opposite_direction_rate": opposite_direction_rate,
         "by_axis": by_axis,
         "directional_confusion": dict(sorted(confusion.items())),
         "invalid_rows": invalid_rows,
@@ -361,6 +394,7 @@ def evaluate_v2_locked_parser(
         "gold_contract_version": config["contract"],
         "v1_locked_rows_reused": False,
         "semantic_parser_axes": [axis.value for axis in SEMANTIC_PARSER_AXES],
+        "gold_label_authority": "HUMAN",
         "outcome_vault_opened": False,
         "return_data_opened": False,
     }
@@ -478,6 +512,8 @@ def main() -> int:
     evaluate_parser.add_argument("--minimum-overall-directional-agreement", type=float, default=0.80)
     evaluate_parser.add_argument("--minimum-axis-directional-agreement", type=float, default=0.70)
     evaluate_parser.add_argument("--maximum-neutral-to-bullish-rate", type=float, default=0.10)
+    evaluate_parser.add_argument("--maximum-false-stable-rate", type=float, default=0.05)
+    evaluate_parser.add_argument("--maximum-opposite-direction-count", type=int, default=0)
     combine_parser = subparsers.add_parser("combine")
     combine_parser.add_argument("--natural-evaluation-manifest", type=Path, required=True)
     combine_parser.add_argument("--balanced-evaluation-manifest", type=Path, required=True)
@@ -507,6 +543,8 @@ def main() -> int:
             minimum_overall_directional_agreement=args.minimum_overall_directional_agreement,
             minimum_axis_directional_agreement=args.minimum_axis_directional_agreement,
             maximum_neutral_to_bullish_rate=args.maximum_neutral_to_bullish_rate,
+            maximum_false_stable_rate=args.maximum_false_stable_rate,
+            maximum_opposite_direction_count=args.maximum_opposite_direction_count,
         )
     else:
         result = combine_v2_locked_evaluations(

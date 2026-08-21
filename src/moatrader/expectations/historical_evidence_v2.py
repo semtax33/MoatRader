@@ -41,6 +41,11 @@ class AxisEvidenceProvenanceV2(StrEnum):
     DETERMINISTIC_NUMERIC = "DETERMINISTIC_NUMERIC"
 
 
+class AxisSignedScoreRoleV2(StrEnum):
+    PRIMARY_SIGNED_SCORE = "PRIMARY_SIGNED_SCORE"
+    RAW_DIRECTION_ONLY = "RAW_DIRECTION_ONLY"
+
+
 class PreviousEvidenceBasisV2(StrEnum):
     IMMEDIATE_PREVIOUS_FILING = "IMMEDIATE_PREVIOUS_FILING"
     LAST_GROUNDED_WITHIN_STALENESS = "LAST_GROUNDED_WITHIN_STALENESS"
@@ -68,7 +73,7 @@ class SparseBreadthBandV2(StrEnum):
 
 
 class SparseAxisEvidenceV2(ContractModel):
-    schema_version: str = "moatrader-sparse-axis-evidence-v2/1"
+    schema_version: str = "moatrader-sparse-axis-evidence-v2/2"
     axis: OperatingEvidenceAxis
     applicability: AxisApplicabilityV2
     availability: SparseAxisAvailabilityV2
@@ -91,9 +96,20 @@ class SparseAxisEvidenceV2(ContractModel):
     deterministic_previous_value: Decimal | None = None
     deterministic_current_value: Decimal | None = None
     deterministic_delta: Decimal | None = None
+    signed_score_role: AxisSignedScoreRoleV2 = AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
 
     @model_validator(mode="after")
     def missing_never_becomes_neutral(self) -> "SparseAxisEvidenceV2":
+        if (
+            self.signed_score_role == AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            and self.axis != OperatingEvidenceAxis.CAPACITY_CAPEX
+        ):
+            raise ValueError("raw-direction-only role is reserved for Capacity/Capex")
+        if (
+            self.axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            and self.signed_score_role != AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+        ):
+            raise ValueError("Capacity/Capex must not enter the primary signed score")
         for name, value in (
             ("previous_evidence_at", self.previous_evidence_at),
             ("current_evidence_at", self.current_evidence_at),
@@ -165,7 +181,7 @@ class SparseAxisEvidenceV2(ContractModel):
 
 
 class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
-    schema_version: str = "moatrader-historical-sparse-evidence-feature-v2/1"
+    schema_version: str = "moatrader-historical-sparse-evidence-feature-v2/2"
     observation_id: str = Field(pattern=r"^OBS_[0-9a-f]{24}$")
     pair_id: str = Field(pattern=r"^PAIR_[0-9a-f]{24}$")
     issuer_id: str = Field(pattern=r"^[0-9]{6}$")
@@ -175,6 +191,8 @@ class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
     observed_axis_count: int = Field(ge=0, le=6)
     unavailable_axis_count: int = Field(ge=0, le=6)
     not_applicable_axis_count: int = Field(ge=0, le=6)
+    signed_score_axis_count: int = Field(ge=0, le=5)
+    raw_direction_only_axis_count: int = Field(ge=0, le=1)
     positive_axis_count: int = Field(ge=0, le=6)
     neutral_axis_count: int = Field(ge=0, le=6)
     negative_axis_count: int = Field(ge=0, le=6)
@@ -216,22 +234,31 @@ class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
             item.availability == SparseAxisAvailabilityV2.NOT_APPLICABLE
             for item in self.axis_evidence.values()
         )
-        directions = [
+        scored_directions = [
             item.direction.value
             for item in self.axis_evidence.values()
             if item.direction is not None
+            and item.signed_score_role == AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
         ]
-        positive = sum(value > 0 for value in directions)
-        neutral = sum(value == 0 for value in directions)
-        negative = sum(value < 0 for value in directions)
-        net = sum(directions)
-        expected_breadth = D(net) / D(observed) if observed else None
+        signed_score_axes = len(scored_directions)
+        raw_direction_only = sum(
+            item.direction is not None
+            and item.signed_score_role == AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            for item in self.axis_evidence.values()
+        )
+        positive = sum(value > 0 for value in scored_directions)
+        neutral = sum(value == 0 for value in scored_directions)
+        negative = sum(value < 0 for value in scored_directions)
+        net = sum(scored_directions)
+        expected_breadth = D(net) / D(signed_score_axes) if signed_score_axes else None
         expected_coverage = D(observed) / D(applicable) if applicable else None
         expected = (
             applicable,
             observed,
             unavailable,
             not_applicable,
+            signed_score_axes,
+            raw_direction_only,
             positive,
             neutral,
             negative,
@@ -246,6 +273,8 @@ class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
             self.observed_axis_count,
             self.unavailable_axis_count,
             self.not_applicable_axis_count,
+            self.signed_score_axis_count,
+            self.raw_direction_only_axis_count,
             self.positive_axis_count,
             self.neutral_axis_count,
             self.negative_axis_count,
@@ -448,6 +477,11 @@ def _na_axis(
         availability=SparseAxisAvailabilityV2.NA,
         abstention_reason=reason,
         applicability_rule_id=rule_id,
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -457,6 +491,11 @@ def _not_applicable_axis(axis: OperatingEvidenceAxis, *, rule_id: str) -> Sparse
         applicability=AxisApplicabilityV2.NOT_APPLICABLE,
         availability=SparseAxisAvailabilityV2.NOT_APPLICABLE,
         applicability_rule_id=rule_id,
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -473,6 +512,7 @@ def _deterministic_axis(
     metrics: Sequence[str],
     rule_id: str,
     provenance: AxisEvidenceProvenanceV2,
+    signed_score_role: AxisSignedScoreRoleV2 = AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE,
 ) -> SparseAxisEvidenceV2:
     sources = _source_ids(previous, current, metrics=metrics)
     if not sources:
@@ -493,6 +533,7 @@ def _deterministic_axis(
         deterministic_previous_value=previous_value,
         deterministic_current_value=current_value,
         deterministic_delta=delta,
+        signed_score_role=signed_score_role,
     )
 
 
@@ -507,7 +548,19 @@ def build_deterministic_pit_axis_evidence(
     if previous.fiscal_period_end >= current.fiscal_period_end:
         raise ValueError("PIT snapshots must be chronological")
     if previous.available_at > current.available_at:
-        raise ValueError("PIT availability must be chronological")
+        return {
+            axis: _na_axis(
+                axis,
+                AbstentionReasonV2.PERIOD_MISMATCH,
+                rule_id="PIT_PREVIOUS_DISCLOSURE_AVAILABLE_AFTER_CURRENT_V2",
+            )
+            for axis in (
+                OperatingEvidenceAxis.MARGIN,
+                OperatingEvidenceAxis.INVENTORY_MISMATCH,
+                OperatingEvidenceAxis.BACKLOG,
+                OperatingEvidenceAxis.CAPACITY_CAPEX,
+            )
+        }
     result: dict[OperatingEvidenceAxis, SparseAxisEvidenceV2] = {}
 
     margin_rule = "PIT_OPERATING_MARGIN_CHANGE_V2"
@@ -612,7 +665,7 @@ def build_deterministic_pit_axis_evidence(
             rule_id=backlog_rule,
         )
 
-    capex_rule = "PIT_CAPEX_INTENSITY_CHANGE_V2"
+    capex_rule = "PIT_CAPEX_INTENSITY_RAW_DIRECTION_V2"
     ppe_ratios = [
         snapshot.ppe / snapshot.assets
         for snapshot in (previous, current)
@@ -646,6 +699,35 @@ def build_deterministic_pit_axis_evidence(
             metrics=("capex", "revenue"),
             rule_id=capex_rule,
             provenance=AxisEvidenceProvenanceV2.DETERMINISTIC_NUMERIC,
+            signed_score_role=AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY,
+        )
+    elif all(
+        value not in (None, D(0))
+        for value in (
+            previous.ppe,
+            previous.assets,
+            current.ppe,
+            current.assets,
+        )
+    ):
+        assert previous.ppe is not None and previous.assets is not None
+        assert current.ppe is not None and current.assets is not None
+        prior_intensity = previous.ppe / previous.assets
+        current_intensity = current.ppe / current.assets
+        delta = current_intensity - prior_intensity
+        result[OperatingEvidenceAxis.CAPACITY_CAPEX] = _deterministic_axis(
+            axis=OperatingEvidenceAxis.CAPACITY_CAPEX,
+            direction=_direction(delta, rules.capex_intensity_neutral_tolerance),
+            previous=previous,
+            current=current,
+            metric_name="NET_PPE_TO_ASSETS",
+            previous_value=prior_intensity,
+            current_value=current_intensity,
+            delta=delta,
+            metrics=("ppe", "assets"),
+            rule_id=capex_rule,
+            provenance=AxisEvidenceProvenanceV2.DETERMINISTIC_NUMERIC,
+            signed_score_role=AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY,
         )
     else:
         result[OperatingEvidenceAxis.CAPACITY_CAPEX] = _na_axis(
@@ -762,6 +844,11 @@ def qualitative_axis_evidence(
         current_evidence_at=pair.current.available_at,
         classification_packet_id=classification.packet_id,
         applicability_rule_id=applicability_rule_id,
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if packet.axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -811,11 +898,22 @@ def build_sparse_feature_row_v2(
         item.availability == SparseAxisAvailabilityV2.NOT_APPLICABLE
         for item in by_axis.values()
     )
-    directions = [item.direction.value for item in by_axis.values() if item.direction is not None]
-    positive = sum(value > 0 for value in directions)
-    neutral = sum(value == 0 for value in directions)
-    negative = sum(value < 0 for value in directions)
-    net = sum(directions)
+    scored_directions = [
+        item.direction.value
+        for item in by_axis.values()
+        if item.direction is not None
+        and item.signed_score_role == AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+    ]
+    signed_score_axes = len(scored_directions)
+    raw_direction_only = sum(
+        item.direction is not None
+        and item.signed_score_role == AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+        for item in by_axis.values()
+    )
+    positive = sum(value > 0 for value in scored_directions)
+    neutral = sum(value == 0 for value in scored_directions)
+    negative = sum(value < 0 for value in scored_directions)
+    net = sum(scored_directions)
     draft = HistoricalSparseEvidenceFeatureRowV2.model_construct(
         observation_id=historical_observation_id(pair.pair_id),
         pair_id=pair.pair_id,
@@ -826,13 +924,15 @@ def build_sparse_feature_row_v2(
         observed_axis_count=observed,
         unavailable_axis_count=unavailable,
         not_applicable_axis_count=not_applicable,
+        signed_score_axis_count=signed_score_axes,
+        raw_direction_only_axis_count=raw_direction_only,
         positive_axis_count=positive,
         neutral_axis_count=neutral,
         negative_axis_count=negative,
         n_directional=positive + negative,
         directional_event_count=positive + negative,
         net_evidence=net,
-        signed_breadth=D(net) / D(observed) if observed else None,
+        signed_breadth=D(net) / D(signed_score_axes) if signed_score_axes else None,
         coverage=D(observed) / D(applicable) if applicable else None,
         feature_hash="0" * 64,
     )

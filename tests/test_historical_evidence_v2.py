@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import zipfile
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -29,6 +30,7 @@ from moatrader.expectations.historical_evidence_v2 import (
     AbstentionReasonV2,
     AxisApplicabilityV2,
     AxisEvidenceProvenanceV2,
+    AxisSignedScoreRoleV2,
     GroundedAxisStateSnapshotV2,
     PITApplicabilityRulesV2,
     PITOperatingSnapshotV2,
@@ -64,6 +66,13 @@ from scripts.prepare_historical_evidence_classification_subset import prepare_su
 from scripts.prepare_historical_locked_sets_v2 import (
     finalize_locked_sets,
     prepare_locked_candidates,
+)
+from scripts.materialize_historical_human_gold_v2 import materialize_human_gold
+from scripts.prepare_historical_deterministic_pit_inputs_v2 import (
+    FilingSource,
+    FilingTask,
+    _extract_task,
+    extract_pit_metrics_from_html,
 )
 from scripts.prepare_historical_semantic_packets_v2 import prepare_semantic_packets
 
@@ -145,6 +154,11 @@ def _grounded(
         previous_evidence_at=pair.previous.available_at,
         current_evidence_at=pair.current.available_at,
         applicability_rule_id="TEST_PIT_RULE",
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -155,6 +169,11 @@ def _na(axis: OperatingEvidenceAxis) -> SparseAxisEvidenceV2:
         availability=SparseAxisAvailabilityV2.NA,
         abstention_reason=AbstentionReasonV2.TRUE_NO_MENTION,
         applicability_rule_id="TEST_APPLICABLE",
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -164,6 +183,11 @@ def _not_applicable(axis: OperatingEvidenceAxis) -> SparseAxisEvidenceV2:
         applicability=AxisApplicabilityV2.NOT_APPLICABLE,
         availability=SparseAxisAvailabilityV2.NOT_APPLICABLE,
         applicability_rule_id="TEST_NOT_APPLICABLE",
+        signed_score_role=(
+            AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+            if axis == OperatingEvidenceAxis.CAPACITY_CAPEX
+            else AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE
+        ),
     )
 
 
@@ -184,8 +208,10 @@ def test_sparse_contract_keeps_na_and_not_applicable_distinct_from_neutral() -> 
     assert row.applicable_axis_count == 5
     assert row.unavailable_axis_count == 1
     assert row.not_applicable_axis_count == 1
+    assert row.signed_score_axis_count == 3
+    assert row.raw_direction_only_axis_count == 1
     assert row.neutral_axis_count == 1
-    assert row.signed_breadth == D("0.25")
+    assert row.signed_breadth == D("0")
     assert row.coverage == D("0.8")
     with pytest.raises(ValueError, match="NA axis cannot contain"):
         SparseAxisEvidenceV2(
@@ -211,7 +237,15 @@ def _pit_snapshot(
         source_ids=(
             {
                 metric: [f"{suffix}_{metric}"]
-                for metric in ("revenue", "operating_profit", "inventory", "backlog", "capex")
+                for metric in (
+                    "revenue",
+                    "operating_profit",
+                    "inventory",
+                    "assets",
+                    "backlog",
+                    "capex",
+                    "ppe",
+                )
             }
             if sources
             else {}
@@ -251,6 +285,202 @@ def test_deterministic_pit_axes_have_priority_ready_directions() -> None:
     assert evidence[OperatingEvidenceAxis.CAPACITY_CAPEX].provenance == (
         AxisEvidenceProvenanceV2.DETERMINISTIC_NUMERIC
     )
+    assert evidence[OperatingEvidenceAxis.CAPACITY_CAPEX].signed_score_role == (
+        AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+    )
+
+
+def test_capex_axis_uses_net_ppe_intensity_fallback_as_raw_direction() -> None:
+    previous = _pit_snapshot(current=False).model_copy(
+        update={
+            "capex": None,
+            "ppe": D(50),
+            "source_ids": {
+                key: value
+                for key, value in _pit_snapshot(current=False).source_ids.items()
+                if key != "capex"
+            },
+        }
+    )
+    current = _pit_snapshot(current=True).model_copy(
+        update={
+            "capex": None,
+            "ppe": D(80),
+            "source_ids": {
+                key: value
+                for key, value in _pit_snapshot(current=True).source_ids.items()
+                if key != "capex"
+            },
+        }
+    )
+
+    capex = build_deterministic_pit_axis_evidence(
+        previous=previous,
+        current=current,
+        rules=PITApplicabilityRulesV2(),
+    )[OperatingEvidenceAxis.CAPACITY_CAPEX]
+
+    assert capex.availability == SparseAxisAvailabilityV2.GROUNDED
+    assert capex.deterministic_metric_name == "NET_PPE_TO_ASSETS"
+    assert capex.direction == EvidenceState.IMPROVING
+    assert capex.signed_score_role == AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY
+
+
+def test_pit_availability_order_violation_is_na_not_lookahead() -> None:
+    previous = _pit_snapshot(current=False).model_copy(
+        update={"available_at": datetime(2020, 8, 20, 16, tzinfo=SEOUL)}
+    )
+    current = _pit_snapshot(current=True)
+
+    evidence = build_deterministic_pit_axis_evidence(
+        previous=previous,
+        current=current,
+        rules=PITApplicabilityRulesV2(),
+    )
+
+    assert set(evidence) == {
+        OperatingEvidenceAxis.MARGIN,
+        OperatingEvidenceAxis.INVENTORY_MISMATCH,
+        OperatingEvidenceAxis.BACKLOG,
+        OperatingEvidenceAxis.CAPACITY_CAPEX,
+    }
+    assert all(
+        row.availability == SparseAxisAvailabilityV2.NA
+        and row.abstention_reason == AbstentionReasonV2.PERIOD_MISMATCH
+        and row.direction is None
+        for row in evidence.values()
+    )
+
+
+def test_pit_html_extractor_uses_current_cumulative_values_and_structured_backlog() -> None:
+    document = """
+    <html><body>
+      <p>(단위 : 백만원)</p>
+      <table><thead><tr><th>계정</th><th>당기 3개월</th><th>당기 누적</th><th>전기 3개월</th><th>전기 누적</th></tr></thead>
+        <tbody>
+          <tr><td>매출액</td><td>100</td><td>200</td><td>80</td><td>160</td></tr>
+          <tr><td>영업이익(손실)</td><td>10</td><td>20</td><td>8</td><td>16</td></tr>
+        </tbody>
+      </table>
+      <p>(단위 : 백만원)</p>
+      <table><tbody>
+        <tr><td>재고자산</td><td>50</td><td>45</td></tr>
+        <tr><td>유형자산</td><td>200</td><td>180</td></tr>
+        <tr><td>자산총계</td><td>500</td><td>450</td></tr>
+      </tbody></table>
+      <p>(단위 : 백만원)</p>
+      <table><tbody>
+        <tr><td>유형자산의 취득</td><td>(30)</td><td>(25)</td></tr>
+        <tr><td>무형자산의 취득</td><td>(5)</td><td>(4)</td></tr>
+      </tbody></table>
+      <p>생산설비 증설</p>
+      <p>(단위 : 백만원)</p>
+      <table><thead><tr><th>공사명</th><th>계약잔액</th></tr></thead>
+        <tbody>
+          <tr><td>A</td><td>30</td></tr><tr><td>B</td><td>40</td></tr>
+          <tr><td>합계</td><td>70</td></tr>
+        </tbody>
+      </table>
+    </body></html>
+    """
+
+    metrics = extract_pit_metrics_from_html(
+        document,
+        fiscal_period_end=date(2024, 6, 30),
+    )
+
+    assert metrics["revenue"] == D(200_000_000)
+    assert metrics["operating_profit"] == D(20_000_000)
+    assert metrics["inventory"] == D(50_000_000)
+    assert metrics["assets"] == D(500_000_000)
+    assert metrics["ppe"] == D(200_000_000)
+    assert metrics["capex"] == D(35_000_000)
+    assert metrics["backlog"] == D(70_000_000)
+    assert metrics["backlog_disclosed"] is True
+    assert metrics["capacity_disclosed"] is True
+
+    embedded_unit_metrics = extract_pit_metrics_from_html(
+        """
+        <html><body><table>
+          <tr><td>단위 : 억원</td></tr>
+          <tr><td>매출액</td><td>3</td></tr>
+          <tr><td>영업이익</td><td>1</td></tr>
+        </table></body></html>
+        """,
+        fiscal_period_end=date(2024, 12, 31),
+    )
+    assert embedded_unit_metrics["revenue"] == D(300_000_000)
+    assert embedded_unit_metrics["operating_profit"] == D(100_000_000)
+
+
+def test_pit_filing_task_reads_all_arcana_sections_and_moatrader_original(
+    tmp_path: Path,
+) -> None:
+    documents = {
+        "finance-statement.html": "<html><body><p>재무제표 본문</p></body></html>",
+        "finance-comment.html": """
+            <html><body><table>
+              <tr><td>매출액</td><td>100</td></tr>
+              <tr><td>영업이익</td><td>10</td></tr>
+              <tr><td>재고자산</td><td>20</td></tr>
+              <tr><td>자산총계</td><td>200</td></tr>
+            </table></body></html>
+        """,
+        "business-info.html": """
+            <html><body><table>
+              <tr><th>공사명</th><th>수주잔고</th></tr>
+              <tr><td>합계</td><td>80</td></tr>
+            </table></body></html>
+        """,
+    }
+    paths: dict[str, Path] = {}
+    for name, document in documents.items():
+        path = tmp_path / name
+        path.write_text(document, encoding="utf-8")
+        paths[name] = path
+    archive_path = tmp_path / "original.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "report.xml",
+            """
+            <html><body><table>
+              <tr><td>유형자산의 취득</td><td>(30)</td></tr>
+            </table></body></html>
+            """,
+        )
+
+    def source(name: str, origin: str) -> FilingSource:
+        path = archive_path if name == "original.zip" else paths[name]
+        digest = sha256_file(path)
+        return FilingSource(
+            source_id=f"PIT_SRC_{digest[:20]}",
+            origin=origin,
+            path=str(path),
+            raw_sha256=digest,
+        )
+
+    result = _extract_task(
+        FilingTask(
+            ticker="000001",
+            rcept_no="20240515000001",
+            fiscal_period_end="2024-03-31",
+            available_at="2024-05-15T16:00:00+09:00",
+            finance_statement=source(
+                "finance-statement.html", "ARCANA_FINANCE_STATEMENT_HTML"
+            ),
+            finance_comment=source(
+                "finance-comment.html", "ARCANA_FINANCE_COMMENT_HTML"
+            ),
+            business_info=source("business-info.html", "ARCANA_BUSINESS_HTML"),
+            moatrader_original=source("original.zip", "MOATRADER_OPENDART_ARCHIVE"),
+        )
+    )
+
+    assert len(result["verified_hashes"]) == 4
+    assert result["origins"]["revenue"] == "ARCANA_FINANCE_COMMENT_HTML"
+    assert result["origins"]["backlog"] == "ARCANA_BUSINESS_HTML"
+    assert result["origins"]["capex"] == "MOATRADER_OPENDART_ARCHIVE"
+    assert result["snapshot"]["capacity_disclosed"] is True
 
 
 def test_last_grounded_respects_frozen_staleness_window() -> None:
@@ -429,7 +659,7 @@ def test_axis_available_subset_does_not_require_six_axis_complete_pair(tmp_path:
     assert manifest["candidate_grounded_axis_count_histogram"]["5"] == 1
 
 
-def test_semantic_selection_skips_numeric_axes_and_keeps_capacity_fallback(
+def test_semantic_selection_keeps_only_demand_and_price_mix(
     tmp_path: Path,
 ) -> None:
     pair = _pair()
@@ -496,9 +726,9 @@ def test_semantic_selection_skips_numeric_axes_and_keeps_capacity_fallback(
     assert {packet.axis for packet in selected} == {
         OperatingEvidenceAxis.DEMAND,
         OperatingEvidenceAxis.PRICE_MIX,
-        OperatingEvidenceAxis.CAPACITY_CAPEX,
     }
-    assert manifest["selected_packet_count"] == 3
+    assert manifest["selected_packet_count"] == 2
+    assert manifest["capacity_narrative_fallback_enabled"] is False
     assert manifest["qualitative_diagnostics_for_numeric_axes"] is False
 
 
@@ -774,6 +1004,7 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
             "human_current_source_span": "",
             "gold_split": split,
             "gold_contract_version": contract,
+            "reviewer": "HUMAN",
         }
         if status == "COMPLETE":
             payload.update(
@@ -799,7 +1030,6 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
     semantic_axes = (
         OperatingEvidenceAxis.DEMAND,
         OperatingEvidenceAxis.PRICE_MIX,
-        OperatingEvidenceAxis.CAPACITY_CAPEX,
     )
     for axis in semantic_axes:
         for status, previous_state, current_state in (
@@ -934,6 +1164,12 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
     assert balanced["status"] == "V2_BALANCED_LOCKED_TEST_PASSED"
     assert natural["status"] == "V2_NATURAL_LOCKED_TEST_PASSED"
     assert combined["status"] == "V2_LOCKED_TESTS_PASSED"
+    balanced_quality = json.loads(
+        (balanced_output / "parser-quality-report-v2.json").read_text(encoding="utf-8")
+    )
+    assert balanced_quality["false_stable_count"] == 0
+    assert balanced_quality["false_stable_rate"] == 0
+    assert balanced_quality["opposite_direction_count"] == 0
     with pytest.raises(FileExistsError, match="already consumed"):
         evaluate_v2_locked_parser(
             packet_input=balanced_input,
@@ -951,15 +1187,14 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
     semantic_axes = (
         OperatingEvidenceAxis.DEMAND,
         OperatingEvidenceAxis.PRICE_MIX,
-        OperatingEvidenceAxis.CAPACITY_CAPEX,
     )
     packets = [
         _locked_packet(axis_index * 100 + index, axis)
         for axis_index, axis in enumerate(semantic_axes, start=1)
         for index in range(1, 29)
     ]
-    prior = [packets[index * 28] for index in range(3)]
-    dev = [packets[index * 28 + 1] for index in range(3)]
+    prior = [packets[index * 28] for index in range(2)]
+    dev = [packets[index * 28 + 1] for index in range(2)]
 
     def write_packets(path: Path, rows: list[PairedAxisPacket]) -> None:
         path.write_text(
@@ -998,7 +1233,7 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
     ]
     natural_ids = {packet.packet_id for packet in natural}
     by_axis_index: dict[OperatingEvidenceAxis, int] = {axis: 0 for axis in semantic_axes}
-    rows: list[dict[str, str]] = []
+    decisions: list[dict[str, object]] = []
     for packet in (*natural, *balanced_candidates):
         if packet.packet_id in natural_ids:
             status, previous_state, current_state = "COMPLETE", 0, 0
@@ -1012,36 +1247,41 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
                 ("INSUFFICIENT_EVIDENCE", None, None),
                 ("AMBIGUOUS", None, None),
             )[stratum_index]
-        row = {
+        decision: dict[str, object] = {
             "packet_id": packet.packet_id,
-            "axis": packet.axis.value,
-            "human_status": status,
-            "human_previous_state": "",
-            "human_current_state": "",
-            "human_previous_source_id": "",
-            "human_current_source_id": "",
-            "human_previous_source_span": "",
-            "human_current_source_span": "",
-            "gold_split": "",
-            "gold_contract_version": "",
-            "reviewer": "human",
-            "review_notes": "",
+            "status": status,
+            "review_notes": "fixture HUMAN review",
         }
         if status == "COMPLETE":
-            row.update(
-                human_previous_state=str(previous_state),
-                human_current_state=str(current_state),
-                human_previous_source_id=packet.previous_excerpts[0].source_id,
-                human_current_source_id=packet.current_excerpts[0].source_id,
-                human_previous_source_span=packet.previous_excerpts[0].text,
-                human_current_source_span=packet.current_excerpts[0].text,
+            decision.update(
+                previous_state=previous_state,
+                current_state=current_state,
+                previous_anchor="이전",
+                current_anchor="현재",
             )
-        rows.append(row)
-    adjudicated = tmp_path / "adjudicated.csv"
-    with adjudicated.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+        decisions.append(decision)
+    review_decisions = tmp_path / "human-review-decisions.json"
+    review_decisions.write_text(
+        json.dumps(
+            {
+                "reviewer": "HUMAN",
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "decisions": decisions,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    materialized = tmp_path / "human-gold-materialized"
+    materialization = materialize_human_gold(
+        candidate_build=candidates,
+        review_decisions=review_decisions,
+        output=materialized,
+    )
+    assert materialization["reviewer"] == "HUMAN"
+    assert materialization["review_decision_count"] == 52
+    adjudicated = materialized / "adjudicated-human-gold.csv"
     final = tmp_path / "locked-final"
     manifest = finalize_locked_sets(
         candidate_build=candidates,
@@ -1050,8 +1290,9 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
         minimum_per_axis_stratum=5,
     )
     assert manifest["status"] == "V2_DUAL_INDEPENDENT_LOCKED_SETS_PREPARED_OUTCOME_BLIND"
-    assert manifest["natural_packet_count"] == 3
-    assert manifest["balanced_packet_count"] == 75
+    assert manifest["natural_packet_count"] == 2
+    assert manifest["balanced_packet_count"] == 50
+    assert manifest["gold_label_authority"] == "HUMAN"
     assert all(
         count == 5
         for axis_counts in manifest["balanced_stratum_counts"].values()
