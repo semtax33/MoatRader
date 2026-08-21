@@ -195,6 +195,64 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
     assert pilot["full_historical_execution_authorized"] is False
     assert calls == 2
 
+    (tmp_path / "private").mkdir()
+    (tmp_path / "llm").mkdir()
+    pair_source = tmp_path / "private" / "filing-pairs.jsonl"
+    blinded_source = tmp_path / "llm" / "blinded-packets.jsonl"
+    before = tmp_path / "private" / "source-integrity-before.json"
+    after = tmp_path / "private" / "source-integrity-after.json"
+    source_audit = tmp_path / "source-audit.json"
+    source_build_manifest = tmp_path / "build-manifest.json"
+    pair_source.write_text('{"fixture": "pair"}\n', encoding="utf-8")
+    blinded_source.write_text(packet_input.read_text(encoding="utf-8"), encoding="utf-8")
+    integrity_records = [{"path": "readonly/source.html", "sha256": "a" * 64}]
+    before.write_text(
+        json.dumps(
+            {
+                "mutation_policy": "ARCANA_AND_MOATRADER_SOURCE_FILES_READ_ONLY",
+                "records": integrity_records,
+            }
+        ),
+        encoding="utf-8",
+    )
+    after.write_text(
+        json.dumps(
+            {
+                "verification_status": "PASS_NO_SOURCE_MUTATION",
+                "records": integrity_records,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_audit.write_text(
+        json.dumps(
+            {
+                "schema_version": "moatrader-historical-source-audit-v1/2",
+                "both_source_systems_used": True,
+                "all_arcana_sections_discovered": True,
+                "all_arcana_sections_read_for_pairs": True,
+                "all_arcana_sections_contributed_to_packets": True,
+                "source_files_modified": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    source_build_manifest.write_text(
+        json.dumps(
+            {
+                "source_files_modified": False,
+                "artifacts": {
+                    "source-audit.json": sha256_file(source_audit),
+                    "private/filing-pairs.jsonl": sha256_file(pair_source),
+                    "llm/blinded-packets.jsonl": sha256_file(blinded_source),
+                    "private/source-integrity-before.json": sha256_file(before),
+                    "private/source-integrity-after.json": sha256_file(after),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
     selection = tmp_path / "selection.json"
     selection.write_text(
         json.dumps(
@@ -203,6 +261,10 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
                 "selected_packet_count": 2,
                 "semantic_primary_axes": ["DEMAND", "PRICE_MIX"],
                 "output_packet_sha256": sha256_file(packet_input),
+                "source_hashes": {
+                    "filing_pairs": sha256_file(pair_source),
+                    "blinded_packets": sha256_file(blinded_source),
+                },
                 "outcome_vault_opened": False,
                 "return_data_opened": False,
             }
@@ -266,6 +328,26 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
             transport=FunctionTransport(handler),
         )
     assert calls == 2
+
+    source_audit_text = source_audit.read_text(encoding="utf-8")
+    invalid_source_audit = json.loads(source_audit_text)
+    invalid_source_audit["all_arcana_sections_read_for_pairs"] = False
+    source_audit.write_text(json.dumps(invalid_source_audit), encoding="utf-8")
+    with pytest.raises(ValueError, match="all_arcana_sections_read_for_pairs"):
+        run_classifier(
+            input_build=tmp_path,
+            packet_input=packet_input,
+            output=tmp_path / "failed-source-full",
+            execute=True,
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+            semantic_execution_scope=SemanticExecutionScope.FULL_HISTORICAL,
+            dual_locked_manifest=locked,
+            semantic_selection_manifest=selection,
+            semantic_cost_manifest=cost,
+            transport=FunctionTransport(handler),
+        )
+    assert calls == 2
+    source_audit.write_text(source_audit_text, encoding="utf-8")
 
     full = run_classifier(
         input_build=tmp_path,
@@ -542,7 +624,8 @@ def test_dev_freeze_and_locked_test_are_split_aware_and_single_use(tmp_path: Pat
 
     def classification_build(path: Path, packets: list[PairedAxisPacket], packet_path: Path) -> None:
         path.mkdir()
-        (path / "classifications.jsonl").write_text(
+        classification_path = path / "classifications.jsonl"
+        classification_path.write_text(
             "".join(classification(packet).model_dump_json() + "\n" for packet in packets),
             encoding="utf-8",
         )
@@ -551,6 +634,9 @@ def test_dev_freeze_and_locked_test_are_split_aware_and_single_use(tmp_path: Pat
                 {
                     "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
                     "input_blinded_packet_sha256": sha256_file(packet_path),
+                    "classification_sha256": sha256_file(classification_path),
+                    "packet_count": len(packets),
+                    "classification_count": len(packets),
                     "parser_version": "parser-test-v1",
                     "prompt_sha256": "a" * 64,
                     "requested_model": "fixture",

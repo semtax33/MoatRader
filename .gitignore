@@ -12,3 +12,4 @@ data-lake/demo/
 data-lake/**
 ./data-
 tmp/
+outputs/

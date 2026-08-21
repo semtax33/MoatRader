@@ -331,9 +331,70 @@ def _read_gate_manifest(path: Path, description: str) -> dict[str, Any]:
     return value
 
 
+def _validate_semantic_source_build(
+    *, input_build: Path, selection: dict[str, Any]
+) -> dict[str, str]:
+    source_audit_path = input_build / "source-audit.json"
+    build_manifest_path = input_build / "build-manifest.json"
+    pair_path = input_build / "private" / "filing-pairs.jsonl"
+    blinded_path = input_build / "llm" / "blinded-packets.jsonl"
+    before_path = input_build / "private" / "source-integrity-before.json"
+    after_path = input_build / "private" / "source-integrity-after.json"
+    source_audit = _read_gate_manifest(source_audit_path, "semantic source audit")
+    build_manifest = _read_gate_manifest(build_manifest_path, "semantic source build manifest")
+    before = _read_gate_manifest(before_path, "semantic source integrity before")
+    after = _read_gate_manifest(after_path, "semantic source integrity after")
+    for path in (pair_path, blinded_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    if source_audit.get("schema_version") != "moatrader-historical-source-audit-v1/2":
+        raise ValueError("full semantic run requires the three-section source audit schema")
+    if not source_audit.get("both_source_systems_used", False):
+        raise ValueError("full semantic run requires Arcana and MoatRader source systems")
+    for key in (
+        "all_arcana_sections_discovered",
+        "all_arcana_sections_read_for_pairs",
+        "all_arcana_sections_contributed_to_packets",
+    ):
+        if source_audit.get(key) is not True:
+            raise ValueError(f"full semantic source audit failed: {key}")
+    if source_audit.get("source_files_modified", True) or build_manifest.get(
+        "source_files_modified", True
+    ):
+        raise ValueError("full semantic source build reports modified originals")
+    if before.get("mutation_policy") != "ARCANA_AND_MOATRADER_SOURCE_FILES_READ_ONLY":
+        raise ValueError("semantic source integrity lacks the read-only mutation policy")
+    if after.get("verification_status") != "PASS_NO_SOURCE_MUTATION":
+        raise ValueError("semantic source integrity verification did not pass")
+    if before.get("records") != after.get("records"):
+        raise ValueError("semantic source integrity records changed")
+    source_hashes = selection.get("source_hashes", {})
+    if source_hashes.get("filing_pairs") != sha256_file(pair_path):
+        raise ValueError("semantic selection filing-pair source hash mismatch")
+    if source_hashes.get("blinded_packets") != sha256_file(blinded_path):
+        raise ValueError("semantic selection blinded-packet source hash mismatch")
+    artifacts = build_manifest.get("artifacts", {})
+    for name, path in (
+        ("source-audit.json", source_audit_path),
+        ("private/filing-pairs.jsonl", pair_path),
+        ("llm/blinded-packets.jsonl", blinded_path),
+        ("private/source-integrity-before.json", before_path),
+        ("private/source-integrity-after.json", after_path),
+    ):
+        if artifacts.get(name) != sha256_file(path):
+            raise ValueError(f"semantic source artifact changed after build: {name}")
+    return {
+        "semantic_source_audit_sha256": sha256_file(source_audit_path),
+        "semantic_source_build_manifest_sha256": sha256_file(build_manifest_path),
+        "semantic_source_integrity_before_sha256": sha256_file(before_path),
+        "semantic_source_integrity_after_sha256": sha256_file(after_path),
+    }
+
+
 def _validate_semantic_execution_gate(
     *,
     scope: SemanticExecutionScope | str | None,
+    input_build: Path,
     packet_path: Path,
     packet_count: int,
     model: str,
@@ -421,6 +482,10 @@ def _validate_semantic_execution_gate(
         semantic_selection_manifest
     ):
         raise ValueError("semantic cost manifest selection hash mismatch")
+    source_authorization = _validate_semantic_source_build(
+        input_build=input_build,
+        selection=selection,
+    )
     return {
         "semantic_execution_scope": selected_scope.value,
         "full_historical_execution_authorized": True,
@@ -429,6 +494,7 @@ def _validate_semantic_execution_gate(
             semantic_selection_manifest
         ),
         "semantic_cost_manifest_sha256": sha256_file(semantic_cost_manifest),
+        **source_authorization,
     }
 
 
@@ -555,6 +621,8 @@ def run(
             "private_source_map_opened": False,
             "outcome_vault_opened": False,
             "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
             "credentials_persisted": False,
         }
         _write_json(output / "stage-status.json", status)
@@ -564,6 +632,7 @@ def run(
     if spec.profile == ParserProfile.DEMAND_PRICE_MIX_V2:
         semantic_gate = _validate_semantic_execution_gate(
             scope=semantic_execution_scope,
+            input_build=input_build,
             packet_path=packet_path,
             packet_count=packet_count,
             model=model,
@@ -732,6 +801,8 @@ def run(
         "private_source_map_opened": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
         "credentials_persisted": False,
         **semantic_gate,
     }

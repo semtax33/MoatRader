@@ -28,6 +28,11 @@ from moatrader.expectations.historical_evidence_v2 import (
     qualitative_axis_evidence,
     sparse_feature_coverage_report,
 )
+from scripts.classify_historical_future_eri_evidence import (
+    ParserProfile,
+    SemanticExecutionScope,
+    parser_spec,
+)
 
 
 class AxisApplicabilityDecisionInputV2(ContractModel):
@@ -109,6 +114,73 @@ def _validation_status(path: Path | None, *, coverage_only_unvalidated: bool) ->
     return payload
 
 
+def _validate_classification_execution(
+    *,
+    classification_stage: dict[str, Any],
+    classification_path: Path,
+    parser_validation_manifest: Path | None,
+    validation: dict[str, Any],
+    coverage_only_unvalidated: bool,
+) -> None:
+    if coverage_only_unvalidated:
+        if classification_stage.get("status") not in {
+            "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+            "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED",
+        }:
+            raise ValueError("classification build is incomplete")
+        expected_hash = classification_stage.get("classification_sha256")
+        if expected_hash is not None and expected_hash != sha256_file(classification_path):
+            raise ValueError("classification file changed after its stage manifest")
+        return
+
+    if parser_validation_manifest is None:
+        raise ValueError("production semantic classifications require the dual LOCKED manifest")
+    if classification_stage.get("status") != (
+        "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED"
+    ):
+        raise ValueError("production sparse features require the gated full semantic run")
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
+    if classification_stage.get("parser_profile") != spec.profile.value:
+        raise ValueError("full classification did not use the semantic V2 parser profile")
+    if classification_stage.get("semantic_execution_scope") != (
+        SemanticExecutionScope.FULL_HISTORICAL.value
+    ) or classification_stage.get("full_historical_execution_authorized") is not True:
+        raise ValueError("full classification lacks FULL_HISTORICAL authorization")
+    for key in (
+        "outcome_vault_opened",
+        "return_data_opened",
+        "value_data_opened",
+        "private_source_map_opened",
+        "credentials_persisted",
+    ):
+        if classification_stage.get(key, False):
+            raise ValueError(f"full classification opened or persisted forbidden data: {key}")
+    if classification_stage.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+        raise ValueError("full classification used PER/PBR before the Full Index seal")
+    for key, expected in (
+        ("parser_version", spec.parser_version),
+        ("prompt_sha256", spec.prompt_sha256),
+        ("requested_model", "gpt-5.6-luna"),
+    ):
+        if classification_stage.get(key) != expected:
+            raise ValueError(f"full classification does not match frozen {key}")
+        if validation.get(key) != expected:
+            raise ValueError(f"dual LOCKED validation does not match frozen {key}")
+    if classification_stage.get("dual_locked_manifest_sha256") != sha256_file(
+        parser_validation_manifest
+    ):
+        raise ValueError("full classification used a different dual LOCKED authorization")
+    if classification_stage.get("classification_sha256") != sha256_file(
+        classification_path
+    ):
+        raise ValueError("classification file changed after its full-run stage manifest")
+    packet_count = classification_stage.get("packet_count")
+    if not isinstance(packet_count, int) or packet_count < 1:
+        raise ValueError("full classification packet count is invalid")
+    if classification_stage.get("classification_count") != packet_count:
+        raise ValueError("full semantic classification count is incomplete")
+
+
 def _measurement_contract(
     *,
     contract_freeze_manifest: Path | None,
@@ -157,6 +229,16 @@ def _measurement_contract(
         "locked_evaluator": workspace / "scripts" / "evaluate_historical_evidence_parser_v2.py",
         "locked_set_preparer": workspace / "scripts" / "prepare_historical_locked_sets_v2.py",
         "abstention_audit": workspace / "scripts" / "audit_historical_evidence_abstentions_v2.py",
+        "evidence_index_freezer": workspace
+        / "scripts"
+        / "freeze_historical_evidence_index_v2.py",
+        "semantic_classifier": workspace
+        / "scripts"
+        / "classify_historical_future_eri_evidence.py",
+        "full_index_sealer": workspace
+        / "scripts"
+        / "seal_historical_full_evidence_index_v2.py",
+        "eri_runner": workspace / "scripts" / "run_historical_evidence_index_eri_v2.py",
     }
     frozen_code_hashes = contract.get("code_sha256", {})
     for name, path in current_code_paths.items():
@@ -297,17 +379,22 @@ def build_sparse_features(
         coverage_only_unvalidated=coverage_only_unvalidated,
     )
     classification_stage = json.loads(classification_stage_path.read_text(encoding="utf-8"))
-    if classification_stage.get("status") != "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE":
-        raise ValueError("classification build is incomplete")
-    if parser_validation_manifest is not None:
-        for key in ("parser_version", "prompt_sha256", "requested_model"):
-            if classification_stage.get(key) != validation.get(key):
-                raise ValueError(f"classification build does not match validated {key}")
+    _validate_classification_execution(
+        classification_stage=classification_stage,
+        classification_path=classification_path,
+        parser_validation_manifest=parser_validation_manifest,
+        validation=validation,
+        coverage_only_unvalidated=coverage_only_unvalidated,
+    )
 
     classifications_list = _read_jsonl(classification_path, AxisPairClassification)
     classifications = {item.packet_id: item for item in classifications_list}
     if len(classifications) != len(classifications_list):
         raise ValueError("V2 classifications must have unique packet IDs")
+    if not coverage_only_unvalidated and len(classifications_list) != classification_stage.get(
+        "classification_count"
+    ):
+        raise ValueError("classification row count differs from the full-run stage manifest")
 
     applicability_rows = (
         _read_jsonl(applicability_input, AxisApplicabilityDecisionInputV2)
@@ -482,6 +569,8 @@ def build_sparse_features(
         "per_pbr_role": "NOT_USED",
         "source_contract": source_contract,
         "measurement_contract_tag": measurement_contract.get("contract_tag"),
+        "measurement_contract_git_commit": measurement_contract.get("git_commit"),
+        "measurement_contract_code_sha256": measurement_contract.get("code_sha256", {}),
         "measurement_contract_frozen": measurement_contract.get("status")
         == "V2_PRE_OUTCOME_CONTRACT_FROZEN",
         "input_hashes": {

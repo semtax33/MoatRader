@@ -510,6 +510,8 @@ def prepare_locked_candidates(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "candidate-preparation-manifest.json", manifest)
     return manifest
@@ -649,6 +651,8 @@ def prepare_supplemental_candidates(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "supplemental-candidate-preparation-manifest.json", manifest)
     return manifest
@@ -815,6 +819,8 @@ def extend_locked_candidates(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "candidate-preparation-manifest.json", manifest)
     return manifest
@@ -991,6 +997,8 @@ def finalize_locked_sets(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "locked-set-preparation-manifest.json", manifest)
     return manifest

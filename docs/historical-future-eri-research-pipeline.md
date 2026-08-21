@@ -323,8 +323,14 @@ LLM 분류 입력에 넣는다. 모든 feature row에는 여섯 축이 남지만
 grounded `-1/0/+1`만 센다. CAPEX는 이 분자·분모에서 모두 제외한다. applicable-axis
 count와 coverage는 별도 필드로 보존하며 score에 coverage/confidence를 곱하지 않는다.
 
-`historical_evidence_v2.py`와 V2 stage scripts는 다음 순서와 게이트를 구현한다. 현재 허용
-범위는 feature-only calibration까지이며 ERI, Value, return은 닫혀 있다.
+`historical_evidence_v2.py`와 V2 stage scripts는 다음 구성요소와 게이트를 구현한다.
+production 실행 순서는 반드시 `semantic DEV 평가 → V2 parser freeze → measurement/code
+contract freeze → Natural/Balanced single-use LOCKED 평가 → 87,204건 full semantic 분류 →
+Full Evidence Index coverage seal → t+63 ERI open`이다. 검증용
+`CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE` 결과는 sparse production 입력으로
+승격할 수 없고, `FULL_HISTORICAL` authorization과 dual LOCKED SHA가 기록된 분류만 허용한다.
+Full Index seal은 classifier, sparse builder, sealer, ERI runner의 동결 SHA와 git commit도
+재검증한다. 이 순서 전에는 ERI, Value, return이 닫혀 있다.
 
 1. `freeze_historical_sparse_contract_v2.py`
    - `0=현재 근거로 확인된 무변화`, `NA=현재 근거 없음`,

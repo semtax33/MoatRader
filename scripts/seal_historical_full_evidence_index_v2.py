@@ -94,6 +94,31 @@ def _share(counter: Counter[str], denominator: int) -> D:
     return D(counter.most_common(1)[0][1]) / D(denominator)
 
 
+def _validate_frozen_execution_code(
+    *, workspace: Path, sparse_stage: dict[str, Any], current_commit: str
+) -> None:
+    if sparse_stage.get("measurement_contract_frozen") is not True:
+        raise ValueError("Full Index seal requires the frozen V2 measurement contract")
+    if sparse_stage.get("measurement_contract_git_commit") != current_commit:
+        raise ValueError("measurement code commit changed after the V2 contract freeze")
+    frozen = sparse_stage.get("measurement_contract_code_sha256", {})
+    if not isinstance(frozen, dict):
+        raise ValueError("sparse feature stage lacks frozen measurement code hashes")
+    required = {
+        "semantic_classifier": workspace
+        / "scripts"
+        / "classify_historical_future_eri_evidence.py",
+        "sparse_builder": workspace / "scripts" / "build_historical_sparse_features_v2.py",
+        "full_index_sealer": workspace
+        / "scripts"
+        / "seal_historical_full_evidence_index_v2.py",
+        "eri_runner": workspace / "scripts" / "run_historical_evidence_index_eri_v2.py",
+    }
+    for name, path in required.items():
+        if frozen.get(name) != sha256_file(path):
+            raise ValueError(f"V2 measurement code changed after contract freeze: {name}")
+
+
 def full_evidence_index_diagnostics_v2(
     rows: list[FullEvidenceIndexRowV2],
     *,
@@ -301,6 +326,27 @@ def _validate_gates(
         raise ValueError("Arcana three-section or MoatRader original source proof is missing")
     if provenance.get("source_files_modified") is not False:
         raise ValueError("source provenance does not prove original-file preservation")
+    source_contract = sparse.get("source_contract", {})
+    if source_contract.get("status") != (
+        "ARCANA_AND_MOATRADER_ORIGINALS_VERIFIED_READ_ONLY"
+    ) or source_contract.get("verified") is not True:
+        raise ValueError("sparse features lack the production three-section source contract")
+    for classification_key, source_key in (
+        ("semantic_source_audit_sha256", "source_audit_sha256"),
+        ("semantic_source_build_manifest_sha256", "build_manifest_sha256"),
+        (
+            "semantic_source_integrity_before_sha256",
+            "source_integrity_before_sha256",
+        ),
+        (
+            "semantic_source_integrity_after_sha256",
+            "source_integrity_after_sha256",
+        ),
+    ):
+        if classification.get(classification_key) != source_contract.get(source_key):
+            raise ValueError(
+                f"semantic classification and sparse source lineage differ: {classification_key}"
+            )
     return {
         "sparse": sparse,
         "locked": locked,
@@ -346,6 +392,11 @@ def seal_full_evidence_index_v2(
         capture_output=True,
         text=True,
     ).stdout.strip()
+    _validate_frozen_execution_code(
+        workspace=workspace,
+        sparse_stage=gates["sparse"],
+        current_commit=commit,
+    )
     dirty = subprocess.run(
         ["git", "status", "--porcelain"],
         cwd=workspace,

@@ -158,6 +158,8 @@ def materialize_human_gold(
         "source_spans_materialized_from_human_anchors": True,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "human-gold-materialization-manifest.json", manifest)
     return manifest

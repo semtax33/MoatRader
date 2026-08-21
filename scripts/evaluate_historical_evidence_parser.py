@@ -62,6 +62,10 @@ def evaluate_parser(
     packet_hash = sha256_file(packet_input)
     if classification_status.get("input_blinded_packet_sha256") != packet_hash:
         raise ValueError("classification stage packet hash does not match evaluation input")
+    if classification_status.get("classification_sha256") != sha256_file(
+        classification_path
+    ):
+        raise ValueError("classification file changed after its stage manifest")
 
     if split == "LOCKED_TEST":
         if parser_freeze_manifest is None or locked_consumption_record is None:
@@ -100,6 +104,10 @@ def evaluate_parser(
         raise ValueError("packet and classification IDs must be unique")
     if set(packets) != set(classifications):
         raise ValueError("classification IDs must exactly match evaluation packet IDs")
+    if classification_status.get("packet_count") != len(packets_list) or (
+        classification_status.get("classification_count") != len(classifications_list)
+    ):
+        raise ValueError("classification stage counts do not match evaluation artifacts")
 
     report = evaluate_human_gold_quality(
         human_gold_path=human_gold,
@@ -168,11 +176,17 @@ def evaluate_parser(
         "status": stage,
         "split": split,
         "gate_passed": bool(report["gate_passed"]),
+        "parser_profile": classification_status.get("parser_profile"),
         "parser_version": classification_status["parser_version"],
         "prompt_sha256": classification_status["prompt_sha256"],
         "requested_model": classification_status["requested_model"],
+        "semantic_execution_scope": classification_status.get(
+            "semantic_execution_scope"
+        ),
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "stage-status.json", status)
     return status

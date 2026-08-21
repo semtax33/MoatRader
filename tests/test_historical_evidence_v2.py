@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import subprocess
 import zipfile
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -79,10 +80,15 @@ from scripts.build_historical_deterministic_pit_evidence_v2 import (
 from scripts.build_historical_sparse_features_v2 import (
     AxisApplicabilityDecisionInputV2,
     DeterministicAxisEvidenceInputV2,
+    _validate_classification_execution,
     build_sparse_features,
 )
 from scripts.calibrate_historical_sparse_features_v2 import calibrate_sparse_features
-from scripts.classify_historical_future_eri_evidence import ParserProfile, parser_spec
+from scripts.classify_historical_future_eri_evidence import (
+    ParserProfile,
+    SemanticExecutionScope,
+    parser_spec,
+)
 from scripts.evaluate_historical_evidence_parser_v2 import (
     combine_v2_locked_evaluations,
     create_v2_parser_freeze,
@@ -569,6 +575,32 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
     spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
     classification_sha = "c" * 64
     packet_sha = "b" * 64
+    source_audit_sha = "1" * 64
+    source_build_sha = "2" * 64
+    source_before_sha = "3" * 64
+    source_after_sha = "4" * 64
+    workspace = Path.cwd()
+    current_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    frozen_code = {
+        "semantic_classifier": sha256_file(
+            workspace / "scripts" / "classify_historical_future_eri_evidence.py"
+        ),
+        "sparse_builder": sha256_file(
+            workspace / "scripts" / "build_historical_sparse_features_v2.py"
+        ),
+        "full_index_sealer": sha256_file(
+            workspace / "scripts" / "seal_historical_full_evidence_index_v2.py"
+        ),
+        "eri_runner": sha256_file(
+            workspace / "scripts" / "run_historical_evidence_index_eri_v2.py"
+        ),
+    }
 
     def write_manifest(name: str, payload: dict[str, object]) -> Path:
         path = tmp_path / f"{name}.json"
@@ -583,6 +615,17 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
             "parser_directional_validation_passed": True,
             "missing_is_neutral": False,
             "deterministic_pit_priority_applied": True,
+            "measurement_contract_frozen": True,
+            "measurement_contract_git_commit": current_commit,
+            "measurement_contract_code_sha256": frozen_code,
+            "source_contract": {
+                "status": "ARCANA_AND_MOATRADER_ORIGINALS_VERIFIED_READ_ONLY",
+                "verified": True,
+                "source_audit_sha256": source_audit_sha,
+                "build_manifest_sha256": source_build_sha,
+                "source_integrity_before_sha256": source_before_sha,
+                "source_integrity_after_sha256": source_after_sha,
+            },
             "input_hashes": {
                 "sparse_features": sha256_file(sparse_input),
                 "classifications": classification_sha,
@@ -633,6 +676,10 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
             "dual_locked_manifest_sha256": sha256_file(locked_manifest),
             "semantic_selection_manifest_sha256": sha256_file(selection_manifest),
             "semantic_cost_manifest_sha256": sha256_file(cost_manifest),
+            "semantic_source_audit_sha256": source_audit_sha,
+            "semantic_source_build_manifest_sha256": source_build_sha,
+            "semantic_source_integrity_before_sha256": source_before_sha,
+            "semantic_source_integrity_after_sha256": source_after_sha,
         },
     )
     core_manifest = write_manifest(
@@ -1718,6 +1765,71 @@ def test_sparse_builder_retains_all_pairs_and_unclassified_axes_as_na(tmp_path: 
     assert result["outcome_stage_authorized"] is False
 
 
+def test_production_sparse_builder_accepts_only_authorized_full_semantic_stage(
+    tmp_path: Path,
+) -> None:
+    classification_path = tmp_path / "classifications.jsonl"
+    classification_path.write_text('{"fixture": true}\n', encoding="utf-8")
+    dual_locked = tmp_path / "dual-locked.json"
+    dual_locked.write_text(
+        json.dumps({"status": "V2_LOCKED_TESTS_PASSED"}), encoding="utf-8"
+    )
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
+    validation = {
+        "status": "V2_LOCKED_TESTS_PASSED",
+        "parser_version": spec.parser_version,
+        "prompt_sha256": spec.prompt_sha256,
+        "requested_model": "gpt-5.6-luna",
+    }
+    stage = {
+        "status": "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED",
+        "parser_profile": spec.profile.value,
+        "semantic_execution_scope": SemanticExecutionScope.FULL_HISTORICAL.value,
+        "full_historical_execution_authorized": True,
+        "parser_version": spec.parser_version,
+        "prompt_sha256": spec.prompt_sha256,
+        "requested_model": "gpt-5.6-luna",
+        "dual_locked_manifest_sha256": sha256_file(dual_locked),
+        "classification_sha256": sha256_file(classification_path),
+        "packet_count": 1,
+        "classification_count": 1,
+        "private_source_map_opened": False,
+        "outcome_vault_opened": False,
+        "return_data_opened": False,
+        "value_data_opened": False,
+        "credentials_persisted": False,
+        "per_pbr_role": "NOT_USED",
+    }
+
+    _validate_classification_execution(
+        classification_stage=stage,
+        classification_path=classification_path,
+        parser_validation_manifest=dual_locked,
+        validation=validation,
+        coverage_only_unvalidated=False,
+    )
+
+    legacy = dict(stage)
+    legacy["status"] = "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE"
+    with pytest.raises(ValueError, match="gated full semantic run"):
+        _validate_classification_execution(
+            classification_stage=legacy,
+            classification_path=classification_path,
+            parser_validation_manifest=dual_locked,
+            validation=validation,
+            coverage_only_unvalidated=False,
+        )
+    classification_path.write_text('{"fixture": "mutated"}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="changed after its full-run stage manifest"):
+        _validate_classification_execution(
+            classification_stage=stage,
+            classification_path=classification_path,
+            parser_validation_manifest=dual_locked,
+            validation=validation,
+            coverage_only_unvalidated=False,
+        )
+
+
 def test_calibration_diagnostics_never_auto_select_nobs(tmp_path: Path) -> None:
     rows = [
         _breadth_row(index, directions)
@@ -1898,6 +2010,7 @@ def _locked_packet(index: int, axis: OperatingEvidenceAxis) -> PairedAxisPacket:
 
 
 def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: Path) -> None:
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
     balanced_packets: list[PairedAxisPacket] = []
     balanced_labels: list[AxisPairClassification] = []
     natural_packets: list[PairedAxisPacket] = []
@@ -2017,18 +2130,31 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
         labels: list[AxisPairClassification],
     ) -> None:
         path.mkdir()
-        (path / "classifications.jsonl").write_text(
+        classification_path = path / "classifications.jsonl"
+        classification_path.write_text(
             "".join(item.model_dump_json() + "\n" for item in labels), encoding="utf-8"
         )
         (path / "stage-status.json").write_text(
             json.dumps(
-                {
-                    "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
-                    "input_blinded_packet_sha256": sha256_file(packet_path),
-                    "parser_version": "parser-v2-test",
-                    "prompt_sha256": "a" * 64,
-                    "requested_model": "fixture",
-                }
+                    {
+                        "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+                        "input_blinded_packet_sha256": sha256_file(packet_path),
+                        "classification_sha256": sha256_file(classification_path),
+                        "packet_count": len(labels),
+                        "classification_count": len(labels),
+                        "parser_profile": spec.profile.value,
+                        "parser_version": spec.parser_version,
+                        "prompt_sha256": spec.prompt_sha256,
+                        "requested_model": "gpt-5.6-luna",
+                        "semantic_execution_scope": (
+                            SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value
+                        ),
+                        "full_historical_execution_authorized": False,
+                        "outcome_vault_opened": False,
+                        "return_data_opened": False,
+                        "value_data_opened": False,
+                        "per_pbr_role": "NOT_USED",
+                    }
             ),
             encoding="utf-8",
         )
@@ -2041,17 +2167,22 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
     freeze.write_text(
         json.dumps(
             {
-                "schema_version": "moatrader-historical-evidence-parser-freeze-v2/2",
-                "status": "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS",
-                "parser_version": "parser-v2-test",
-                "prompt_sha256": "a" * 64,
-                "requested_model": "fixture",
+                    "schema_version": "moatrader-historical-evidence-parser-freeze-v2/2",
+                    "status": "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS",
+                    "parser_profile": spec.profile.value,
+                    "parser_version": spec.parser_version,
+                    "prompt_sha256": spec.prompt_sha256,
+                    "requested_model": "gpt-5.6-luna",
                 "natural_locked_packet_sha256": sha256_file(natural_input),
                 "balanced_locked_packet_sha256": sha256_file(balanced_input),
                 "human_gold_sha256": sha256_file(gold),
-                "locked_sets_disjoint": True,
-                "v1_locked_rows_reused": False,
-            }
+                    "locked_sets_disjoint": True,
+                    "v1_locked_rows_reused": False,
+                    "outcome_vault_opened": False,
+                    "return_data_opened": False,
+                    "value_data_opened": False,
+                    "per_pbr_role": "NOT_USED",
+                }
         ),
         encoding="utf-8",
     )
@@ -2116,6 +2247,7 @@ def test_v2_dual_locked_sets_are_independent_balanced_and_single_use(tmp_path: P
 
 
 def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path) -> None:
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
     semantic_axes = (
         OperatingEvidenceAxis.DEMAND,
         OperatingEvidenceAxis.PRICE_MIX,
@@ -2233,14 +2365,20 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
     dev_evaluation = tmp_path / "dev-evaluation.json"
     dev_evaluation.write_text(
         json.dumps(
-            {
-                "status": "DEV_PASSED_PARSER_READY_TO_FREEZE",
-                "parser_version": "parser-v2-test",
-                "prompt_sha256": "a" * 64,
-                "requested_model": "fixture",
-                "outcome_vault_opened": False,
-                "return_data_opened": False,
-            }
+                {
+                    "status": "DEV_PASSED_PARSER_READY_TO_FREEZE",
+                    "parser_profile": spec.profile.value,
+                    "parser_version": spec.parser_version,
+                    "prompt_sha256": spec.prompt_sha256,
+                    "requested_model": "gpt-5.6-luna",
+                    "semantic_execution_scope": (
+                        SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value
+                    ),
+                    "outcome_vault_opened": False,
+                    "return_data_opened": False,
+                    "value_data_opened": False,
+                    "per_pbr_role": "NOT_USED",
+                }
         ),
         encoding="utf-8",
     )
@@ -2257,6 +2395,20 @@ def test_prepare_new_independent_natural_and_balanced_locked_sets(tmp_path: Path
     assert parser_freeze["locked_set_preparation_manifest_sha256"] == sha256_file(
         final / "locked-set-preparation-manifest.json"
     )
+    legacy_dev = tmp_path / "legacy-dev-evaluation.json"
+    legacy_payload = json.loads(dev_evaluation.read_text(encoding="utf-8"))
+    legacy_payload["parser_profile"] = ParserProfile.LEGACY_V1.value
+    legacy_dev.write_text(json.dumps(legacy_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="semantic V2 parser_profile"):
+        create_v2_parser_freeze(
+            dev_evaluation_manifest=legacy_dev,
+            locked_set_preparation_manifest=final
+            / "locked-set-preparation-manifest.json",
+            natural_locked_packet_input=final / "natural-locked-packets.jsonl",
+            balanced_locked_packet_input=final / "balanced-locked-packets.jsonl",
+            human_gold=final / "v2-locked-human-gold.csv",
+            output=tmp_path / "legacy-parser-freeze.json",
+        )
 
 
 def test_human_review_rows_distinguish_unreviewed_candidates_from_abstentions() -> None:

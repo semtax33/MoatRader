@@ -136,6 +136,8 @@ def merge_human_review_decisions(
         "source_decision_files": source_files,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
         "decisions": decisions,
     }
     _write_json(output, result)

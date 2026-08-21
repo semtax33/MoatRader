@@ -13,6 +13,7 @@ from moatrader.expectations.historical_evidence_v2 import (
     EvidenceIndexContractV2,
     PITApplicabilityRulesV2,
 )
+from scripts.classify_historical_future_eri_evidence import ParserProfile, parser_spec
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -95,6 +96,13 @@ def freeze_contract(
         "locked_set_preparer": workspace / "scripts" / "prepare_historical_locked_sets_v2.py",
         "abstention_audit": workspace / "scripts" / "audit_historical_evidence_abstentions_v2.py",
         "evidence_index_freezer": workspace / "scripts" / "freeze_historical_evidence_index_v2.py",
+        "semantic_classifier": workspace
+        / "scripts"
+        / "classify_historical_future_eri_evidence.py",
+        "full_index_sealer": workspace
+        / "scripts"
+        / "seal_historical_full_evidence_index_v2.py",
+        "eri_runner": workspace / "scripts" / "run_historical_evidence_index_eri_v2.py",
     }
     for path in (
         rules_input,
@@ -111,10 +119,24 @@ def freeze_contract(
     parser_freeze = json.loads(parser_freeze_manifest.read_text(encoding="utf-8"))
     if parser_freeze.get("schema_version") != "moatrader-historical-evidence-parser-freeze-v2/2":
         raise ValueError("contract freeze requires the dual independent V2 parser freeze")
-    if parser_freeze.get("outcome_vault_opened", False) or parser_freeze.get(
-        "return_data_opened", False
+    if parser_freeze.get("status") != (
+        "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS"
     ):
-        raise ValueError("parser freeze is contaminated by downstream data")
+        raise ValueError("contract freeze requires the pending dual-LOCKED parser freeze")
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
+    for key, expected in (
+        ("parser_profile", spec.profile.value),
+        ("parser_version", spec.parser_version),
+        ("prompt_sha256", spec.prompt_sha256),
+        ("requested_model", "gpt-5.6-luna"),
+    ):
+        if parser_freeze.get(key) != expected:
+            raise ValueError(f"contract freeze parser does not match semantic V2 {key}")
+    for key in ("outcome_vault_opened", "return_data_opened", "value_data_opened"):
+        if parser_freeze.get(key, False):
+            raise ValueError(f"parser freeze opened forbidden downstream data: {key}")
+    if parser_freeze.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+        raise ValueError("parser freeze used PER/PBR before the Full Index seal")
     source_audit = json.loads(source_audit_path.read_text(encoding="utf-8"))
     source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
     if not source_audit.get("both_source_systems_used", False):

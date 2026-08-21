@@ -17,6 +17,11 @@ from moatrader.expectations.historical_evidence import (
     sha256_file,
     validate_classification_grounding,
 )
+from scripts.classify_historical_future_eri_evidence import (
+    ParserProfile,
+    SemanticExecutionScope,
+    parser_spec,
+)
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -43,6 +48,27 @@ SEMANTIC_PARSER_AXES = (
     OperatingEvidenceAxis.DEMAND,
     OperatingEvidenceAxis.PRICE_MIX,
 )
+
+
+def _semantic_parser_contract() -> dict[str, str]:
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
+    return {
+        "parser_profile": spec.profile.value,
+        "parser_version": spec.parser_version,
+        "prompt_sha256": spec.prompt_sha256,
+        "requested_model": "gpt-5.6-luna",
+    }
+
+
+def _require_semantic_parser_contract(payload: dict[str, Any], description: str) -> None:
+    for key, expected in _semantic_parser_contract().items():
+        if payload.get(key) != expected:
+            raise ValueError(f"{description} does not match semantic V2 {key}")
+    for key in ("outcome_vault_opened", "return_data_opened", "value_data_opened"):
+        if payload.get(key, False):
+            raise ValueError(f"{description} opened forbidden downstream data: {key}")
+    if payload.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+        raise ValueError(f"{description} used PER/PBR before the Full Index seal")
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -125,8 +151,11 @@ def create_v2_parser_freeze(
         "DEV_PASSED_PARSER_FROZEN",
     }:
         raise ValueError("V2 freeze requires a passing outcome-blind DEV evaluation")
-    if dev.get("outcome_vault_opened", False) or dev.get("return_data_opened", False):
-        raise ValueError("DEV evaluation is contaminated by downstream data")
+    _require_semantic_parser_contract(dev, "DEV evaluation")
+    if dev.get("semantic_execution_scope") != (
+        SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value
+    ):
+        raise ValueError("V2 freeze requires semantic DEV validation scope")
     preparation = json.loads(locked_set_preparation_manifest.read_text(encoding="utf-8"))
     if preparation.get("status") != "V2_DUAL_INDEPENDENT_LOCKED_SETS_PREPARED_OUTCOME_BLIND":
         raise ValueError("V2 freeze requires the independent LOCKED-set preparation gate")
@@ -134,10 +163,11 @@ def create_v2_parser_freeze(
         raise ValueError("V1 LOCKED rows cannot be reused in V2")
     if not preparation.get("locked_sets_disjoint", False):
         raise ValueError("Natural and Balanced preparation sets are not disjoint")
-    if preparation.get("outcome_vault_opened", False) or preparation.get(
-        "return_data_opened", False
-    ):
-        raise ValueError("LOCKED-set preparation is contaminated by downstream data")
+    for key in ("outcome_vault_opened", "return_data_opened", "value_data_opened"):
+        if preparation.get(key, False):
+            raise ValueError(f"LOCKED-set preparation opened forbidden data: {key}")
+    if preparation.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+        raise ValueError("LOCKED-set preparation used PER/PBR before semantic validation")
     expected_prepared_hashes = {
         "natural_locked_packet_sha256": sha256_file(natural_locked_packet_input),
         "balanced_locked_packet_sha256": sha256_file(balanced_locked_packet_input),
@@ -157,6 +187,7 @@ def create_v2_parser_freeze(
         "schema_version": "moatrader-historical-evidence-parser-freeze-v2/2",
         "status": "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS",
         "frozen_at": datetime.now(SEOUL).isoformat(),
+        "parser_profile": dev["parser_profile"],
         "parser_version": dev["parser_version"],
         "prompt_sha256": dev["prompt_sha256"],
         "requested_model": dev["requested_model"],
@@ -173,6 +204,8 @@ def create_v2_parser_freeze(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output, payload)
     return payload
@@ -216,6 +249,7 @@ def evaluate_v2_locked_parser(
         raise ValueError("V1 or single-set LOCKED artifacts cannot validate V2 measurement")
     if freeze.get("status") != "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS":
         raise ValueError("V2 parser is not frozen for dual independent LOCKED tests")
+    _require_semantic_parser_contract(freeze, "V2 parser freeze")
     if freeze.get("v1_locked_rows_reused", True) or not freeze.get("locked_sets_disjoint", False):
         raise ValueError("V2 LOCKED sets must be new, mutually disjoint, and independent of V1")
     if freeze.get(str(config["packet_hash_key"])) != sha256_file(packet_input):
@@ -225,8 +259,19 @@ def evaluate_v2_locked_parser(
     classification_stage = json.loads(classification_status_path.read_text(encoding="utf-8"))
     if classification_stage.get("status") != "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE":
         raise ValueError(f"V2 {locked_kind} LOCKED classifications are incomplete")
+    _require_semantic_parser_contract(
+        classification_stage, f"V2 {locked_kind} LOCKED classification"
+    )
+    if classification_stage.get("semantic_execution_scope") != (
+        SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value
+    ) or classification_stage.get("full_historical_execution_authorized") is not False:
+        raise ValueError(f"V2 {locked_kind} classification lacks LOCKED validation scope")
     if classification_stage.get("input_blinded_packet_sha256") != sha256_file(packet_input):
         raise ValueError(f"V2 {locked_kind} LOCKED classification packet hash mismatch")
+    if classification_stage.get("classification_sha256") != sha256_file(
+        classification_path
+    ):
+        raise ValueError(f"V2 {locked_kind} LOCKED classification file changed")
     for key in ("parser_version", "prompt_sha256", "requested_model"):
         if classification_stage.get(key) != freeze.get(key):
             raise ValueError(f"V2 {locked_kind} classification does not match frozen {key}")
@@ -244,6 +289,8 @@ def evaluate_v2_locked_parser(
             "v1_locked_rows_reused": False,
             "outcome_vault_opened": False,
             "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
         },
     )
 
@@ -255,6 +302,10 @@ def evaluate_v2_locked_parser(
         raise ValueError("V2 LOCKED packet and classification IDs must be unique")
     if set(machine) != set(packets):
         raise ValueError("V2 LOCKED classifications must exactly match packet IDs")
+    if classification_stage.get("packet_count") != len(packet_rows) or (
+        classification_stage.get("classification_count") != len(classification_rows)
+    ):
+        raise ValueError("V2 LOCKED classification stage counts do not match artifacts")
     if any(packet.axis not in SEMANTIC_PARSER_AXES for packet in packets.values()):
         raise ValueError("V2 parser LOCKED sets may contain only frozen semantic-parser axes")
 
@@ -397,6 +448,8 @@ def evaluate_v2_locked_parser(
         "gold_label_authority": "HUMAN",
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / "parser-quality-report-v2.json"
@@ -413,6 +466,7 @@ def evaluate_v2_locked_parser(
         "natural_frequency_gate_passed": natural_gate if locked_kind == "NATURAL" else False,
         "directional_strata_gate_passed": balanced_gate if locked_kind == "BALANCED" else False,
         "parser_version": classification_stage["parser_version"],
+        "parser_profile": classification_stage["parser_profile"],
         "prompt_sha256": classification_stage["prompt_sha256"],
         "requested_model": classification_stage["requested_model"],
         "parser_quality_report_sha256": sha256_file(report_path),
@@ -420,6 +474,8 @@ def evaluate_v2_locked_parser(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output / "stage-status.json", stage)
     consumption = json.loads(locked_consumption_record.read_text(encoding="utf-8"))
@@ -451,6 +507,10 @@ def combine_v2_locked_evaluations(
             raise FileNotFoundError(path)
     natural = json.loads(natural_evaluation_manifest.read_text(encoding="utf-8"))
     balanced = json.loads(balanced_evaluation_manifest.read_text(encoding="utf-8"))
+    freeze = json.loads(parser_freeze_manifest.read_text(encoding="utf-8"))
+    if freeze.get("status") != "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS":
+        raise ValueError("supplied semantic V2 parser freeze is invalid")
+    _require_semantic_parser_contract(freeze, "V2 parser freeze")
     expected_freeze_hash = sha256_file(parser_freeze_manifest)
     if natural.get("status") != "V2_NATURAL_LOCKED_TEST_PASSED":
         raise ValueError("Natural-frequency V2 LOCKED test has not passed")
@@ -461,11 +521,10 @@ def combine_v2_locked_evaluations(
     if not balanced.get("directional_strata_gate_passed", False):
         raise ValueError("Balanced directional-strata gate flag is false")
     for manifest in (natural, balanced):
+        _require_semantic_parser_contract(manifest, "V2 LOCKED evaluation")
         if manifest.get("parser_freeze_sha256") != expected_freeze_hash:
             raise ValueError("LOCKED evaluations do not share the supplied parser freeze")
-        if manifest.get("outcome_vault_opened", False) or manifest.get("return_data_opened", False):
-            raise ValueError("LOCKED evaluation is contaminated by downstream data")
-    for key in ("parser_version", "prompt_sha256", "requested_model"):
+    for key in ("parser_profile", "parser_version", "prompt_sha256", "requested_model"):
         if natural.get(key) != balanced.get(key):
             raise ValueError(f"Natural and Balanced LOCKED disagree on {key}")
     payload = {
@@ -473,6 +532,7 @@ def combine_v2_locked_evaluations(
         "status": "V2_LOCKED_TESTS_PASSED",
         "natural_frequency_gate_passed": True,
         "directional_strata_gate_passed": True,
+        "parser_profile": natural["parser_profile"],
         "parser_version": natural["parser_version"],
         "prompt_sha256": natural["prompt_sha256"],
         "requested_model": natural["requested_model"],
@@ -482,6 +542,8 @@ def combine_v2_locked_evaluations(
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
     }
     _write_json(output, payload)
     return payload
