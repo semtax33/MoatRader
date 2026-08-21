@@ -235,6 +235,9 @@ def _measurement_contract(
         "semantic_classifier": workspace
         / "scripts"
         / "classify_historical_future_eri_evidence.py",
+        "semantic_cost_preparer": workspace
+        / "scripts"
+        / "prepare_historical_semantic_cost_manifest_v2.py",
         "full_index_sealer": workspace
         / "scripts"
         / "seal_historical_full_evidence_index_v2.py",

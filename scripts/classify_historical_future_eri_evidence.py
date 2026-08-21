@@ -466,6 +466,14 @@ def _validate_semantic_execution_gate(
         raise ValueError("full semantic cost was not prespecified")
     if cost.get("api_calls_executed") is not False:
         raise ValueError("semantic cost manifest was not frozen before API execution")
+    token_estimation = cost.get("token_estimation", {})
+    if (
+        token_estimation.get("pilot_prompt_differs_from_frozen_full_prompt") is not False
+        or token_estimation.get("pilot_contract_matches_frozen_full_prompt") is not True
+    ):
+        raise ValueError(
+            "full semantic cost must be re-estimated from exact frozen V2 pilot executions"
+        )
     for key, expected in (
         ("parser_profile", spec.profile.value),
         ("parser_version", spec.parser_version),
@@ -476,6 +484,24 @@ def _validate_semantic_execution_gate(
         if cost.get(key) != expected:
             raise ValueError(f"semantic cost manifest does not match {key}")
     cost_inputs = cost.get("inputs", {})
+    pilot_sources = cost_inputs.get("pilot_stage_manifests", [])
+    if not isinstance(pilot_sources, list) or len(pilot_sources) < 2:
+        raise ValueError("semantic cost manifest requires two exact V2 pilot sources")
+    for pilot in pilot_sources:
+        if not isinstance(pilot, dict):
+            raise ValueError("semantic cost pilot source must be a JSON object")
+        for key, expected in (
+            ("parser_profile", spec.profile.value),
+            ("parser_version", spec.parser_version),
+            ("prompt_sha256", spec.prompt_sha256),
+            ("requested_model", model),
+            (
+                "semantic_execution_scope",
+                SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value,
+            ),
+        ):
+            if pilot.get(key) != expected:
+                raise ValueError(f"semantic cost pilot source does not match {key}")
     if cost_inputs.get("semantic_packet_sha256") != sha256_file(packet_path):
         raise ValueError("semantic cost manifest packet hash mismatch")
     if cost_inputs.get("semantic_selection_manifest_sha256") != sha256_file(

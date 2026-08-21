@@ -13,6 +13,7 @@ from moatrader.expectations.historical_evidence import PairedAxisPacket, sha256_
 from scripts.classify_historical_future_eri_evidence import (
     GROUNDING_VALIDATION_ATTEMPTS,
     ParserProfile,
+    SemanticExecutionScope,
     parser_spec,
 )
 
@@ -128,17 +129,38 @@ def prepare_cost_manifest(
     combined_usage = {key: 0 for key in TOKEN_KEYS}
     pilot_packets = 0
     pilot_sources: list[dict[str, Any]] = []
+    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
     for path in pilot_stage_manifests:
         stage = _read_json(path)
         if stage.get("status") != "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE":
             raise ValueError(f"pilot stage is not complete: {path}")
-        if stage.get("requested_model") != model:
-            raise ValueError(f"pilot model mismatch: {path}")
+        for key, expected in (
+            ("parser_profile", spec.profile.value),
+            ("parser_version", spec.parser_version),
+            ("prompt_sha256", spec.prompt_sha256),
+            ("requested_model", model),
+            (
+                "semantic_execution_scope",
+                SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION.value,
+            ),
+            ("full_historical_execution_authorized", False),
+        ):
+            if stage.get(key) != expected:
+                raise ValueError(
+                    f"pilot stage does not match frozen semantic V2 {key}: {path}"
+                )
         if any(
             stage.get(key) is not False
-            for key in ("outcome_vault_opened", "return_data_opened", "credentials_persisted")
+            for key in (
+                "outcome_vault_opened",
+                "return_data_opened",
+                "value_data_opened",
+                "credentials_persisted",
+            )
         ):
             raise ValueError(f"pilot stage violated closed-data contract: {path}")
+        if stage.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+            raise ValueError(f"pilot stage used PER/PBR before Full Index seal: {path}")
         count = int(stage.get("classification_count", -1))
         if count < 1 or count != int(stage.get("packet_count", -2)):
             raise ValueError(f"pilot classification count mismatch: {path}")
@@ -154,8 +176,11 @@ def prepare_cost_manifest(
                 "path": str(path),
                 "sha256": sha256_file(path),
                 "packet_count": count,
+                "parser_profile": stage.get("parser_profile"),
                 "parser_version": stage.get("parser_version"),
                 "prompt_sha256": stage.get("prompt_sha256"),
+                "requested_model": stage.get("requested_model"),
+                "semantic_execution_scope": stage.get("semantic_execution_scope"),
             }
         )
     if len(pilot_sources) < 2:
@@ -173,7 +198,6 @@ def prepare_cost_manifest(
         for key, value in expected.items()
     }
     conservative_cost = _cost_components(conservative_tokens, active_rates)
-    spec = parser_spec(ParserProfile.DEMAND_PRICE_MIX_V2)
     created = prepared_at or datetime.now(timezone.utc)
     if created.tzinfo is None or created.utcoffset() is None:
         raise ValueError("prepared_at must be timezone-aware")
@@ -200,7 +224,8 @@ def prepare_cost_manifest(
             "pilot_usage": combined_usage,
             "expected_tokens": expected,
             "conservative_20pct_tokens": conservative_tokens,
-            "pilot_prompt_differs_from_frozen_full_prompt": True,
+            "pilot_prompt_differs_from_frozen_full_prompt": False,
+            "pilot_contract_matches_frozen_full_prompt": True,
             "estimate_not_research_result": True,
         },
         "pricing": {

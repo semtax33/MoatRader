@@ -471,6 +471,9 @@ DEV 준비 manifest는 LOCKED overlap 0, HUMAN authority, 입력 해시, Value/r
 V2 semantic `--execute`는 실행 범위를 반드시 명시한다. DEV·LOCKED 검증은 최대
 2,000 packet으로 제한되며, 전체 historical 실행은 통과한 dual LOCKED manifest와
 사전 작성한 selection/cost manifest 없이는 transport를 열지 않는다.
+Cost manifest도 실제 frozen V2 prompt/model로 실행한 Natural·Balanced 두 stage의
+usage를 사용해야 한다. `pilot_prompt_differs_from_frozen_full_prompt=true`인 과거 V1
+사용량 기반 운영 추정치는 참고용일 뿐 full-run authorization으로 사용할 수 없다.
 
 ```powershell
 python scripts\classify_historical_future_eri_evidence.py `
@@ -480,6 +483,13 @@ python scripts\classify_historical_future_eri_evidence.py `
   --parser-profile DEMAND_PRICE_MIX_V2 `
   --semantic-execution-scope PILOT_OR_LOCKED_VALIDATION `
   --execute --prompt-api-key
+
+python scripts\prepare_historical_semantic_cost_manifest_v2.py `
+  --semantic-packet-input <semantic-packets.jsonl> `
+  --semantic-selection-manifest <semantic-packets.jsonl.manifest.json> `
+  --pilot-stage-manifest <completed-v2-natural-classification\stage-status.json> `
+  --pilot-stage-manifest <completed-v2-balanced-classification\stage-status.json> `
+  --output <new-exact-v2-cost-manifest.json>
 
 python scripts\classify_historical_future_eri_evidence.py `
   --input-build <source-build> `

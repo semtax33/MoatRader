@@ -591,6 +591,9 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
         "semantic_classifier": sha256_file(
             workspace / "scripts" / "classify_historical_future_eri_evidence.py"
         ),
+        "semantic_cost_preparer": sha256_file(
+            workspace / "scripts" / "prepare_historical_semantic_cost_manifest_v2.py"
+        ),
         "sparse_builder": sha256_file(
             workspace / "scripts" / "build_historical_sparse_features_v2.py"
         ),
@@ -662,6 +665,10 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
             "prompt_sha256": spec.prompt_sha256,
             "model": "gpt-5.6-luna",
             "exact_packet_count": 5,
+            "token_estimation": {
+                "pilot_prompt_differs_from_frozen_full_prompt": False,
+                "pilot_contract_matches_frozen_full_prompt": True,
+            },
         },
     )
     classification_manifest = write_manifest(

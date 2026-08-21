@@ -108,6 +108,9 @@ def _validate_frozen_execution_code(
         "semantic_classifier": workspace
         / "scripts"
         / "classify_historical_future_eri_evidence.py",
+        "semantic_cost_preparer": workspace
+        / "scripts"
+        / "prepare_historical_semantic_cost_manifest_v2.py",
         "sparse_builder": workspace / "scripts" / "build_historical_sparse_features_v2.py",
         "full_index_sealer": workspace
         / "scripts"
@@ -288,6 +291,14 @@ def _validate_gates(
         raise ValueError("full semantic cost was not prespecified")
     if cost.get("api_calls_executed") is not False:
         raise ValueError("cost manifest was created after calls were executed")
+    token_estimation = cost.get("token_estimation", {})
+    if (
+        token_estimation.get("pilot_prompt_differs_from_frozen_full_prompt") is not False
+        or token_estimation.get("pilot_contract_matches_frozen_full_prompt") is not True
+    ):
+        raise ValueError(
+            "Full Index seal requires cost estimation from exact frozen V2 pilots"
+        )
     for key, expected in (
         ("parser_profile", spec.profile.value),
         ("parser_version", spec.parser_version),

@@ -298,9 +298,29 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
                 "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
                 "model": "gpt-5.6-luna",
                 "exact_packet_count": 2,
+                "token_estimation": {
+                    "pilot_prompt_differs_from_frozen_full_prompt": False,
+                    "pilot_contract_matches_frozen_full_prompt": True,
+                },
                 "inputs": {
                     "semantic_packet_sha256": sha256_file(packet_input),
                     "semantic_selection_manifest_sha256": sha256_file(selection),
+                    "pilot_stage_manifests": [
+                        {
+                            "parser_profile": "DEMAND_PRICE_MIX_V2",
+                            "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                            "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                            "requested_model": "gpt-5.6-luna",
+                            "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                        },
+                        {
+                            "parser_profile": "DEMAND_PRICE_MIX_V2",
+                            "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                            "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                            "requested_model": "gpt-5.6-luna",
+                            "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                        },
+                    ],
                 },
                 "outcome_vault_opened": False,
                 "return_data_opened": False,
@@ -348,6 +368,28 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
         )
     assert calls == 2
     source_audit.write_text(source_audit_text, encoding="utf-8")
+
+    legacy_cost = tmp_path / "legacy-cost.json"
+    legacy_cost_payload = json.loads(cost.read_text(encoding="utf-8"))
+    legacy_cost_payload["token_estimation"] = {
+        "pilot_prompt_differs_from_frozen_full_prompt": True,
+        "pilot_contract_matches_frozen_full_prompt": False,
+    }
+    legacy_cost.write_text(json.dumps(legacy_cost_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="exact frozen V2 pilot executions"):
+        run_classifier(
+            input_build=tmp_path,
+            packet_input=packet_input,
+            output=tmp_path / "failed-legacy-cost-full",
+            execute=True,
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+            semantic_execution_scope=SemanticExecutionScope.FULL_HISTORICAL,
+            dual_locked_manifest=locked,
+            semantic_selection_manifest=selection,
+            semantic_cost_manifest=legacy_cost,
+            transport=FunctionTransport(handler),
+        )
+    assert calls == 2
 
     full = run_classifier(
         input_build=tmp_path,
@@ -768,11 +810,16 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
                     "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
                     "packet_count": 1,
                     "classification_count": 1,
-                    "parser_version": "pilot-v1",
-                    "prompt_sha256": "a" * 64,
+                    "parser_profile": "DEMAND_PRICE_MIX_V2",
+                    "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                    "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
                     "requested_model": "gpt-5.6-luna",
+                    "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                    "full_historical_execution_authorized": False,
                     "outcome_vault_opened": False,
                     "return_data_opened": False,
+                    "value_data_opened": False,
+                    "per_pbr_role": "NOT_USED",
                     "credentials_persisted": False,
                     "usage": {
                         "input_tokens": 100,
@@ -806,6 +853,70 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
     assert result["api_calls_executed"] is False
     assert result["outcome_vault_opened"] is False
     assert result["per_pbr_role"] == "NOT_USED"
+    assert result["token_estimation"]["pilot_prompt_differs_from_frozen_full_prompt"] is False
+    assert result["token_estimation"]["pilot_contract_matches_frozen_full_prompt"] is True
+
+
+def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> None:
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(
+        packet_input,
+        [
+            _packet(1, OperatingEvidenceAxis.DEMAND),
+            _packet(2, OperatingEvidenceAxis.PRICE_MIX),
+        ],
+    )
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected_packet_count": 2,
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pilot_paths: list[Path] = []
+    for index in range(2):
+        path = tmp_path / f"legacy-pilot-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+                    "packet_count": 1,
+                    "classification_count": 1,
+                    "parser_profile": "LEGACY_V1",
+                    "parser_version": "historical-evidence-parser-v1.2.0",
+                    "prompt_sha256": "a" * 64,
+                    "requested_model": "gpt-5.6-luna",
+                    "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                    "full_historical_execution_authorized": False,
+                    "outcome_vault_opened": False,
+                    "return_data_opened": False,
+                    "value_data_opened": False,
+                    "credentials_persisted": False,
+                    "per_pbr_role": "NOT_USED",
+                    "usage": {
+                        "input_tokens": 1,
+                        "cached_input_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "output_tokens": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        pilot_paths.append(path)
+
+    with pytest.raises(ValueError, match="frozen semantic V2 parser_profile"):
+        prepare_cost_manifest(
+            semantic_packet_input=packet_input,
+            semantic_selection_manifest=selection,
+            pilot_stage_manifests=pilot_paths,
+            output=tmp_path / "cost.json",
+        )
 
 
 def test_semantic_cost_manifest_rejects_nonsemantic_axis(tmp_path: Path) -> None:
