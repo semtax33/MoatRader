@@ -81,7 +81,31 @@ _ALL_AXIS_KEYWORD_PATTERN = re.compile(
 
 class HistoricalSourceOrigin(StrEnum):
     ARCANA_BUSINESS_HTML = "ARCANA_BUSINESS_HTML"
+    ARCANA_FINANCE_COMMENT_HTML = "ARCANA_FINANCE_COMMENT_HTML"
+    ARCANA_FINANCE_STATEMENT_HTML = "ARCANA_FINANCE_STATEMENT_HTML"
     MOATRADER_OPENDART_ARCHIVE = "MOATRADER_OPENDART_ARCHIVE"
+
+
+ARCANA_SOURCE_ORIGINS = frozenset(
+    {
+        HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_COMMENT_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML,
+    }
+)
+ARCANA_DART_SECTION_SPECS: tuple[tuple[str, str, HistoricalSourceOrigin], ...] = (
+    ("business-info", "business_info", HistoricalSourceOrigin.ARCANA_BUSINESS_HTML),
+    (
+        "finance-comment",
+        "finance_statement_comment",
+        HistoricalSourceOrigin.ARCANA_FINANCE_COMMENT_HTML,
+    ),
+    (
+        "finance-statement",
+        "finance_statement",
+        HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML,
+    ),
+)
 
 
 class ReceiptLinkage(StrEnum):
@@ -526,17 +550,32 @@ def _published_at_from_receipt(rcept_no: str) -> datetime:
     return datetime.combine(receipt_date, time.max, tzinfo=SEOUL)
 
 
-def discover_arcana_business_sources(
+def discover_arcana_regular_sources(
     *,
     metadata_path: str | Path,
     business_html_root: str | Path,
+    finance_comment_html_root: str | Path | None = None,
+    finance_statement_html_root: str | Path | None = None,
     trading_sessions: Sequence[date],
     begin_year: int,
     end_year: int,
     tickers: set[str] | None = None,
-) -> tuple[list[HistoricalRegularFiling], list[dict[str, Any]]]:
+) -> tuple[list[HistoricalRegularFiling], list[dict[str, Any]], dict[str, Any]]:
     metadata_file = Path(metadata_path)
-    html_root = Path(business_html_root)
+    business_root = Path(business_html_root)
+    section_roots = {
+        "business-info": business_root,
+        "finance-comment": (
+            Path(finance_comment_html_root)
+            if finance_comment_html_root is not None
+            else business_root.parent / "finance-comment"
+        ),
+        "finance-statement": (
+            Path(finance_statement_html_root)
+            if finance_statement_html_root is not None
+            else business_root.parent / "finance-statement"
+        ),
+    }
     candidates: dict[tuple[str, date], list[dict[str, str]]] = defaultdict(list)
     amendments: list[dict[str, Any]] = []
     with metadata_file.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -565,11 +604,58 @@ def discover_arcana_business_sources(
 
     metadata_sha256 = sha256_file(metadata_file)
     filings: list[HistoricalRegularFiling] = []
+    section_counts: dict[str, Counter[str]] = {
+        section: Counter() for section, _, _ in ARCANA_DART_SECTION_SPECS
+    }
+    all_three = 0
+    skipped_without_business = 0
     for (ticker, period), rows in sorted(candidates.items()):
         row = min(rows, key=lambda item: str(item["rcept_no"]))
-        source = html_root / ticker / f"business_info_({period.year}.{period.month:02d}).html"
-        if not source.is_file() or source.stat().st_size == 0:
+        available: list[tuple[Path, HistoricalSourceOrigin, str]] = []
+        for section, prefix, origin in ARCANA_DART_SECTION_SPECS:
+            source = (
+                section_roots[section]
+                / ticker
+                / f"{prefix}_({period.year}.{period.month:02d}).html"
+            )
+            if not source.is_file():
+                section_counts[section]["missing"] += 1
+                continue
+            if source.stat().st_size == 0:
+                section_counts[section]["empty"] += 1
+                continue
+            section_counts[section]["discovered_nonempty"] += 1
+            available.append((source, origin, section))
+
+        if not any(
+            origin == HistoricalSourceOrigin.ARCANA_BUSINESS_HTML
+            for _, origin, _ in available
+        ):
+            skipped_without_business += 1
             continue
+        if len(available) == len(ARCANA_DART_SECTION_SPECS):
+            all_three += 1
+
+        variants: list[HistoricalSourceVariant] = []
+        seen_hashes: set[str] = set()
+        for source, origin, section in available:
+            raw_sha256 = sha256_file(source)
+            if raw_sha256 in seen_hashes:
+                section_counts[section]["duplicate_content_hash"] += 1
+                continue
+            variants.append(
+                HistoricalSourceVariant(
+                    origin=origin,
+                    path=str(source.resolve()),
+                    raw_sha256=raw_sha256,
+                    byte_count=source.stat().st_size,
+                    receipt_linkage=ReceiptLinkage.INFERRED_TICKER_PERIOD,
+                    metadata_path=str(metadata_file.resolve()),
+                    metadata_sha256=metadata_sha256,
+                )
+            )
+            seen_hashes.add(raw_sha256)
+            section_counts[section]["attached"] += 1
         rcept_no = str(row["rcept_no"])
         published = _published_at_from_receipt(rcept_no)
         signal = next_usable_signal_timestamp(published, trading_sessions=trading_sessions)
@@ -584,19 +670,60 @@ def discover_arcana_business_sources(
                 published_at=published,
                 available_at=published,
                 signal_timestamp=signal,
-                source_variants=[
-                    HistoricalSourceVariant(
-                        origin=HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
-                        path=str(source.resolve()),
-                        raw_sha256=sha256_file(source),
-                        byte_count=source.stat().st_size,
-                        receipt_linkage=ReceiptLinkage.INFERRED_TICKER_PERIOD,
-                        metadata_path=str(metadata_file.resolve()),
-                        metadata_sha256=metadata_sha256,
-                    )
-                ],
+                source_variants=variants,
             )
         )
+    candidate_count = len(candidates)
+    audit = {
+        "schema_version": "moatrader-arcana-dart-section-audit-v1/1",
+        "required_sections": [item[0] for item in ARCANA_DART_SECTION_SPECS],
+        "anchor_policy": "BUSINESS_INFO_REQUIRED_FOR_BACKWARD_COMPATIBLE_FILING_UNIVERSE",
+        "candidate_regular_filing_count": candidate_count,
+        "regular_filing_count": len(filings),
+        "filing_count_with_all_three_sections": all_three,
+        "filing_count_skipped_without_business_info": skipped_without_business,
+        "sections": {
+            section: {
+                "root": str(section_roots[section].resolve()),
+                "discovered_nonempty_count": section_counts[section]["discovered_nonempty"],
+                "missing_count": section_counts[section]["missing"],
+                "empty_count": section_counts[section]["empty"],
+                "duplicate_content_hash_count": section_counts[section][
+                    "duplicate_content_hash"
+                ],
+                "attached_source_variant_count": section_counts[section]["attached"],
+                "discovery_coverage": (
+                    section_counts[section]["discovered_nonempty"] / candidate_count
+                    if candidate_count
+                    else 0.0
+                ),
+            }
+            for section, _, _ in ARCANA_DART_SECTION_SPECS
+        },
+        "source_files_modified": False,
+    }
+    return filings, amendments, audit
+
+
+def discover_arcana_business_sources(
+    *,
+    metadata_path: str | Path,
+    business_html_root: str | Path,
+    trading_sessions: Sequence[date],
+    begin_year: int,
+    end_year: int,
+    tickers: set[str] | None = None,
+) -> tuple[list[HistoricalRegularFiling], list[dict[str, Any]]]:
+    """Backward-compatible wrapper around the three-section Arcana discovery."""
+
+    filings, amendments, _ = discover_arcana_regular_sources(
+        metadata_path=metadata_path,
+        business_html_root=business_html_root,
+        trading_sessions=trading_sessions,
+        begin_year=begin_year,
+        end_year=end_year,
+        tickers=tickers,
+    )
     return filings, amendments
 
 
@@ -790,7 +917,10 @@ def merge_historical_sources(
                 if variant.raw_sha256 not in seen_hashes:
                     variants.append(variant)
                     seen_hashes.add(variant.raw_sha256)
-        if {item.origin for item in variants} == set(HistoricalSourceOrigin):
+        origins = {item.origin for item in variants}
+        if origins.intersection(ARCANA_SOURCE_ORIGINS) and (
+            HistoricalSourceOrigin.MOATRADER_OPENDART_ARCHIVE in origins
+        ):
             dual_source += 1
         merged_payload = base.model_dump()
         merged_payload["source_variants"] = variants
@@ -858,7 +988,7 @@ def _visible_document_text(content: bytes, suffix: str) -> str:
 
 def source_variant_text(variant: HistoricalSourceVariant) -> str:
     path = Path(variant.path)
-    if variant.origin == HistoricalSourceOrigin.ARCANA_BUSINESS_HTML:
+    if variant.origin in ARCANA_SOURCE_ORIGINS:
         return _visible_document_text(path.read_bytes(), path.suffix)
     texts: list[str] = []
     with zipfile.ZipFile(path) as archive:
@@ -998,7 +1128,7 @@ def build_blinded_packets(
         side: str,
         axis: OperatingEvidenceAxis,
     ) -> list[BlindedExcerpt]:
-        result: list[BlindedExcerpt] = []
+        by_source: list[list[BlindedExcerpt]] = []
         for variant in filing.source_variants:
             windows_by_axis = cached_windows.get(variant.raw_sha256)
             if windows_by_axis is None:
@@ -1009,6 +1139,7 @@ def build_blinded_packets(
                         cache[variant.raw_sha256] = text
                 windows_by_axis = _all_axis_keyword_windows(text)
                 cached_windows[variant.raw_sha256] = windows_by_axis
+            source_rows: list[BlindedExcerpt] = []
             for window_text in windows_by_axis[axis]:
                 blinded = anonymize_historical_text(
                     window_text,
@@ -1017,19 +1148,28 @@ def build_blinded_packets(
                     rcept_no=filing.rcept_no,
                     brand_terms=brand_terms,
                 )
-                result.append(
+                source_rows.append(
                     BlindedExcerpt(
                         source_id=opaque_source_id(variant.raw_sha256, pair.pair_id, side),
                         text=blinded,
                     )
                 )
+            if source_rows:
+                by_source.append(source_rows)
         unique: list[BlindedExcerpt] = []
         seen: set[str] = set()
-        for item in result:
-            digest = hashlib.sha256(item.text.encode("utf-8")).hexdigest()
-            if digest not in seen:
-                unique.append(item)
-                seen.add(digest)
+        maximum_depth = max((len(rows) for rows in by_source), default=0)
+        for index in range(maximum_depth):
+            for source_rows in by_source:
+                if index >= len(source_rows):
+                    continue
+                item = source_rows[index]
+                digest = hashlib.sha256(item.text.encode("utf-8")).hexdigest()
+                if digest not in seen:
+                    unique.append(item)
+                    seen.add(digest)
+                if len(unique) >= 8:
+                    return unique
         return unique[:8]
 
     packets: list[PairedAxisPacket] = []
@@ -1083,15 +1223,25 @@ def validate_classification_grounding(
     assert classification.current_source_id is not None
     assert classification.previous_source_span is not None
     assert classification.current_source_span is not None
-    previous = {item.source_id: item.text for item in packet.previous_excerpts}
-    current = {item.source_id: item.text for item in packet.current_excerpts}
+    previous: dict[str, list[str]] = defaultdict(list)
+    current: dict[str, list[str]] = defaultdict(list)
+    for item in packet.previous_excerpts:
+        previous[item.source_id].append(item.text)
+    for item in packet.current_excerpts:
+        current[item.source_id].append(item.text)
     if classification.previous_source_id not in previous:
         raise ValueError("previous classification source is absent from packet")
     if classification.current_source_id not in current:
         raise ValueError("current classification source is absent from packet")
-    if classification.previous_source_span not in previous[classification.previous_source_id]:
+    if not any(
+        classification.previous_source_span in text
+        for text in previous[classification.previous_source_id]
+    ):
         raise ValueError("previous source span is not verbatim packet evidence")
-    if classification.current_source_span not in current[classification.current_source_id]:
+    if not any(
+        classification.current_source_span in text
+        for text in current[classification.current_source_id]
+    ):
         raise ValueError("current source span is not verbatim packet evidence")
 
 

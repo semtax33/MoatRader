@@ -11,8 +11,10 @@ from moatrader.expectations.eri_validation import (
     ClusteredEriObservationV1,
     evaluate_clustered_eri_mechanism,
 )
+from moatrader.expectations.eri_null_fixtures import run_production_eri_null_fixtures
 from moatrader.expectations.future_eri import (
     CurrentExpectationStateV1,
+    FeatureDatasetSealV1,
     FutureEriFeatureRowV1,
     FutureEriOutcomeInputV1,
     build_future_eri_label,
@@ -81,6 +83,7 @@ def _assert_expectation_input_is_pre_outcome(records: list[dict[str, Any]]) -> N
 def run(
     *,
     feature_build: Path,
+    eligibility_build: Path | None = None,
     expectation_input: Path,
     outcome_input: Path,
     trading_sessions_path: Path,
@@ -94,6 +97,20 @@ def run(
         raise FileNotFoundError("feature stage status is missing")
     feature_stage = json.loads(stage_path.read_text(encoding="utf-8"))
     output.mkdir(parents=True, exist_ok=True)
+    if feature_stage.get("schema_version") == "moatrader-historical-sparse-calibration-stage-v2/1":
+        status = {
+            "schema_version": "moatrader-historical-future-eri-outcome-stage-v1/1",
+            "status": "BLOCKED_V2_FEATURES_REQUIRE_SPARSE_ERI_RUNNER",
+            "expectation_input_opened": False,
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "downstream_stage_authorized": False,
+            "feature_stage_authorized": bool(
+                feature_stage.get("outcome_stage_authorized", False)
+            ),
+        }
+        _write_json(output / "stage-status.json", status)
+        return status
     if not feature_stage.get("outcome_stage_authorized", False):
         status = {
             "schema_version": "moatrader-historical-future-eri-outcome-stage-v1/1",
@@ -105,6 +122,28 @@ def run(
         }
         _write_json(output / "stage-status.json", status)
         return status
+
+    eligibility_seal: FeatureDatasetSealV1 | None = None
+    eligibility_stage_path: Path | None = None
+    if eligibility_build is not None:
+        eligibility_stage_path = eligibility_build / "stage-status.json"
+        if not eligibility_stage_path.is_file():
+            raise FileNotFoundError("outcome eligibility stage status is missing")
+        eligibility_stage = json.loads(eligibility_stage_path.read_text(encoding="utf-8"))
+        if not eligibility_stage.get("outcome_stage_authorized", False):
+            status = {
+                "schema_version": "moatrader-historical-future-eri-outcome-stage-v1/1",
+                "status": "BLOCKED_OUTCOME_ELIGIBILITY_GATE",
+                "expectation_input_opened": False,
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "downstream_stage_authorized": False,
+            }
+            _write_json(output / "stage-status.json", status)
+            return status
+        eligibility_seal = FeatureDatasetSealV1.model_validate_json(
+            (eligibility_build / "eligible-feature-seal.json").read_text(encoding="utf-8")
+        )
 
     feature_path = feature_build / "features-pre-outcome.jsonl"
     historical_seal_path = feature_build / "feature-seal.json"
@@ -148,6 +187,11 @@ def run(
                 ),
             )
         )
+    if eligibility_seal is not None:
+        eligible_ids = set(eligibility_seal.observation_ids)
+        final_features = [
+            feature for feature in final_features if feature.observation_id in eligible_ids
+        ]
     if not final_features:
         status = {
             "schema_version": "moatrader-historical-future-eri-outcome-stage-v1/1",
@@ -165,12 +209,34 @@ def run(
         final_features,
         sealed_at=max(item.evidence.signal_timestamp for item in final_features),
     )
+    if eligibility_seal is not None:
+        if final_seal.observation_ids != eligibility_seal.observation_ids:
+            raise ValueError("outcome features do not match the eligibility-audited set")
+        if final_seal.feature_dataset_sha256 != eligibility_seal.feature_dataset_sha256:
+            raise ValueError("eligibility-audited feature dataset changed before outcome open")
     _write_jsonl(
         output / "features-with-frozen-expectations-pre-outcome.jsonl",
         (item.model_dump(mode="json") for item in final_features),
     )
     _write_json(output / "feature-seal-with-expectations.json", final_seal.model_dump(mode="json"))
     _write_json(output / "missing-expectations.json", missing_expectations)
+
+    # Exercise the production ERI label path before any outcome value is opened.
+    null_fixture_report = run_production_eri_null_fixtures()
+    null_fixture_path = output / "eri-null-fixtures.json"
+    _write_json(null_fixture_path, null_fixture_report)
+    if not null_fixture_report["all_passed"]:
+        status = {
+            "schema_version": "moatrader-historical-future-eri-outcome-stage-v1/1",
+            "status": "BLOCKED_PRODUCTION_ERI_NULL_FIXTURE",
+            "expectation_input_opened": True,
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "downstream_stage_authorized": False,
+            "production_null_fixtures_passed": False,
+        }
+        _write_json(output / "stage-status.json", status)
+        return status
 
     # The outcome vault is deliberately opened only after the final feature seal exists.
     outcome_records = _read_records(outcome_input)
@@ -239,6 +305,8 @@ def run(
         "enterprise_eri_role": "EV_BRIDGE_DIAGNOSTIC_ONLY",
         "primary_ranking_policy": "NONE_MECHANISM_ONLY",
         "per_pbr_role": "NOT_USED",
+        "production_null_fixtures_passed": True,
+        "outcome_eligibility_gate_used": eligibility_build is not None,
     }
     _write_json(output / "stage-status.json", status)
     _write_json(
@@ -249,6 +317,11 @@ def run(
             "expectation_input_sha256": sha256_file(expectation_input),
             "outcome_input_sha256": sha256_file(outcome_input),
             "trading_sessions_sha256": sha256_file(trading_sessions_path),
+            "production_null_fixture_sha256": sha256_file(null_fixture_path),
+            "production_null_fixtures_passed": True,
+            "eligibility_stage_status_sha256": (
+                sha256_file(eligibility_stage_path) if eligibility_stage_path is not None else None
+            ),
             "outcome_opened_only_after_final_feature_seal": True,
             "return_data_opened": False,
         },
@@ -261,6 +334,11 @@ def main() -> int:
         description="Open 63-session ERI outcomes only after the historical evidence feature seal."
     )
     parser.add_argument("--feature-build", type=Path, required=True)
+    parser.add_argument(
+        "--eligibility-build",
+        type=Path,
+        help="Value-blind exact-t+63 eligibility audit build; required for the production run.",
+    )
     parser.add_argument("--expectation-input", type=Path, required=True)
     parser.add_argument("--outcome-input", type=Path, required=True)
     parser.add_argument("--trading-sessions", type=Path, required=True)
@@ -269,6 +347,7 @@ def main() -> int:
     args = parser.parse_args()
     result = run(
         feature_build=args.feature_build,
+        eligibility_build=args.eligibility_build,
         expectation_input=args.expectation_input,
         outcome_input=args.outcome_input,
         trading_sessions_path=args.trading_sessions,

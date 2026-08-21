@@ -108,6 +108,22 @@ def test_arcana_discovery_keeps_regular_original_and_records_amendment(tmp_path:
     source = root / "005930" / "business_info_(2020.03).html"
     source.parent.mkdir(parents=True)
     source.write_text("<html><body>수주잔고 증가</body></html>", encoding="utf-8")
+    comment = (
+        tmp_path
+        / "finance-comment"
+        / "005930"
+        / "finance_statement_comment_(2020.03).html"
+    )
+    comment.parent.mkdir(parents=True)
+    comment.write_text("<html><body>영업이익률 개선</body></html>", encoding="utf-8")
+    statement = (
+        tmp_path
+        / "finance-statement"
+        / "005930"
+        / "finance_statement_(2020.03).html"
+    )
+    statement.parent.mkdir(parents=True)
+    statement.write_text("<html><body>재고자산 감소</body></html>", encoding="utf-8")
     metadata = tmp_path / "kr_report_metadata.csv"
     rows = [
         {
@@ -142,7 +158,11 @@ def test_arcana_discovery_keeps_regular_original_and_records_amendment(tmp_path:
 
     assert len(filings) == 1
     assert len(amendments) == 1
-    assert filings[0].source_variants[0].origin == HistoricalSourceOrigin.ARCANA_BUSINESS_HTML
+    assert {item.origin for item in filings[0].source_variants} == {
+        HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_COMMENT_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML,
+    }
     assert filings[0].signal_timestamp.date() == date(2020, 3, 31)
 
 
@@ -226,7 +246,10 @@ def test_merge_retains_both_independent_source_variants(tmp_path: Path) -> None:
 
     assert len(merged) == 1
     assert merged[0].rcept_no == moatrader.rcept_no
-    assert {item.origin for item in merged[0].source_variants} == set(HistoricalSourceOrigin)
+    assert {item.origin for item in merged[0].source_variants} == {
+        HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
+        HistoricalSourceOrigin.MOATRADER_OPENDART_ARCHIVE,
+    }
     assert audit["dual_source_filing_count"] == 1
     assert audit["receipt_conflict_count"] == 1
 
@@ -283,6 +306,61 @@ def test_consecutive_pair_blinds_identifiers_dates_and_market_context(tmp_path: 
     validate_classification_grounding(classification, backlog)
 
 
+def test_blinded_packet_round_robins_arcana_section_sources_before_excerpt_cap(
+    tmp_path: Path,
+) -> None:
+    origins = (
+        HistoricalSourceOrigin.ARCANA_BUSINESS_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_COMMENT_HTML,
+        HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML,
+    )
+
+    def filing_with_sections(*, current: bool) -> HistoricalRegularFiling:
+        paths: list[Path] = []
+        for index, origin in enumerate(origins):
+            path = tmp_path / f"{'current' if current else 'previous'}-{origin.value}.html"
+            repeats = 12 if index == 0 else 1
+            path.write_text(
+                "<html><body>"
+                + "\n".join(f"수요 근거 {index}-{item}" for item in range(repeats))
+                + "</body></html>",
+                encoding="utf-8",
+            )
+            paths.append(path)
+        base = _filing(
+            ticker="005930",
+            rcept_no="20200814000001" if current else "20200330000001",
+            period=date(2020, 6, 30) if current else date(2020, 3, 31),
+            source=paths[0],
+        )
+        return base.model_copy(
+            update={
+                "source_variants": [
+                    HistoricalSourceVariant(
+                        origin=origin,
+                        path=str(path.resolve()),
+                        raw_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                        byte_count=path.stat().st_size,
+                        receipt_linkage=ReceiptLinkage.INFERRED_TICKER_PERIOD,
+                    )
+                    for origin, path in zip(origins, paths, strict=True)
+                ]
+            }
+        )
+
+    pair = build_regular_filing_pairs(
+        [filing_with_sections(current=False), filing_with_sections(current=True)]
+    )[0]
+    demand = next(
+        packet
+        for packet in build_blinded_packets(pair)[0]
+        if packet.axis == OperatingEvidenceAxis.DEMAND
+    )
+
+    assert len({item.source_id for item in demand.previous_excerpts}) == 3
+    assert len({item.source_id for item in demand.current_excerpts}) == 3
+
+
 def test_packet_coverage_reports_complete_six_axis_pair(tmp_path: Path) -> None:
     previous_source = tmp_path / "previous.html"
     current_source = tmp_path / "current.html"
@@ -321,6 +399,28 @@ def test_historical_builder_uses_both_sources_without_opening_outcomes(tmp_path:
     for period in ("2020.03", "2020.06"):
         (ticker_root / f"business_info_({period}).html").write_text(
             f"<html><body>테스트회사 {period} {evidence}</body></html>",
+            encoding="utf-8",
+        )
+        comment = (
+            tmp_path
+            / "finance-comment"
+            / "005930"
+            / f"finance_statement_comment_({period}).html"
+        )
+        comment.parent.mkdir(parents=True, exist_ok=True)
+        comment.write_text(
+            f"<html><body>테스트회사 {period} 마진 원가 개선</body></html>",
+            encoding="utf-8",
+        )
+        statement = (
+            tmp_path
+            / "finance-statement"
+            / "005930"
+            / f"finance_statement_({period}).html"
+        )
+        statement.parent.mkdir(parents=True, exist_ok=True)
+        statement.write_text(
+            f"<html><body>테스트회사 {period} 매출 재고 설비투자</body></html>",
             encoding="utf-8",
         )
     arcana_metadata = tmp_path / "kr_report_metadata.csv"
@@ -387,6 +487,14 @@ def test_historical_builder_uses_both_sources_without_opening_outcomes(tmp_path:
     assert result["outcome_vault_opened"] is False
     assert result["return_data_opened"] is False
     assert result["source_files_modified"] is False
+    assert result["all_arcana_sections_discovered"] is True
+    assert result["all_arcana_sections_read_for_pairs"] is True
+    assert result["all_arcana_sections_contributed_to_packets"] is True
+    assert set(result["pair_source_extraction_by_origin"]) >= {
+        "ARCANA_BUSINESS_HTML",
+        "ARCANA_FINANCE_COMMENT_HTML",
+        "ARCANA_FINANCE_STATEMENT_HTML",
+    }
     after = json.loads(
         (output / "private" / "source-integrity-after.json").read_text(encoding="utf-8")
     )

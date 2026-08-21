@@ -24,7 +24,7 @@ from moatrader.expectations.historical_evidence import (
     build_blinded_packets,
     build_regular_filing_pairs,
     build_source_integrity_manifest,
-    discover_arcana_business_sources,
+    discover_arcana_regular_sources,
     discover_moatrader_original_sources,
     merge_historical_sources,
     sha256_file,
@@ -70,6 +70,8 @@ FROZEN_FEATURE_CONTRACT: dict[str, Any] = {
     "source_scope": {
         "included": [
             "Arcana data-lake raw business-info HTML",
+            "Arcana data-lake raw finance-comment HTML",
+            "Arcana data-lake raw finance-statement HTML",
             "MoatRader data-lake original OpenDART archives",
         ],
         "regular_reports_only": ["사업보고서", "반기보고서", "분기보고서"],
@@ -306,6 +308,8 @@ def run(
     *,
     arcana_metadata: Path,
     arcana_business_html: Path,
+    arcana_finance_comment_html: Path | None = None,
+    arcana_finance_statement_html: Path | None = None,
     moatrader_data_lake: Path,
     trading_calendar: Path,
     output: Path,
@@ -334,16 +338,20 @@ def run(
     )
     print(f"calendar: {len(sessions)} date-only sessions", flush=True)
     sectors, issuer_names, sector_audit = read_sector_map(sector_map_path)
-    arcana, amendments = discover_arcana_business_sources(
+    arcana, amendments, arcana_section_audit = discover_arcana_regular_sources(
         metadata_path=arcana_metadata,
         business_html_root=arcana_business_html,
+        finance_comment_html_root=arcana_finance_comment_html,
+        finance_statement_html_root=arcana_finance_statement_html,
         trading_sessions=sessions,
         begin_year=begin_year,
         end_year=end_year,
         tickers=tickers,
     )
     print(
-        f"arcana: regular={len(arcana)} amendments={len(amendments)} source hashes complete",
+        f"arcana: regular={len(arcana)} amendments={len(amendments)} "
+        f"all_three={arcana_section_audit['filing_count_with_all_three_sections']} "
+        "source hashes complete",
         flush=True,
     )
     moatrader, moatrader_audit = discover_moatrader_original_sources(
@@ -400,6 +408,10 @@ def run(
     complete_year: Counter[str] = Counter()
     complete_sector: Counter[str] = Counter()
     complete_pairs = 0
+    extraction_read_count: Counter[str] = Counter()
+    extraction_empty_candidate_count: Counter[str] = Counter()
+    extraction_axis_window_count: dict[str, Counter[str]] = {}
+    packet_excerpt_count: dict[str, Counter[str]] = {}
     gold: dict[OperatingEvidenceAxis, list[PairedAxisPacket]] = {
         axis: [] for axis in OperatingEvidenceAxis
     }
@@ -425,6 +437,16 @@ def run(
             window_cache = dict(
                 extraction_pool.map(source_variant_axis_windows, variants.values())
             )
+            for raw_sha256, variant in variants.items():
+                origin = variant.origin.value
+                windows = window_cache[raw_sha256]
+                extraction_read_count[origin] += 1
+                extraction_empty_candidate_count[origin] += int(
+                    not any(windows[axis] for axis in OperatingEvidenceAxis)
+                )
+                origin_axis = extraction_axis_window_count.setdefault(origin, Counter())
+                for axis in OperatingEvidenceAxis:
+                    origin_axis[axis.value] += len(windows[axis])
             for pair in ticker_pairs:
                 pair_index += 1
                 protected_names = tuple(
@@ -452,6 +474,9 @@ def run(
                         json.dumps(packet.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
                         + "\n"
                     )
+                    for excerpt in (*packet.previous_excerpts, *packet.current_excerpts):
+                        origin = str(private["sources"][excerpt.source_id]["origin"])
+                        packet_excerpt_count.setdefault(origin, Counter())[packet.axis.value] += 1
                     axis_packet_count[packet.axis.value] += 1
                     both = bool(packet.previous_excerpts) and bool(packet.current_excerpts)
                     axis_both_count[packet.axis.value] += int(both)
@@ -508,9 +533,50 @@ def run(
         writer.writerows(gold_rows)
 
     source_audit = {
-        "schema_version": "moatrader-historical-source-audit-v1/1",
+        "schema_version": "moatrader-historical-source-audit-v1/2",
         "arcana_regular_filing_count": len(arcana),
         "arcana_amendment_count": len(amendments),
+        "arcana_section_audit": arcana_section_audit,
+        "pair_source_extraction_by_origin": {
+            origin: {
+                "source_files_read": extraction_read_count[origin],
+                "source_files_without_any_axis_candidate": extraction_empty_candidate_count[
+                    origin
+                ],
+                "axis_keyword_windows": {
+                    axis.value: extraction_axis_window_count.get(origin, Counter())[axis.value]
+                    for axis in OperatingEvidenceAxis
+                },
+                "selected_packet_excerpt_count": sum(
+                    packet_excerpt_count.get(origin, Counter()).values()
+                ),
+                "selected_packet_excerpts_by_axis": {
+                    axis.value: packet_excerpt_count.get(origin, Counter())[axis.value]
+                    for axis in OperatingEvidenceAxis
+                },
+            }
+            for origin in sorted(set(extraction_read_count) | set(packet_excerpt_count))
+        },
+        "all_arcana_sections_discovered": all(
+            arcana_section_audit["sections"][section]["discovered_nonempty_count"] > 0
+            for section in ("business-info", "finance-comment", "finance-statement")
+        ),
+        "all_arcana_sections_read_for_pairs": all(
+            extraction_read_count[origin] > 0
+            for origin in (
+                "ARCANA_BUSINESS_HTML",
+                "ARCANA_FINANCE_COMMENT_HTML",
+                "ARCANA_FINANCE_STATEMENT_HTML",
+            )
+        ),
+        "all_arcana_sections_contributed_to_packets": all(
+            sum(packet_excerpt_count.get(origin, Counter()).values()) > 0
+            for origin in (
+                "ARCANA_BUSINESS_HTML",
+                "ARCANA_FINANCE_COMMENT_HTML",
+                "ARCANA_FINANCE_STATEMENT_HTML",
+            )
+        ),
         "moatrader_regular_original_filing_count": len(moatrader),
         "moatrader_original_audit": moatrader_audit,
         "merge_audit": merge_audit,
@@ -585,6 +651,16 @@ def main() -> int:
         type=Path,
         default=DEFAULT_ARCANA_ROOT / "bronze" / "dart" / "business-info",
     )
+    parser.add_argument(
+        "--arcana-finance-comment-html",
+        type=Path,
+        default=DEFAULT_ARCANA_ROOT / "bronze" / "dart" / "finance-comment",
+    )
+    parser.add_argument(
+        "--arcana-finance-statement-html",
+        type=Path,
+        default=DEFAULT_ARCANA_ROOT / "bronze" / "dart" / "finance-statement",
+    )
     parser.add_argument("--moatrader-data-lake", type=Path, default=DEFAULT_MOATRADER_DATA_LAKE)
     parser.add_argument("--trading-calendar", type=Path, default=DEFAULT_CALENDAR_ROOT)
     parser.add_argument("--sector-map", type=Path, default=DEFAULT_SECTOR_MAP)
@@ -600,6 +676,8 @@ def main() -> int:
     result = run(
         arcana_metadata=args.arcana_metadata,
         arcana_business_html=args.arcana_business_html,
+        arcana_finance_comment_html=args.arcana_finance_comment_html,
+        arcana_finance_statement_html=args.arcana_finance_statement_html,
         moatrader_data_lake=args.moatrader_data_lake,
         trading_calendar=args.trading_calendar,
         output=args.output,
