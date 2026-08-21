@@ -69,6 +69,19 @@ AXIS_KEYWORDS: dict[OperatingEvidenceAxis, tuple[str, ...]] = {
         "생산능력", "생산설비", "가동률", "시설투자", "설비투자", "증설", "CAPA", "CAPEX", "생산실적",
     ),
 }
+FINANCE_STATEMENT_EXTRA_AXIS_KEYWORDS: dict[
+    OperatingEvidenceAxis, tuple[str, ...]
+] = {
+    # Finance-statement tables usually expose capex through account headings,
+    # not the narrative terms used by business-info and finance-comment.
+    OperatingEvidenceAxis.CAPACITY_CAPEX: (
+        "유형자산의 취득",
+        "유형자산 취득",
+        "건설중인자산",
+        "기계장치",
+        "시설장치",
+    ),
+}
 _KEYWORD_AXES: dict[str, set[OperatingEvidenceAxis]] = defaultdict(set)
 for _axis, _keywords in AXIS_KEYWORDS.items():
     for _keyword in _keywords:
@@ -1123,7 +1136,21 @@ def _all_axis_keyword_windows(
 def source_variant_axis_windows(
     variant: HistoricalSourceVariant,
 ) -> tuple[str, dict[OperatingEvidenceAxis, list[str]]]:
-    return variant.raw_sha256, _all_axis_keyword_windows(source_variant_text(variant))
+    text = source_variant_text(variant)
+    result = _all_axis_keyword_windows(text)
+    if variant.origin == HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML:
+        for axis, extra_keywords in FINANCE_STATEMENT_EXTRA_AXIS_KEYWORDS.items():
+            result[axis] = _keyword_windows(
+                text,
+                keywords=(*AXIS_KEYWORDS[axis], *extra_keywords),
+            )
+    return source_variant_window_cache_key(variant), result
+
+
+def source_variant_window_cache_key(variant: HistoricalSourceVariant) -> str:
+    """Keep source-specific extraction rules isolated even for identical bytes."""
+
+    return f"{variant.origin.value}|{variant.raw_sha256}"
 
 
 def build_blinded_packets(
@@ -1144,7 +1171,8 @@ def build_blinded_packets(
     ) -> list[BlindedExcerpt]:
         by_source: list[list[BlindedExcerpt]] = []
         for variant in filing.source_variants:
-            windows_by_axis = cached_windows.get(variant.raw_sha256)
+            window_key = source_variant_window_cache_key(variant)
+            windows_by_axis = cached_windows.get(window_key)
             if windows_by_axis is None:
                 text = cache.get(variant.raw_sha256)
                 if text is None:
@@ -1152,7 +1180,15 @@ def build_blinded_packets(
                     if window_cache is None:
                         cache[variant.raw_sha256] = text
                 windows_by_axis = _all_axis_keyword_windows(text)
-                cached_windows[variant.raw_sha256] = windows_by_axis
+                if variant.origin == HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML:
+                    for extra_axis, extra_keywords in (
+                        FINANCE_STATEMENT_EXTRA_AXIS_KEYWORDS.items()
+                    ):
+                        windows_by_axis[extra_axis] = _keyword_windows(
+                            text,
+                            keywords=(*AXIS_KEYWORDS[extra_axis], *extra_keywords),
+                        )
+                cached_windows[window_key] = windows_by_axis
             source_rows: list[BlindedExcerpt] = []
             for window_text in windows_by_axis[axis]:
                 blinded = anonymize_historical_text(

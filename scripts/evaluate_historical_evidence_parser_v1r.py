@@ -229,9 +229,52 @@ def evaluate_v1r_locked_parser(
         for line in source_strata_input.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    strata = {str(row["packet_id"]): V1RSourceStratum(str(row["source_stratum"])) for row in strata_rows}
+    strata = {
+        str(row["packet_id"]): V1RSourceStratum(str(row["source_stratum"]))
+        for row in strata_rows
+    }
+    source_origins = {
+        str(row["packet_id"]): {
+            str(source_id): str(origin)
+            for source_id, origin in dict(row.get("source_origins") or {}).items()
+        }
+        for row in strata_rows
+    }
     if len(strata) != len(strata_rows) or set(strata) != set(packets):
         raise ValueError("V1R source strata must exactly cover LOCKED packets")
+    expected_origin = {
+        V1RSourceStratum.BUSINESS_INFO: "ARCANA_BUSINESS_HTML",
+        V1RSourceStratum.FINANCE_COMMENT: "ARCANA_FINANCE_COMMENT_HTML",
+        V1RSourceStratum.FINANCE_STATEMENT: "ARCANA_FINANCE_STATEMENT_HTML",
+    }
+    arcana_origins = set(expected_origin.values())
+    for packet_id, packet in packets.items():
+        packet_source_ids = {
+            excerpt.source_id
+            for excerpt in (*packet.previous_excerpts, *packet.current_excerpts)
+        }
+        if set(source_origins[packet_id]) != packet_source_ids:
+            raise ValueError("V1R source-origin map must exactly cover packet excerpts")
+        stratum = strata[packet_id]
+        previous_origins = {
+            source_origins[packet_id][excerpt.source_id]
+            for excerpt in packet.previous_excerpts
+        }
+        current_origins = {
+            source_origins[packet_id][excerpt.source_id]
+            for excerpt in packet.current_excerpts
+        }
+        if stratum in expected_origin:
+            required = expected_origin[stratum]
+            if previous_origins != {required} or current_origins != {required}:
+                raise ValueError("V1R single-source stratum contains another source")
+        elif (
+            "MOATRADER_OPENDART_ARCHIVE" not in previous_origins
+            or "MOATRADER_OPENDART_ARCHIVE" not in current_origins
+            or not (previous_origins & arcana_origins)
+            or not (current_origins & arcana_origins)
+        ):
+            raise ValueError("V1R overlap stratum lacks Arcana or MoatRader evidence")
 
     common_report = evaluate_human_gold_quality(
         human_gold_path=human_gold,
@@ -295,6 +338,93 @@ def evaluate_v1r_locked_parser(
                 "reviewed": len(values),
                 "exact_matches": matches,
                 "agreement": agreement,
+                "machine_abstention_count": sum(
+                    predicted.status != AxisClassificationStatus.COMPLETE
+                    for _human, predicted in values
+                ),
+                "machine_abstention_rate": (
+                    sum(
+                        predicted.status != AxisClassificationStatus.COMPLETE
+                        for _human, predicted in values
+                    )
+                    / len(values)
+                    if values
+                    else 0.0
+                ),
+                "false_stable_count": sum(
+                    1
+                    for human, predicted in values
+                    if predicted.status == AxisClassificationStatus.COMPLETE
+                    for human_state, predicted_state in zip(
+                        (human.previous_state, human.current_state),
+                        (predicted.previous_state, predicted.current_state),
+                        strict=True,
+                    )
+                    if predicted_state is not None
+                    and predicted_state.value == 0
+                    and (human_state is None or human_state.value != 0)
+                ),
+                "neutral_to_bullish_count": sum(
+                    1
+                    for human, predicted in values
+                    if human.status == AxisClassificationStatus.COMPLETE
+                    and predicted.status == AxisClassificationStatus.COMPLETE
+                    for human_state, predicted_state in zip(
+                        (human.previous_state, human.current_state),
+                        (predicted.previous_state, predicted.current_state),
+                        strict=True,
+                    )
+                    if human_state is not None
+                    and predicted_state is not None
+                    and human_state.value == 0
+                    and predicted_state.value == 1
+                ),
+                "state_confusion": dict(
+                    sorted(
+                        Counter(
+                            f"{human_state.value}->{predicted_state.value}"
+                            for human, predicted in values
+                            if human.status == AxisClassificationStatus.COMPLETE
+                            and predicted.status == AxisClassificationStatus.COMPLETE
+                            for human_state, predicted_state in zip(
+                                (human.previous_state, human.current_state),
+                                (predicted.previous_state, predicted.current_state),
+                                strict=True,
+                            )
+                            if human_state is not None and predicted_state is not None
+                        ).items()
+                    )
+                ),
+                "human_selected_source_origins": dict(
+                    sorted(
+                        Counter(
+                            source_origins[human.packet_id][source_id]
+                            for human, _predicted in values
+                            if human.status == AxisClassificationStatus.COMPLETE
+                            for source_id in (
+                                human.previous_source_id,
+                                human.current_source_id,
+                            )
+                            if source_id is not None
+                        ).items()
+                    )
+                ),
+                "machine_selected_source_origins": dict(
+                    sorted(
+                        Counter(
+                            source_origins[predicted.packet_id][source_id]
+                            for _human, predicted in values
+                            if predicted.status == AxisClassificationStatus.COMPLETE
+                            for source_id in (
+                                predicted.previous_source_id,
+                                predicted.current_source_id,
+                            )
+                            if source_id is not None
+                        ).items()
+                    )
+                ),
+                "source_span_grounding_validated_count": len(values),
+                "source_span_grounding_rate": 1.0 if values else 0.0,
                 "minimum_count_passed": count_passed,
                 "agreement_passed": agreement_passed,
             }

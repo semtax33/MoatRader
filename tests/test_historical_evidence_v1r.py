@@ -453,10 +453,21 @@ def test_v1r_source_stratified_locked_is_new_and_single_use(tmp_path: Path) -> N
         "BUSINESS_INFO_EVIDENCE",
         "FINANCE_COMMENT_EVIDENCE",
         "FINANCE_STATEMENT_EVIDENCE",
-        "MULTI_SECTION_EVIDENCE",
+        "MULTI_SOURCE_MOATRADER_OVERLAP_EVIDENCE",
     }
     evaluation = json.loads(parser_validation.read_text(encoding="utf-8"))
     assert evaluation["source_stratum_gate_passed"] is True
+    quality = json.loads(
+        (parser_validation.parent / "parser-quality-report-v1r.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert all(
+        row["source_span_grounding_rate"] == 1
+        and "neutral_to_bullish_count" in row
+        and "false_stable_count" in row
+        for row in quality["by_axis_source_stratum"].values()
+    )
     with pytest.raises(FileExistsError, match="already consumed"):
         evaluate_v1r_locked_parser(
             packet_input=locked / "v1r-locked-packets.jsonl",

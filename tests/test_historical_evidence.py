@@ -33,6 +33,7 @@ from moatrader.expectations.historical_evidence import (
     packet_coverage_report,
     seal_historical_evidence_features,
     source_integrity_record,
+    source_variant_axis_windows,
     validate_classification_grounding,
     validate_packet_anonymization,
     verify_source_integrity,
@@ -87,6 +88,37 @@ def _filing(
             )
         ],
     )
+
+
+def test_finance_statement_capacity_uses_account_heading_keywords_only_for_that_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "finance-statement.html"
+    source.write_text(
+        "<html><body><table><tr><td>유형자산의 취득</td><td>123</td></tr></table></body></html>",
+        encoding="utf-8",
+    )
+    raw_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def variant(origin: HistoricalSourceOrigin) -> HistoricalSourceVariant:
+        return HistoricalSourceVariant(
+            origin=origin,
+            path=str(source),
+            raw_sha256=raw_sha256,
+            byte_count=source.stat().st_size,
+            receipt_linkage=ReceiptLinkage.INFERRED_TICKER_PERIOD,
+        )
+
+    statement_key, statement_windows = source_variant_axis_windows(
+        variant(HistoricalSourceOrigin.ARCANA_FINANCE_STATEMENT_HTML)
+    )
+    business_key, business_windows = source_variant_axis_windows(
+        variant(HistoricalSourceOrigin.ARCANA_BUSINESS_HTML)
+    )
+
+    assert statement_key != business_key
+    assert statement_windows[OperatingEvidenceAxis.CAPACITY_CAPEX]
+    assert not business_windows[OperatingEvidenceAxis.CAPACITY_CAPEX]
 
 
 def test_integrity_manifest_detects_mutation_of_temporary_copy(tmp_path: Path) -> None:

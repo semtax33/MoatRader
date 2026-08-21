@@ -29,6 +29,7 @@ from moatrader.expectations.historical_evidence import (
     merge_historical_sources,
     sha256_file,
     source_variant_axis_windows,
+    source_variant_window_cache_key,
     validate_packet_anonymization,
     verify_source_integrity,
 )
@@ -504,7 +505,7 @@ def run(
         for ticker, pair_group in groupby(pairs, key=lambda item: item.ticker):
             ticker_pairs = list(pair_group)
             variants = {
-                variant.raw_sha256: variant
+                source_variant_window_cache_key(variant): variant
                 for pair in ticker_pairs
                 for filing in (pair.previous, pair.current)
                 for variant in filing.source_variants
@@ -512,9 +513,9 @@ def run(
             window_cache = dict(
                 extraction_pool.map(source_variant_axis_windows, variants.values())
             )
-            for raw_sha256, variant in variants.items():
+            for window_key, variant in variants.items():
                 origin = variant.origin.value
-                windows = window_cache[raw_sha256]
+                windows = window_cache[window_key]
                 extraction_read_count[origin] += 1
                 extraction_empty_candidate_count[origin] += int(
                     not any(windows[axis] for axis in OperatingEvidenceAxis)

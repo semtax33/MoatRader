@@ -21,7 +21,7 @@ class V1RSourceStratum(StrEnum):
     BUSINESS_INFO = "BUSINESS_INFO_EVIDENCE"
     FINANCE_COMMENT = "FINANCE_COMMENT_EVIDENCE"
     FINANCE_STATEMENT = "FINANCE_STATEMENT_EVIDENCE"
-    MULTI_SECTION = "MULTI_SECTION_EVIDENCE"
+    MULTI_SOURCE_MOATRADER_OVERLAP = "MULTI_SOURCE_MOATRADER_OVERLAP_EVIDENCE"
 
 
 STRATUM_ORIGIN = {
@@ -30,6 +30,7 @@ STRATUM_ORIGIN = {
     V1RSourceStratum.FINANCE_STATEMENT: "ARCANA_FINANCE_STATEMENT_HTML",
 }
 ARCANA_ORIGINS = frozenset(STRATUM_ORIGIN.values())
+MOATRADER_ORIGIN = "MOATRADER_OPENDART_ARCHIVE"
 GOLD_FIELDS = (
     "packet_id",
     "base_packet_id",
@@ -134,12 +135,17 @@ def _derived_packet(
     stratum: V1RSourceStratum,
     source_map: dict[str, dict[str, Any]],
 ) -> PairedAxisPacket | None:
-    if stratum == V1RSourceStratum.MULTI_SECTION:
-        previous_origins = _origins(packet.previous_excerpts, source_map) & ARCANA_ORIGINS
-        current_origins = _origins(packet.current_excerpts, source_map) & ARCANA_ORIGINS
-        if len(previous_origins) < 2 or len(current_origins) < 2:
+    if stratum == V1RSourceStratum.MULTI_SOURCE_MOATRADER_OVERLAP:
+        previous_origins = _origins(packet.previous_excerpts, source_map)
+        current_origins = _origins(packet.current_excerpts, source_map)
+        if (
+            MOATRADER_ORIGIN not in previous_origins
+            or MOATRADER_ORIGIN not in current_origins
+            or not (previous_origins & ARCANA_ORIGINS)
+            or not (current_origins & ARCANA_ORIGINS)
+        ):
             return None
-        allowed = set(ARCANA_ORIGINS)
+        allowed = {*ARCANA_ORIGINS, MOATRADER_ORIGIN}
     else:
         allowed = {STRATUM_ORIGIN[stratum]}
     previous = _filter_origin(packet.previous_excerpts, source_map, allowed)
@@ -199,7 +205,8 @@ def prepare_v1r_locked_set(
     excluded = excluded_v1 | excluded_dev
 
     candidates: dict[
-        tuple[OperatingEvidenceAxis, V1RSourceStratum], list[tuple[PairedAxisPacket, str]]
+        tuple[OperatingEvidenceAxis, V1RSourceStratum],
+        list[tuple[PairedAxisPacket, str, dict[str, str]]],
     ] = defaultdict(list)
     private_lines = (
         json.loads(line)
@@ -216,9 +223,21 @@ def prepare_v1r_locked_set(
             for stratum in V1RSourceStratum:
                 derived = _derived_packet(packet, stratum=stratum, source_map=source_map)
                 if derived is not None:
-                    candidates[(packet.axis, stratum)].append((derived, packet.packet_id))
+                    selected_source_ids = {
+                        excerpt.source_id
+                        for excerpt in (*derived.previous_excerpts, *derived.current_excerpts)
+                    }
+                    source_origins = {
+                        source_id: str(source_map[source_id]["origin"])
+                        for source_id in sorted(selected_source_ids)
+                    }
+                    candidates[(packet.axis, stratum)].append(
+                        (derived, packet.packet_id, source_origins)
+                    )
 
-    selected: list[tuple[PairedAxisPacket, str, V1RSourceStratum]] = []
+    selected: list[
+        tuple[PairedAxisPacket, str, V1RSourceStratum, dict[str, str]]
+    ] = []
     candidate_counts: dict[str, dict[str, int]] = {}
     for axis in OperatingEvidenceAxis:
         candidate_counts[axis.value] = {}
@@ -233,8 +252,10 @@ def prepare_v1r_locked_set(
                     f"insufficient V1R {axis.value}/{stratum.value} candidates: {len(rows)}"
                 )
             selected.extend(
-                (packet, base_packet_id, stratum)
-                for packet, base_packet_id in rows[:minimum_per_axis_source_stratum]
+                (packet, base_packet_id, stratum, source_origins)
+                for packet, base_packet_id, source_origins in rows[
+                    :minimum_per_axis_source_stratum
+                ]
             )
     selected.sort(key=lambda row: (row[0].axis.value, row[2].value, row[0].packet_id))
     derived_ids = {row[0].packet_id for row in selected}
@@ -256,15 +277,16 @@ def prepare_v1r_locked_set(
                 "base_packet_id": base_packet_id,
                 "axis": packet.axis.value,
                 "source_stratum": stratum.value,
+                "source_origins": source_origins,
             }
-            for packet, base_packet_id, stratum in selected
+            for packet, base_packet_id, stratum, source_origins in selected
         ),
     )
     gold_path = output / "v1r-locked-human-gold-template.csv"
     with gold_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(GOLD_FIELDS))
         writer.writeheader()
-        for packet, base_packet_id, stratum in selected:
+        for packet, base_packet_id, stratum, _source_origins in selected:
             writer.writerow(
                 {
                     "packet_id": packet.packet_id,
