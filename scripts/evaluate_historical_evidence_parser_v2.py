@@ -36,6 +36,11 @@ LOCKED_CONFIG = {
         "contract": "V2_DIRECTIONAL_BALANCED_LOCKED",
         "packet_hash_key": "balanced_locked_packet_sha256",
     },
+    "NATURAL_RETEST_1": {
+        "split": "V2_NATURAL_LOCKED_RETEST_1",
+        "contract": "V2_NATURAL_FREQUENCY_LOCKED_RETEST_1",
+        "packet_hash_key": "natural_retest_packet_sha256",
+    },
 }
 V2_STRATA = (
     "COMPLETE_NEGATIVE",
@@ -219,7 +224,7 @@ def evaluate_v2_locked_parser(
     parser_freeze_manifest: Path,
     locked_consumption_record: Path,
     output: Path,
-    locked_kind: Literal["NATURAL", "BALANCED"] = "BALANCED",
+    locked_kind: Literal["NATURAL", "BALANCED", "NATURAL_RETEST_1"] = "BALANCED",
     minimum_per_axis_stratum: int = 5,
     minimum_natural_per_axis: int = 20,
     minimum_overall_directional_agreement: float = 0.80,
@@ -229,6 +234,7 @@ def evaluate_v2_locked_parser(
     maximum_opposite_direction_count: int = 0,
 ) -> dict[str, Any]:
     config = LOCKED_CONFIG[locked_kind]
+    natural_kind = locked_kind in {"NATURAL", "NATURAL_RETEST_1"}
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"output directory must be new or empty: {output}")
     if locked_consumption_record.exists():
@@ -245,10 +251,32 @@ def evaluate_v2_locked_parser(
         if not path.is_file():
             raise FileNotFoundError(path)
     freeze = json.loads(parser_freeze_manifest.read_text(encoding="utf-8"))
-    if freeze.get("schema_version") != "moatrader-historical-evidence-parser-freeze-v2/2":
-        raise ValueError("V1 or single-set LOCKED artifacts cannot validate V2 measurement")
-    if freeze.get("status") != "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS":
-        raise ValueError("V2 parser is not frozen for dual independent LOCKED tests")
+    if locked_kind == "NATURAL_RETEST_1":
+        if freeze.get("schema_version") != (
+            "moatrader-historical-evidence-parser-retest-freeze-v2/1"
+        ):
+            raise ValueError("Natural retest requires its derived measurement freeze")
+        if freeze.get("status") != (
+            "V2_NATURAL_RETEST_1_FROZEN_AWAITING_SINGLE_USE_TEST"
+        ):
+            raise ValueError("Natural retest measurement is not frozen")
+        if not str(freeze.get("semantic_parser_root_freeze_sha256") or ""):
+            raise ValueError("Natural retest freeze lacks root parser-freeze lineage")
+        if freeze.get("first_natural_test_remains_consumed") is not True or freeze.get(
+            "first_natural_result_superseded"
+        ) is not False:
+            raise ValueError("Natural retest attempted to reopen the first consumed test")
+    else:
+        if freeze.get("schema_version") != (
+            "moatrader-historical-evidence-parser-freeze-v2/2"
+        ):
+            raise ValueError(
+                "V1 or single-set LOCKED artifacts cannot validate V2 measurement"
+            )
+        if freeze.get("status") != (
+            "V2_PARSER_FROZEN_AWAITING_DUAL_INDEPENDENT_LOCKED_TESTS"
+        ):
+            raise ValueError("V2 parser is not frozen for dual independent LOCKED tests")
     _require_semantic_parser_contract(freeze, "V2 parser freeze")
     if freeze.get("v1_locked_rows_reused", True) or not freeze.get("locked_sets_disjoint", False):
         raise ValueError("V2 LOCKED sets must be new, mutually disjoint, and independent of V1")
@@ -412,13 +440,13 @@ def evaluate_v2_locked_parser(
     balanced_gate = common_quality and all(
         row["balanced_strata_passed"] for row in by_axis.values()
     )
-    gate = natural_gate if locked_kind == "NATURAL" else balanced_gate
+    gate = natural_gate if natural_kind else balanced_gate
     report = {
         "schema_version": "moatrader-historical-label-quality-v2/2",
         "status": "PASSED" if gate else "FAILED_LOCKED_MEASUREMENT_QUALITY",
         "locked_kind": locked_kind,
         "gate_passed": gate,
-        "natural_frequency_gate_passed": natural_gate if locked_kind == "NATURAL" else False,
+        "natural_frequency_gate_passed": natural_gate if natural_kind else False,
         "directional_strata_gate_passed": balanced_gate if locked_kind == "BALANCED" else False,
         "reviewed_count": len(reviewed),
         "minimum_per_axis_stratum": minimum_per_axis_stratum,
@@ -463,7 +491,7 @@ def evaluate_v2_locked_parser(
         ),
         "locked_kind": locked_kind,
         "gate_passed": gate,
-        "natural_frequency_gate_passed": natural_gate if locked_kind == "NATURAL" else False,
+        "natural_frequency_gate_passed": natural_gate if natural_kind else False,
         "directional_strata_gate_passed": balanced_gate if locked_kind == "BALANCED" else False,
         "parser_version": classification_stage["parser_version"],
         "parser_profile": classification_stage["parser_profile"],
@@ -477,6 +505,15 @@ def evaluate_v2_locked_parser(
         "value_data_opened": False,
         "per_pbr_role": "NOT_USED",
     }
+    if locked_kind == "NATURAL_RETEST_1":
+        stage.update(
+            semantic_parser_root_freeze_sha256=freeze[
+                "semantic_parser_root_freeze_sha256"
+            ],
+            retest_number=1,
+            first_natural_test_remains_consumed=True,
+            first_natural_result_superseded=False,
+        )
     _write_json(output / "stage-status.json", stage)
     consumption = json.loads(locked_consumption_record.read_text(encoding="utf-8"))
     consumption.update(
@@ -512,7 +549,11 @@ def combine_v2_locked_evaluations(
         raise ValueError("supplied semantic V2 parser freeze is invalid")
     _require_semantic_parser_contract(freeze, "V2 parser freeze")
     expected_freeze_hash = sha256_file(parser_freeze_manifest)
-    if natural.get("status") != "V2_NATURAL_LOCKED_TEST_PASSED":
+    valid_natural_statuses = {
+        "V2_NATURAL_LOCKED_TEST_PASSED",
+        "V2_NATURAL_RETEST_1_LOCKED_TEST_PASSED",
+    }
+    if natural.get("status") not in valid_natural_statuses:
         raise ValueError("Natural-frequency V2 LOCKED test has not passed")
     if balanced.get("status") != "V2_BALANCED_LOCKED_TEST_PASSED":
         raise ValueError("Directional-balanced V2 LOCKED test has not passed")
@@ -522,8 +563,21 @@ def combine_v2_locked_evaluations(
         raise ValueError("Balanced directional-strata gate flag is false")
     for manifest in (natural, balanced):
         _require_semantic_parser_contract(manifest, "V2 LOCKED evaluation")
-        if manifest.get("parser_freeze_sha256") != expected_freeze_hash:
-            raise ValueError("LOCKED evaluations do not share the supplied parser freeze")
+    natural_root_freeze_hash = (
+        natural.get("semantic_parser_root_freeze_sha256")
+        if natural.get("locked_kind") == "NATURAL_RETEST_1"
+        else natural.get("parser_freeze_sha256")
+    )
+    if natural_root_freeze_hash != expected_freeze_hash or balanced.get(
+        "parser_freeze_sha256"
+    ) != expected_freeze_hash:
+        raise ValueError("LOCKED evaluations do not share the supplied root parser freeze")
+    if natural.get("locked_kind") == "NATURAL_RETEST_1" and (
+        natural.get("retest_number") != 1
+        or natural.get("first_natural_test_remains_consumed") is not True
+        or natural.get("first_natural_result_superseded") is not False
+    ):
+        raise ValueError("Natural retest evaluation lacks consumed-test lineage")
     for key in ("parser_profile", "parser_version", "prompt_sha256", "requested_model"):
         if natural.get(key) != balanced.get(key):
             raise ValueError(f"Natural and Balanced LOCKED disagree on {key}")
@@ -539,6 +593,8 @@ def combine_v2_locked_evaluations(
         "parser_freeze_sha256": expected_freeze_hash,
         "natural_evaluation_manifest_sha256": sha256_file(natural_evaluation_manifest),
         "balanced_evaluation_manifest_sha256": sha256_file(balanced_evaluation_manifest),
+        "natural_locked_kind": natural.get("locked_kind"),
+        "natural_retest_number": natural.get("retest_number"),
         "v1_locked_rows_reused": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
@@ -562,7 +618,11 @@ def main() -> int:
     freeze_parser.add_argument("--human-gold", type=Path, required=True)
     freeze_parser.add_argument("--output", type=Path, required=True)
     evaluate_parser = subparsers.add_parser("evaluate")
-    evaluate_parser.add_argument("--locked-kind", choices=["NATURAL", "BALANCED"], required=True)
+    evaluate_parser.add_argument(
+        "--locked-kind",
+        choices=["NATURAL", "BALANCED", "NATURAL_RETEST_1"],
+        required=True,
+    )
     evaluate_parser.add_argument("--packet-input", type=Path, required=True)
     evaluate_parser.add_argument("--classification-build", type=Path, required=True)
     evaluate_parser.add_argument("--human-gold", type=Path, required=True)
