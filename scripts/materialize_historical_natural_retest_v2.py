@@ -144,6 +144,10 @@ def materialize_natural_retest_human_gold(
             raise ValueError(f"review decision is outside Natural retest 1: {packet_id}")
         if raw.get("axis") not in (None, "", packet.axis.value):
             raise ValueError(f"review decision axis mismatch for {packet_id}")
+        if raw.get("contract_self_check") != "YES":
+            raise ValueError(
+                f"contract_self_check must be exactly YES for {packet_id}"
+            )
         seen.add(packet_id)
         status = AxisClassificationStatus(str(raw.get("status") or "").strip())
         status_counts[status.value] = status_counts.get(status.value, 0) + 1
@@ -220,7 +224,7 @@ def materialize_natural_retest_human_gold(
         writer.writeheader()
         writer.writerows(rows)
     result = {
-        "schema_version": "moatrader-v2-natural-retest-human-gold-materialization/1",
+        "schema_version": "moatrader-v2-natural-retest-human-gold-materialization/2",
         "status": "V2_NATURAL_RETEST_1_HUMAN_GOLD_MATERIALIZED_OUTCOME_BLIND",
         "reviewer": "HUMAN",
         "human_reviewer_name": reviewer_name,
@@ -236,6 +240,7 @@ def materialize_natural_retest_human_gold(
         "natural_retest_human_gold_sha256": sha256_file(gold_path),
         "source_spans_materialized_from_human_anchors": True,
         "model_fields_accepted": False,
+        "contract_self_check_required": True,
         "first_natural_test_remains_consumed": True,
         "outcome_vault_opened": False,
         "return_data_opened": False,

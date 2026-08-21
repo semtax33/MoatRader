@@ -452,6 +452,38 @@ python scripts\merge_historical_human_review_decisions_v2.py `
 세 명령은 입력 파일을 덮어쓰지 않고 새 output만 허용하며, packet 중복·해시 계보·
 `outcome_vault_opened=false`·`return_data_opened=false`를 검증한다.
 
+첫 Natural LOCKED가 실패한 경우에도 그 평가와 consumption record를 보존한다.
+Natural Retest 1은 기존 V1·DEV·첫 Natural·첫 Balanced packet을 모두 제외한 새
+Natural-frequency 표본을 outcome-blind하게 고정한다. HUMAN materialization은 각
+결정에서 `contract_self_check=YES`를 요구한다. 이는 단순한 anchor 포함/입력 완결성
+검사가 아니라, 검토자가 Demand와 Price/Mix의 실현 상태 계약을 다시 읽고 적용했다는
+행별 확인이다. `COMPLETE`는 두 기간의 정확한 원문 anchor와 -1/0/+1 state를 모두
+요구하고, `INSUFFICIENT_EVIDENCE`와 `AMBIGUOUS`는 state/anchor를 비워야 한다.
+
+```powershell
+python -m scripts.prepare_historical_natural_retest_v2 `
+  --packet-input <semantic-packets.jsonl> `
+  --prior-v1-input <v1-input.jsonl> `
+  --dev-input <dev-input.jsonl> `
+  --prior-v2-locked-input <first-natural.jsonl> `
+  --prior-v2-locked-input <first-balanced.jsonl> `
+  --failed-natural-evaluation-manifest <failed-natural-stage.json> `
+  --failed-natural-consumption-record <natural-consumption.json> `
+  --parser-freeze-manifest <root-parser-freeze.json> `
+  --output <new-natural-retest-candidates>
+
+python -m scripts.materialize_historical_natural_retest_v2 materialize `
+  --candidate-build <new-natural-retest-candidates> `
+  --review-decisions <fresh-human-review-decisions.json> `
+  --output <new-natural-retest-human-gold>
+
+python -m scripts.materialize_historical_natural_retest_v2 freeze `
+  --parser-freeze-manifest <root-parser-freeze.json> `
+  --candidate-build <new-natural-retest-candidates> `
+  --human-gold-build <new-natural-retest-human-gold> `
+  --output <new-natural-retest-freeze.json>
+```
+
 첫 Balanced LOCKED가 단일사용 평가에서 실패하면 그 결과와 consumption record를
 그대로 보존한다. Retest 1은 실패 분류나 불일치 행을 읽지 않고, 이미 사용한
 V1·DEV·Natural·Balanced·기타 retest ID를 명시적으로 제외한다. 방향성 후보는

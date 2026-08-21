@@ -281,6 +281,7 @@ def test_natural_retest_human_gold_freeze_evaluation_and_combine(
                     "previous_anchor": "이전 공시 원문",
                     "current_anchor": "현재 공시 원문",
                     "review_notes": "두 기간 모두 명시적 안정 상태로 독립 판정",
+                    "contract_self_check": "YES",
                 }
                 for packet in packets
             ],
@@ -297,6 +298,7 @@ def test_natural_retest_human_gold_freeze_evaluation_and_combine(
     )
     assert materialized["review_decision_count"] == 40
     assert materialized["model_fields_accepted"] is False
+    assert materialized["contract_self_check_required"] is True
 
     retest_freeze = tmp_path / "natural-retest-freeze.json"
     frozen = freeze_natural_retest_measurement(
@@ -459,6 +461,57 @@ def test_natural_retest_materialization_rejects_model_fields(tmp_path: Path) -> 
         },
     )
     with pytest.raises(ValueError, match="forbidden model-derived fields"):
+        materialize_natural_retest_human_gold(
+            candidate_build=candidate_build,
+            review_decisions=review_path,
+            output=tmp_path / "human-gold",
+        )
+
+
+def test_natural_retest_materialization_requires_contract_self_check(
+    tmp_path: Path,
+) -> None:
+    paths = _fixture(tmp_path)
+    candidate_build = tmp_path / "natural-retest-candidates"
+    prepare_natural_retest_candidates(
+        packet_input=paths["packet_input"],
+        prior_v1_inputs=[paths["prior_v1"]],
+        dev_inputs=[paths["dev"]],
+        prior_v2_locked_inputs=[paths["old_natural"], paths["old_balanced"]],
+        failed_natural_evaluation_manifest=paths["evaluation"],
+        failed_natural_consumption_record=paths["consumption"],
+        parser_freeze_manifest=paths["freeze"],
+        output=candidate_build,
+        per_axis=20,
+    )
+    packet = PairedAxisPacket.model_validate_json(
+        (candidate_build / "natural-retest-packets.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    review_path = tmp_path / "missing-contract-self-check.json"
+    _write_json(
+        review_path,
+        {
+            "reviewer": "HUMAN",
+            "human_reviewer_name": "Test Reviewer",
+            "attestation": "YES",
+            "review_date": "2026-08-22",
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+            "decisions": [
+                {
+                    "packet_id": packet.packet_id,
+                    "axis": packet.axis.value,
+                    "status": "INSUFFICIENT_EVIDENCE",
+                    "review_notes": "계약상 두 기간의 실현 상태가 부족함",
+                }
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="contract_self_check must be exactly YES"):
         materialize_natural_retest_human_gold(
             candidate_build=candidate_build,
             review_decisions=review_path,
