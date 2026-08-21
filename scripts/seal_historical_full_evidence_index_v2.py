@@ -309,6 +309,11 @@ def _validate_gates(
             raise ValueError(f"cost manifest does not match frozen {key}")
     if cost.get("exact_packet_count") != selection.get("selected_packet_count"):
         raise ValueError("cost manifest packet count differs from semantic selection")
+    cost_inputs = cost.get("inputs", {})
+    if cost_inputs.get("dual_locked_manifest_sha256") != sha256_file(
+        dual_locked_manifest
+    ):
+        raise ValueError("cost manifest does not seal the dual LOCKED lineage")
     if sparse.get("status") != "SPARSE_FEATURES_BUILT_AWAITING_OUTCOME_BLIND_CALIBRATION":
         raise ValueError("sparse full feature stage is incomplete")
     if sparse.get("parser_directional_validation_passed") is not True:

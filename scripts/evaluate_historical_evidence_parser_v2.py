@@ -497,6 +497,9 @@ def evaluate_v2_locked_parser(
         "parser_profile": classification_stage["parser_profile"],
         "prompt_sha256": classification_stage["prompt_sha256"],
         "requested_model": classification_stage["requested_model"],
+        "classification_stage_sha256": sha256_file(classification_status_path),
+        "classification_sha256": sha256_file(classification_path),
+        "input_blinded_packet_sha256": sha256_file(packet_input),
         "parser_quality_report_sha256": sha256_file(report_path),
         "parser_freeze_sha256": sha256_file(parser_freeze_manifest),
         "v1_locked_rows_reused": False,
@@ -578,6 +581,26 @@ def combine_v2_locked_evaluations(
         or natural.get("first_natural_result_superseded") is not False
     ):
         raise ValueError("Natural retest evaluation lacks consumed-test lineage")
+    for manifest, description in (
+        (natural, "Natural"),
+        (balanced, "Balanced"),
+    ):
+        for key in (
+            "classification_stage_sha256",
+            "classification_sha256",
+            "input_blinded_packet_sha256",
+        ):
+            value = manifest.get(key)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"{description} evaluation lacks {key} lineage")
+    same_classification_stage = natural["classification_stage_sha256"] == balanced[
+        "classification_stage_sha256"
+    ]
+    same_locked_input = natural["input_blinded_packet_sha256"] == balanced[
+        "input_blinded_packet_sha256"
+    ]
+    if same_classification_stage or same_locked_input:
+        raise ValueError("Natural and Balanced evaluations must use distinct locked inputs")
     for key in ("parser_profile", "parser_version", "prompt_sha256", "requested_model"):
         if natural.get(key) != balanced.get(key):
             raise ValueError(f"Natural and Balanced LOCKED disagree on {key}")
@@ -593,6 +616,16 @@ def combine_v2_locked_evaluations(
         "parser_freeze_sha256": expected_freeze_hash,
         "natural_evaluation_manifest_sha256": sha256_file(natural_evaluation_manifest),
         "balanced_evaluation_manifest_sha256": sha256_file(balanced_evaluation_manifest),
+        "natural_classification_stage_sha256": natural[
+            "classification_stage_sha256"
+        ],
+        "balanced_classification_stage_sha256": balanced[
+            "classification_stage_sha256"
+        ],
+        "natural_classification_sha256": natural["classification_sha256"],
+        "balanced_classification_sha256": balanced["classification_sha256"],
+        "natural_locked_packet_sha256": natural["input_blinded_packet_sha256"],
+        "balanced_locked_packet_sha256": balanced["input_blinded_packet_sha256"],
         "natural_locked_kind": natural.get("locked_kind"),
         "natural_retest_number": natural.get("retest_number"),
         "v1_locked_rows_reused": False,

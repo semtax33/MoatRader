@@ -27,7 +27,10 @@ from scripts.classify_historical_future_eri_evidence import (
 )
 from scripts.evaluate_historical_evidence_parser import evaluate_parser
 from scripts.prepare_historical_evidence_classification_subset import prepare_subset
-from scripts.prepare_historical_semantic_cost_manifest_v2 import prepare_cost_manifest
+from scripts.prepare_historical_semantic_cost_manifest_v2 import (
+    prepare_cost_manifest,
+    prepare_prelock_cost_preflight,
+)
 from scripts.seal_historical_future_eri_features import evaluate_human_gold_quality
 
 
@@ -278,9 +281,12 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
                 "status": "V2_LOCKED_TESTS_PASSED",
                 "natural_frequency_gate_passed": True,
                 "directional_strata_gate_passed": True,
+                "parser_profile": "DEMAND_PRICE_MIX_V2",
                 "parser_version": SEMANTIC_PARSER_VERSION_V2,
                 "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
                 "requested_model": "gpt-5.6-luna",
+                "natural_classification_stage_sha256": "1" * 64,
+                "balanced_classification_stage_sha256": "2" * 64,
                 "outcome_vault_opened": False,
                 "return_data_opened": False,
             }
@@ -305,8 +311,11 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
                 "inputs": {
                     "semantic_packet_sha256": sha256_file(packet_input),
                     "semantic_selection_manifest_sha256": sha256_file(selection),
+                    "dual_locked_manifest_sha256": sha256_file(locked),
                     "pilot_stage_manifests": [
                         {
+                            "sha256": "1" * 64,
+                            "locked_role": "NATURAL",
                             "parser_profile": "DEMAND_PRICE_MIX_V2",
                             "parser_version": SEMANTIC_PARSER_VERSION_V2,
                             "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
@@ -314,6 +323,8 @@ def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
                             "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
                         },
                         {
+                            "sha256": "2" * 64,
+                            "locked_role": "BALANCED",
                             "parser_profile": "DEMAND_PRICE_MIX_V2",
                             "parser_version": SEMANTIC_PARSER_VERSION_V2,
                             "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
@@ -810,6 +821,7 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
                     "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
                     "packet_count": 1,
                     "classification_count": 1,
+                    "input_blinded_packet_sha256": str(index + 1) * 64,
                     "parser_profile": "DEMAND_PRICE_MIX_V2",
                     "parser_version": SEMANTIC_PARSER_VERSION_V2,
                     "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
@@ -832,10 +844,32 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
             encoding="utf-8",
         )
         pilot_paths.append(path)
+    dual_locked = tmp_path / "dual-locked.json"
+    dual_locked.write_text(
+        json.dumps(
+            {
+                "status": "V2_LOCKED_TESTS_PASSED",
+                "natural_frequency_gate_passed": True,
+                "directional_strata_gate_passed": True,
+                "parser_profile": "DEMAND_PRICE_MIX_V2",
+                "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                "requested_model": "gpt-5.6-luna",
+                "natural_classification_stage_sha256": sha256_file(pilot_paths[0]),
+                "balanced_classification_stage_sha256": sha256_file(pilot_paths[1]),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "per_pbr_role": "NOT_USED",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     result = prepare_cost_manifest(
         semantic_packet_input=packet_input,
         semantic_selection_manifest=selection,
+        dual_locked_manifest=dual_locked,
         pilot_stage_manifests=pilot_paths,
         output=tmp_path / "cost.json",
     )
@@ -855,6 +889,98 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
     assert result["per_pbr_role"] == "NOT_USED"
     assert result["token_estimation"]["pilot_prompt_differs_from_frozen_full_prompt"] is False
     assert result["token_estimation"]["pilot_contract_matches_frozen_full_prompt"] is True
+    assert result["inputs"]["dual_locked_manifest_sha256"] == sha256_file(dual_locked)
+    assert {row["locked_role"] for row in result["inputs"]["pilot_stage_manifests"]} == {
+        "NATURAL",
+        "BALANCED",
+    }
+    substituted_stage = tmp_path / "substituted-dev-stage.json"
+    substituted_payload = json.loads(pilot_paths[1].read_text(encoding="utf-8"))
+    substituted_payload["input_blinded_packet_sha256"] = "f" * 64
+    substituted_stage.write_text(json.dumps(substituted_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="dual LOCKED Natural/Balanced lineage"):
+        prepare_cost_manifest(
+            semantic_packet_input=packet_input,
+            semantic_selection_manifest=selection,
+            dual_locked_manifest=dual_locked,
+            pilot_stage_manifests=[pilot_paths[0], substituted_stage],
+            output=tmp_path / "substituted-cost.json",
+        )
+
+
+def test_semantic_cost_preflight_uses_current_prompt_but_never_authorizes_run(
+    tmp_path: Path,
+) -> None:
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(
+        packet_input,
+        [
+            _packet(1, OperatingEvidenceAxis.DEMAND),
+            _packet(2, OperatingEvidenceAxis.PRICE_MIX),
+        ],
+    )
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected_packet_count": 2,
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    observed: dict[str, Path] = {}
+    for role, index in (("DEV", 0), ("NATURAL_LOCKED", 1)):
+        path = tmp_path / f"observed-{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+                    "packet_count": 1,
+                    "classification_count": 1,
+                    "input_blinded_packet_sha256": str(index) * 64,
+                    "parser_profile": "DEMAND_PRICE_MIX_V2",
+                    "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                    "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                    "requested_model": "gpt-5.6-luna",
+                    "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                    "full_historical_execution_authorized": False,
+                    "outcome_vault_opened": False,
+                    "return_data_opened": False,
+                    "value_data_opened": False,
+                    "credentials_persisted": False,
+                    "per_pbr_role": "NOT_USED",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 20,
+                        "cache_write_tokens": 10,
+                        "output_tokens": 30,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        observed[role] = path
+
+    result = prepare_prelock_cost_preflight(
+        semantic_packet_input=packet_input,
+        semantic_selection_manifest=selection,
+        observed_stage_manifests=observed,
+        output=tmp_path / "preflight.json",
+    )
+
+    assert result["status"] == (
+        "PRELOCK_COST_PREFLIGHT_ONLY_AWAITING_DUAL_LOCKED_USAGE"
+    )
+    assert result["full_historical_execution_authorized"] is False
+    assert result["api_calls_executed"] is False
+    assert result["token_estimation"]["observed_packet_count"] == 2
+    assert result["token_estimation"][
+        "balanced_locked_usage_required_for_final_manifest"
+    ] is True
+    assert "BALANCED_LOCKED_GATE_PASS" in result["missing_final_requirements"]
 
 
 def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> None:
@@ -887,6 +1013,7 @@ def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> N
                     "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
                     "packet_count": 1,
                     "classification_count": 1,
+                    "input_blinded_packet_sha256": str(index + 1) * 64,
                     "parser_profile": "LEGACY_V1",
                     "parser_version": "historical-evidence-parser-v1.2.0",
                     "prompt_sha256": "a" * 64,
@@ -909,11 +1036,33 @@ def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> N
             encoding="utf-8",
         )
         pilot_paths.append(path)
+    dual_locked = tmp_path / "dual-locked.json"
+    dual_locked.write_text(
+        json.dumps(
+            {
+                "status": "V2_LOCKED_TESTS_PASSED",
+                "natural_frequency_gate_passed": True,
+                "directional_strata_gate_passed": True,
+                "parser_profile": "DEMAND_PRICE_MIX_V2",
+                "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                "requested_model": "gpt-5.6-luna",
+                "natural_classification_stage_sha256": sha256_file(pilot_paths[0]),
+                "balanced_classification_stage_sha256": sha256_file(pilot_paths[1]),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "per_pbr_role": "NOT_USED",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     with pytest.raises(ValueError, match="frozen semantic V2 parser_profile"):
         prepare_cost_manifest(
             semantic_packet_input=packet_input,
             semantic_selection_manifest=selection,
+            dual_locked_manifest=dual_locked,
             pilot_stage_manifests=pilot_paths,
             output=tmp_path / "cost.json",
         )
@@ -939,6 +1088,7 @@ def test_semantic_cost_manifest_rejects_nonsemantic_axis(tmp_path: Path) -> None
         prepare_cost_manifest(
             semantic_packet_input=packet_input,
             semantic_selection_manifest=selection,
+            dual_locked_manifest=tmp_path / "missing-dual",
             pilot_stage_manifests=[tmp_path / "missing-a", tmp_path / "missing-b"],
             output=tmp_path / "cost.json",
         )

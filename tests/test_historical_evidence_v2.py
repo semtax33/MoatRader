@@ -669,6 +669,9 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
                 "pilot_prompt_differs_from_frozen_full_prompt": False,
                 "pilot_contract_matches_frozen_full_prompt": True,
             },
+            "inputs": {
+                "dual_locked_manifest_sha256": sha256_file(locked_manifest),
+            },
         },
     )
     classification_manifest = write_manifest(

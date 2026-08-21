@@ -513,8 +513,28 @@ def _validate_semantic_execution_gate(
             raise ValueError(f"semantic cost manifest does not match {key}")
     cost_inputs = cost.get("inputs", {})
     pilot_sources = cost_inputs.get("pilot_stage_manifests", [])
-    if not isinstance(pilot_sources, list) or len(pilot_sources) < 2:
-        raise ValueError("semantic cost manifest requires two exact V2 pilot sources")
+    if not isinstance(pilot_sources, list) or len(pilot_sources) != 2:
+        raise ValueError(
+            "semantic cost manifest requires exact Natural and Balanced V2 pilot sources"
+        )
+    if cost_inputs.get("dual_locked_manifest_sha256") != sha256_file(
+        dual_locked_manifest
+    ):
+        raise ValueError("semantic cost manifest dual LOCKED lineage mismatch")
+    supplied_pilot_roles = {
+        pilot.get("locked_role") for pilot in pilot_sources if isinstance(pilot, dict)
+    }
+    if supplied_pilot_roles != {"NATURAL", "BALANCED"}:
+        raise ValueError("semantic cost pilot sources lack Natural/Balanced roles")
+    expected_pilot_hashes = {
+        locked.get("natural_classification_stage_sha256"),
+        locked.get("balanced_classification_stage_sha256"),
+    }
+    supplied_pilot_hashes = {
+        pilot.get("sha256") for pilot in pilot_sources if isinstance(pilot, dict)
+    }
+    if supplied_pilot_hashes != expected_pilot_hashes:
+        raise ValueError("semantic cost pilot sources do not match dual LOCKED lineage")
     for pilot in pilot_sources:
         if not isinstance(pilot, dict):
             raise ValueError("semantic cost pilot source must be a JSON object")

@@ -474,6 +474,11 @@ V2 semantic `--execute`는 실행 범위를 반드시 명시한다. DEV·LOCKED 
 Cost manifest도 실제 frozen V2 prompt/model로 실행한 Natural·Balanced 두 stage의
 usage를 사용해야 한다. `pilot_prompt_differs_from_frozen_full_prompt=true`인 과거 V1
 사용량 기반 운영 추정치는 참고용일 뿐 full-run authorization으로 사용할 수 없다.
+최종 cost manifest는 passed dual LOCKED manifest가 봉인한 Natural·Balanced
+classification-stage SHA-256 두 개와 입력 stage가 정확히 같아야 한다. DEV나 실패한
+Natural stage를 두 번째 pilot으로 바꿔 끼울 수 없다. Dual gate 전에는 아래 prelock
+preflight만 만들 수 있으며, status와 `full_historical_execution_authorized=false` 때문에
+전체 실행 gate의 입력으로 사용할 수 없다.
 
 ```powershell
 python scripts\classify_historical_future_eri_evidence.py `
@@ -484,11 +489,21 @@ python scripts\classify_historical_future_eri_evidence.py `
   --semantic-execution-scope PILOT_OR_LOCKED_VALIDATION `
   --execute --prompt-api-key
 
-python scripts\prepare_historical_semantic_cost_manifest_v2.py `
+python -m scripts.prepare_historical_semantic_cost_preflight_v2 `
   --semantic-packet-input <semantic-packets.jsonl> `
   --semantic-selection-manifest <semantic-packets.jsonl.manifest.json> `
+  --observed-stage DEV=<completed-v2-dev-classification\stage-status.json> `
+  --observed-stage NATURAL_LOCKED=<completed-v2-natural-classification\stage-status.json> `
+  --pricing-checked-date <YYYY-MM-DD> `
+  --output <new-prelock-cost-preflight.json>
+
+python -m scripts.prepare_historical_semantic_cost_manifest_v2 `
+  --semantic-packet-input <semantic-packets.jsonl> `
+  --semantic-selection-manifest <semantic-packets.jsonl.manifest.json> `
+  --dual-locked-manifest <passed-dual-locked-stage.json> `
   --pilot-stage-manifest <completed-v2-natural-classification\stage-status.json> `
   --pilot-stage-manifest <completed-v2-balanced-classification\stage-status.json> `
+  --pricing-checked-date <YYYY-MM-DD> `
   --output <new-exact-v2-cost-manifest.json>
 
 python scripts\classify_historical_future_eri_evidence.py `
