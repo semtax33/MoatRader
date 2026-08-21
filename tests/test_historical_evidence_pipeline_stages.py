@@ -21,6 +21,7 @@ from scripts.classify_historical_future_eri_evidence import (
     ParserProfile,
     SEMANTIC_PARSER_VERSION_V2,
     SEMANTIC_PROMPT_SHA256_V2,
+    SemanticExecutionScope,
     build_request,
     run as run_classifier,
 )
@@ -140,6 +141,149 @@ def test_semantic_v2_profile_rejects_nonsemantic_packet_file(tmp_path: Path) -> 
             output=tmp_path / "semantic-prep",
             parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
         )
+
+
+def test_full_semantic_execution_requires_dual_locked_and_cost_authorization(
+    tmp_path: Path,
+) -> None:
+    packets = [
+        _packet(1, OperatingEvidenceAxis.DEMAND),
+        _packet(2, OperatingEvidenceAxis.PRICE_MIX),
+    ]
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(packet_input, packets)
+    calls = 0
+
+    def handler(request, _response_model):
+        nonlocal calls
+        calls += 1
+        packet = json.loads(request.user)
+        previous = packet["previous_excerpts"][0]
+        current = packet["current_excerpts"][0]
+        return AxisPairClassification(
+            packet_id=packet["packet_id"],
+            axis=packet["axis"],
+            previous_state=EvidenceState.STABLE,
+            current_state=EvidenceState.IMPROVING,
+            previous_source_id=previous["source_id"],
+            current_source_id=current["source_id"],
+            previous_source_span=previous["text"],
+            current_source_span=current["text"],
+            confidence=1,
+        ).model_dump(mode="python")
+
+    with pytest.raises(ValueError, match="explicit semantic execution scope"):
+        run_classifier(
+            input_build=tmp_path,
+            packet_input=packet_input,
+            output=tmp_path / "missing-scope",
+            execute=True,
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+            transport=FunctionTransport(handler),
+        )
+    assert calls == 0
+
+    pilot = run_classifier(
+        input_build=tmp_path,
+        packet_input=packet_input,
+        output=tmp_path / "pilot",
+        execute=True,
+        parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+        semantic_execution_scope=SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION,
+        transport=FunctionTransport(handler),
+    )
+    assert pilot["full_historical_execution_authorized"] is False
+    assert calls == 2
+
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "status": "SEMANTIC_REQUIRED_PACKETS_PREPARED_OUTCOME_BLIND",
+                "selected_packet_count": 2,
+                "semantic_primary_axes": ["DEMAND", "PRICE_MIX"],
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    locked = tmp_path / "dual-locked.json"
+    locked.write_text(
+        json.dumps(
+            {
+                "status": "V2_LOCKED_TESTS_PASSED",
+                "natural_frequency_gate_passed": True,
+                "directional_strata_gate_passed": True,
+                "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                "requested_model": "gpt-5.6-luna",
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cost = tmp_path / "cost.json"
+    cost.write_text(
+        json.dumps(
+            {
+                "status": "FULL_SEMANTIC_RUN_COST_PRESPECIFIED_NO_EXTERNAL_CALL",
+                "api_calls_executed": False,
+                "parser_profile": "DEMAND_PRICE_MIX_V2",
+                "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                "model": "gpt-5.6-luna",
+                "exact_packet_count": 2,
+                "inputs": {
+                    "semantic_packet_sha256": sha256_file(packet_input),
+                    "semantic_selection_manifest_sha256": sha256_file(selection),
+                },
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "per_pbr_role": "NOT_USED",
+            }
+        ),
+        encoding="utf-8",
+    )
+    failed_locked = tmp_path / "failed-dual-locked.json"
+    failed_payload = json.loads(locked.read_text(encoding="utf-8"))
+    failed_payload["status"] = "V2_LOCKED_TESTS_FAILED"
+    failed_locked.write_text(json.dumps(failed_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="dual LOCKED tests have not passed"):
+        run_classifier(
+            input_build=tmp_path,
+            packet_input=packet_input,
+            output=tmp_path / "failed-full",
+            execute=True,
+            parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+            semantic_execution_scope=SemanticExecutionScope.FULL_HISTORICAL,
+            dual_locked_manifest=failed_locked,
+            semantic_selection_manifest=selection,
+            semantic_cost_manifest=cost,
+            transport=FunctionTransport(handler),
+        )
+    assert calls == 2
+
+    full = run_classifier(
+        input_build=tmp_path,
+        packet_input=packet_input,
+        output=tmp_path / "full",
+        execute=True,
+        parser_profile=ParserProfile.DEMAND_PRICE_MIX_V2,
+        semantic_execution_scope=SemanticExecutionScope.FULL_HISTORICAL,
+        dual_locked_manifest=locked,
+        semantic_selection_manifest=selection,
+        semantic_cost_manifest=cost,
+        transport=FunctionTransport(handler),
+    )
+    assert full["full_historical_execution_authorized"] is True
+    assert full["semantic_execution_scope"] == "FULL_HISTORICAL"
+    assert full["status"] == "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED"
+    assert full["dual_locked_manifest_sha256"] == sha256_file(locked)
+    assert calls == 4
 
 
 def test_classifier_retries_non_verbatim_grounding_before_cache(tmp_path: Path) -> None:

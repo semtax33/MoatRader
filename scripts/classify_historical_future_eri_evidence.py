@@ -81,6 +81,11 @@ class ParserProfile(StrEnum):
     DEMAND_PRICE_MIX_V2 = "DEMAND_PRICE_MIX_V2"
 
 
+class SemanticExecutionScope(StrEnum):
+    PILOT_OR_LOCKED_VALIDATION = "PILOT_OR_LOCKED_VALIDATION"
+    FULL_HISTORICAL = "FULL_HISTORICAL"
+
+
 @dataclass(frozen=True)
 class ParserSpec:
     profile: ParserProfile
@@ -308,6 +313,125 @@ def _secure_transport(*, model: str, prompt_api_key: bool) -> OpenAIResponsesTra
     return transport
 
 
+def _read_gate_manifest(path: Path, description: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"{description} is missing: {path}")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{description} must contain a JSON object: {path}")
+    for key in (
+        "outcome_vault_opened",
+        "return_data_opened",
+        "value_data_opened",
+    ):
+        if value.get(key, False):
+            raise ValueError(f"{description} opened forbidden downstream data: {key}")
+    if value.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+        raise ValueError(f"{description} used PER/PBR before semantic classification")
+    return value
+
+
+def _validate_semantic_execution_gate(
+    *,
+    scope: SemanticExecutionScope | str | None,
+    packet_path: Path,
+    packet_count: int,
+    model: str,
+    spec: ParserSpec,
+    maximum_packets: int | None,
+    dual_locked_manifest: Path | None,
+    semantic_selection_manifest: Path | None,
+    semantic_cost_manifest: Path | None,
+) -> dict[str, Any]:
+    if scope is None:
+        raise ValueError(
+            "semantic V2 --execute requires an explicit semantic execution scope"
+        )
+    selected_scope = SemanticExecutionScope(scope)
+    if selected_scope == SemanticExecutionScope.PILOT_OR_LOCKED_VALIDATION:
+        if packet_count > 2_000:
+            raise ValueError(
+                "pilot/LOCKED semantic execution is capped at 2,000 packets; "
+                "use the gated FULL_HISTORICAL scope for a full run"
+            )
+        return {
+            "semantic_execution_scope": selected_scope.value,
+            "full_historical_execution_authorized": False,
+            "validation_packet_cap": 2_000,
+        }
+    if maximum_packets is not None:
+        raise ValueError("FULL_HISTORICAL semantic execution cannot use --maximum-packets")
+    required = {
+        "dual LOCKED manifest": dual_locked_manifest,
+        "semantic selection manifest": semantic_selection_manifest,
+        "semantic cost manifest": semantic_cost_manifest,
+    }
+    missing = [description for description, path in required.items() if path is None]
+    if missing:
+        raise ValueError(
+            "FULL_HISTORICAL semantic execution requires " + ", ".join(missing)
+        )
+    assert dual_locked_manifest is not None
+    assert semantic_selection_manifest is not None
+    assert semantic_cost_manifest is not None
+    locked = _read_gate_manifest(dual_locked_manifest, "dual LOCKED manifest")
+    selection = _read_gate_manifest(
+        semantic_selection_manifest, "semantic selection manifest"
+    )
+    cost = _read_gate_manifest(semantic_cost_manifest, "semantic cost manifest")
+    if locked.get("status") != "V2_LOCKED_TESTS_PASSED":
+        raise ValueError("Demand/PriceMix dual LOCKED tests have not passed")
+    if not all(
+        locked.get(key) is True
+        for key in ("natural_frequency_gate_passed", "directional_strata_gate_passed")
+    ):
+        raise ValueError("both Natural and Balanced LOCKED gate flags must be true")
+    for key, expected in (
+        ("parser_version", spec.parser_version),
+        ("prompt_sha256", spec.prompt_sha256),
+        ("requested_model", model),
+    ):
+        if locked.get(key) != expected:
+            raise ValueError(f"dual LOCKED manifest does not match frozen {key}")
+    if selection.get("status") != "SEMANTIC_REQUIRED_PACKETS_PREPARED_OUTCOME_BLIND":
+        raise ValueError("semantic packet selection is incomplete")
+    if selection.get("output_packet_sha256") != sha256_file(packet_path):
+        raise ValueError("semantic packet input differs from the selection manifest")
+    if selection.get("selected_packet_count") != packet_count:
+        raise ValueError("semantic packet count differs from the selection manifest")
+    if set(selection.get("semantic_primary_axes", [])) != {"DEMAND", "PRICE_MIX"}:
+        raise ValueError("semantic selection must contain only Demand and PriceMix")
+    if cost.get("status") != "FULL_SEMANTIC_RUN_COST_PRESPECIFIED_NO_EXTERNAL_CALL":
+        raise ValueError("full semantic cost was not prespecified")
+    if cost.get("api_calls_executed") is not False:
+        raise ValueError("semantic cost manifest was not frozen before API execution")
+    for key, expected in (
+        ("parser_profile", spec.profile.value),
+        ("parser_version", spec.parser_version),
+        ("prompt_sha256", spec.prompt_sha256),
+        ("model", model),
+        ("exact_packet_count", packet_count),
+    ):
+        if cost.get(key) != expected:
+            raise ValueError(f"semantic cost manifest does not match {key}")
+    cost_inputs = cost.get("inputs", {})
+    if cost_inputs.get("semantic_packet_sha256") != sha256_file(packet_path):
+        raise ValueError("semantic cost manifest packet hash mismatch")
+    if cost_inputs.get("semantic_selection_manifest_sha256") != sha256_file(
+        semantic_selection_manifest
+    ):
+        raise ValueError("semantic cost manifest selection hash mismatch")
+    return {
+        "semantic_execution_scope": selected_scope.value,
+        "full_historical_execution_authorized": True,
+        "dual_locked_manifest_sha256": sha256_file(dual_locked_manifest),
+        "semantic_selection_manifest_sha256": sha256_file(
+            semantic_selection_manifest
+        ),
+        "semantic_cost_manifest_sha256": sha256_file(semantic_cost_manifest),
+    }
+
+
 def run(
     *,
     input_build: Path,
@@ -320,6 +444,10 @@ def run(
     workers: int = 8,
     transport: OpenAIResponsesTransport | None = None,
     parser_profile: ParserProfile | str = ParserProfile.LEGACY_V1,
+    semantic_execution_scope: SemanticExecutionScope | str | None = None,
+    dual_locked_manifest: Path | None = None,
+    semantic_selection_manifest: Path | None = None,
+    semantic_cost_manifest: Path | None = None,
 ) -> dict[str, Any]:
     spec = parser_spec(parser_profile)
     packet_path = packet_input or input_build / "llm" / "blinded-packets.jsonl"
@@ -343,6 +471,11 @@ def run(
         "requested_model": model,
         "input_blinded_packet_sha256": input_packet_sha256,
         "maximum_packets": maximum_packets,
+        "semantic_execution_scope": (
+            SemanticExecutionScope(semantic_execution_scope).value
+            if semantic_execution_scope is not None
+            else None
+        ),
     }
     existing_request_manifest = (
         json.loads(request_manifest_path.read_text(encoding="utf-8"))
@@ -426,6 +559,20 @@ def run(
         }
         _write_json(output / "stage-status.json", status)
         return status
+
+    semantic_gate: dict[str, Any] = {}
+    if spec.profile == ParserProfile.DEMAND_PRICE_MIX_V2:
+        semantic_gate = _validate_semantic_execution_gate(
+            scope=semantic_execution_scope,
+            packet_path=packet_path,
+            packet_count=packet_count,
+            model=model,
+            spec=spec,
+            maximum_packets=maximum_packets,
+            dual_locked_manifest=dual_locked_manifest,
+            semantic_selection_manifest=semantic_selection_manifest,
+            semantic_cost_manifest=semantic_cost_manifest,
+        )
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     actual_transport = (
@@ -564,7 +711,11 @@ def run(
 
     status = {
         "schema_version": "moatrader-historical-axis-classification-stage-v1/1",
-        "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+        "status": (
+            "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED"
+            if semantic_gate.get("full_historical_execution_authorized") is True
+            else "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE"
+        ),
         "packet_count": packet_count,
         "classification_count": classification_count,
         "parser_profile": spec.profile.value,
@@ -582,6 +733,7 @@ def run(
         "outcome_vault_opened": False,
         "return_data_opened": False,
         "credentials_persisted": False,
+        **semantic_gate,
     }
     _write_json(output / "stage-status.json", status)
     return status
@@ -628,6 +780,13 @@ def main() -> int:
         choices=[item.value for item in ParserProfile],
         default=ParserProfile.LEGACY_V1.value,
     )
+    parser.add_argument(
+        "--semantic-execution-scope",
+        choices=[item.value for item in SemanticExecutionScope],
+    )
+    parser.add_argument("--dual-locked-manifest", type=Path)
+    parser.add_argument("--semantic-selection-manifest", type=Path)
+    parser.add_argument("--semantic-cost-manifest", type=Path)
     args = parser.parse_args()
     result = run(
         input_build=args.input_build,
@@ -639,6 +798,10 @@ def main() -> int:
         maximum_packets=args.maximum_packets,
         workers=args.workers,
         parser_profile=args.parser_profile,
+        semantic_execution_scope=args.semantic_execution_scope,
+        dual_locked_manifest=args.dual_locked_manifest,
+        semantic_selection_manifest=args.semantic_selection_manifest,
+        semantic_cost_manifest=args.semantic_cost_manifest,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

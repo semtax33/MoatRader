@@ -600,20 +600,6 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
             "requested_model": "gpt-5.6-luna",
         },
     )
-    classification_manifest = write_manifest(
-        "classification-stage",
-        {
-            "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
-            "parser_profile": spec.profile.value,
-            "parser_version": spec.parser_version,
-            "prompt_sha256": spec.prompt_sha256,
-            "requested_model": "gpt-5.6-luna",
-            "classification_count": 5,
-            "packet_count": 5,
-            "input_blinded_packet_sha256": packet_sha,
-            "classification_sha256": classification_sha,
-        },
-    )
     selection_manifest = write_manifest(
         "semantic-selection",
         {"output_packet_sha256": packet_sha, "selected_packet_count": 5},
@@ -628,6 +614,25 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
             "prompt_sha256": spec.prompt_sha256,
             "model": "gpt-5.6-luna",
             "exact_packet_count": 5,
+        },
+    )
+    classification_manifest = write_manifest(
+        "classification-stage",
+        {
+            "status": "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED",
+            "parser_profile": spec.profile.value,
+            "parser_version": spec.parser_version,
+            "prompt_sha256": spec.prompt_sha256,
+            "requested_model": "gpt-5.6-luna",
+            "classification_count": 5,
+            "packet_count": 5,
+            "input_blinded_packet_sha256": packet_sha,
+            "classification_sha256": classification_sha,
+            "semantic_execution_scope": "FULL_HISTORICAL",
+            "full_historical_execution_authorized": True,
+            "dual_locked_manifest_sha256": sha256_file(locked_manifest),
+            "semantic_selection_manifest_sha256": sha256_file(selection_manifest),
+            "semantic_cost_manifest_sha256": sha256_file(cost_manifest),
         },
     )
     core_manifest = write_manifest(

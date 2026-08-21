@@ -233,8 +233,21 @@ def _validate_gates(
                 raise ValueError(f"{description} does not match frozen {key}")
     if classification.get("parser_profile") != spec.profile.value:
         raise ValueError("full classification did not use the semantic V2 parser profile")
-    if classification.get("status") != "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE":
+    if classification.get("status") != (
+        "FULL_SEMANTIC_CLASSIFICATION_COMPLETE_OUTCOMES_CLOSED"
+    ):
         raise ValueError("full semantic classification is incomplete")
+    if classification.get("semantic_execution_scope") != "FULL_HISTORICAL" or (
+        classification.get("full_historical_execution_authorized") is not True
+    ):
+        raise ValueError("semantic classifications lack the full-run execution gate")
+    for key, path in (
+        ("dual_locked_manifest_sha256", dual_locked_manifest),
+        ("semantic_selection_manifest_sha256", semantic_selection_manifest),
+        ("semantic_cost_manifest_sha256", cost_manifest),
+    ):
+        if classification.get(key) != sha256_file(path):
+            raise ValueError(f"semantic classification authorization hash mismatch: {key}")
     if classification.get("classification_count") != classification.get("packet_count"):
         raise ValueError("semantic classification count is incomplete")
     if classification.get("input_blinded_packet_sha256") != selection.get(

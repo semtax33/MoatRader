@@ -441,6 +441,34 @@ python scripts\merge_historical_human_review_decisions_v2.py `
 세 명령은 입력 파일을 덮어쓰지 않고 새 output만 허용하며, packet 중복·해시 계보·
 `outcome_vault_opened=false`·`return_data_opened=false`를 검증한다.
 
+V2 semantic `--execute`는 실행 범위를 반드시 명시한다. DEV·LOCKED 검증은 최대
+2,000 packet으로 제한되며, 전체 historical 실행은 통과한 dual LOCKED manifest와
+사전 작성한 selection/cost manifest 없이는 transport를 열지 않는다.
+
+```powershell
+python scripts\classify_historical_future_eri_evidence.py `
+  --input-build <source-build> `
+  --packet-input <dev-or-locked-packets.jsonl> `
+  --output <new-validation-classification> `
+  --parser-profile DEMAND_PRICE_MIX_V2 `
+  --semantic-execution-scope PILOT_OR_LOCKED_VALIDATION `
+  --execute --prompt-api-key
+
+python scripts\classify_historical_future_eri_evidence.py `
+  --input-build <source-build> `
+  --packet-input <semantic-packets.jsonl> `
+  --output <new-full-semantic-classification> `
+  --parser-profile DEMAND_PRICE_MIX_V2 `
+  --semantic-execution-scope FULL_HISTORICAL `
+  --dual-locked-manifest <passed-dual-locked-stage.json> `
+  --semantic-selection-manifest <semantic-packets.jsonl.manifest.json> `
+  --semantic-cost-manifest <cost-manifest.json> `
+  --execute --prompt-api-key
+```
+
+Full Index seal은 전체 classification stage에 기록된 위 세 authorization SHA도 다시
+검증한다. 검증용 분류나 gate 이전 분류는 Full Index 입력으로 승격할 수 없다.
+
 Outcome-blind coverage 진단 예시:
 
 ```powershell
