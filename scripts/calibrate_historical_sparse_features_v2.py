@@ -109,7 +109,7 @@ def calibrate_sparse_features(
         "outcome_vault_opened": False,
         "return_data_opened": False,
         "minimum_observed_axes_auto_selected": False,
-        "band_boundaries_outcome_blind": True,
+        "band_rules_outcome_blind": True,
         "primary_ranking_policy": "NONE_MECHANISM_ONLY",
         "per_pbr_role": "NOT_USED",
         "input_hashes": {
@@ -213,7 +213,7 @@ def calibrate_sparse_features(
         return base_status
 
     eligible = sorted(
-        (row for row in rows if row.observed_axis_count >= minimum_observed_axes),
+        (row for row in rows if row.signed_score_axis_count >= minimum_observed_axes),
         key=lambda row: row.observation_id,
     )
     eligible_path = output / "features-pre-outcome.jsonl"
@@ -230,7 +230,7 @@ def calibrate_sparse_features(
     seal_path = output / "sparse-feature-seal.json"
     _write_json(seal_path, seal.model_dump(mode="json"))
     pre_outcome_manifest = {
-        "schema_version": "moatrader-v2-pre-outcome-manifest/1",
+        "schema_version": "moatrader-v2-pre-outcome-manifest/2",
         "status": "V2_PRE_OUTCOME_SEALED",
         "contract_tag": contract_freeze["contract_tag"],
         "git_commit": contract_freeze["git_commit"],
@@ -254,7 +254,10 @@ def calibrate_sparse_features(
         "abstention_audit_sha256": sha256_file(abstention_audit_manifest),
         "min_nobs": minimum_observed_axes,
         "minimum_observed_axes": minimum_observed_axes,
-        "band_boundaries": [str(value) for value in contract.cut_points],
+        "banding_method": contract.calibration_method,
+        "band_rules": {
+            key.value: value for key, value in contract.band_rules.items()
+        },
         "band_contract_sha256": sha256_file(contract_path),
         "coverage_gate_policy_sha256": sha256_file(coverage_gate_policy),
         "coverage_gate_report_sha256": sha256_file(coverage_gate_path),

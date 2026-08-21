@@ -319,8 +319,9 @@ LLM 분류 입력에 넣는다. 모든 feature row에는 여섯 축이 남지만
 - outcome-blind applicability rule상 비적용: `NOT_APPLICABLE`
 
 `NA`와 `NOT_APPLICABLE`은 neutral `0`이 아니다. primary sparse feature는
-`SignedBreadth = (N_positive - N_negative) / N_observed`이고 `N_observed`, applicable-axis
-count, coverage를 별도 필드로 보존한다. score와 coverage/confidence를 합성하지 않는다.
+`SignedBreadth = (N_positive - N_negative) / Nobs`이고 `Nobs`는 signed-score 대상 축의
+grounded `-1/0/+1`만 센다. CAPEX는 이 분자·분모에서 모두 제외한다. applicable-axis
+count와 coverage는 별도 필드로 보존하며 score에 coverage/confidence를 곱하지 않는다.
 
 `historical_evidence_v2.py`와 V2 stage scripts는 다음 순서와 게이트를 구현한다. 현재 허용
 범위는 feature-only calibration까지이며 ERI, Value, return은 닫혀 있다.
@@ -330,8 +331,8 @@ count, coverage를 별도 필드로 보존한다. score와 coverage/confidence�
      `NOT_APPLICABLE=경제적 비적용` 계약을 분리하며 자동 변환을 금지한다.
    - 먼저 git commit, feature/applicability/deterministic policy SHA, parser prompt,
      signal timestamp policy, `last_grounded_days=450`을 measurement contract에 고정한다.
-     feature-only calibration seal은 여기에 dual LOCKED SHA, explicit min Nobs, band
-     boundary와 coverage gate SHA를 더한 `pre-outcome-manifest.json`을 만든다.
+     feature-only calibration seal은 여기에 dual LOCKED SHA, 고정 `min Nobs=2`, 고정
+     경제 밴드 규칙과 coverage gate SHA를 더한 `pre-outcome-manifest.json`을 만든다.
    - last-grounded는 이전 비교 기준으로만 쓴다. 현재 공시에 grounded evidence가 없으면
      450일 이내 과거 상태가 있어도 현재 결과는 반드시 `NA`다.
 2. `build_historical_deterministic_pit_evidence_v2.py`
@@ -372,19 +373,35 @@ count, coverage를 별도 필드로 보존한다. score와 coverage/confidence�
    - deterministic grounded 또는 N/A 결과는 semantic parser가 덮어쓰지 않는다.
 6. `build_historical_sparse_features_v2.py`
    - 모든 filing pair를 보존하고 미분류/abstained 축은 `NA`로 둔다.
-   - `Nobs`는 grounded -1/0/+1만 세며 coverage=`Nobs/N_applicable`이다. `Ndir`은
-     `|s|=1` 축 수 진단이고 primary는 계속 SignedBreadth다.
+   - `Nobs`는 CAPEX를 제외한 primary signed axes의 grounded -1/0/+1만 센다. `Ndir`은
+     `|s|=1` primary 축 수 진단이고 primary는 계속 SignedBreadth다. coverage는 점수와
+     별도로 저장하며 `SignedBreadth × coverage`를 만들지 않는다.
    - Arcana 세 HTML 섹션과 MoatRader original regular disclosure를 모두 읽었다는
      source audit 및 before/after integrity 일치를 production gate로 요구한다.
 7. `calibrate_historical_sparse_features_v2.py`
-   - Nobs 0..6 exact report, Ndir, co-observation,
+   - primary Nobs 0..5 exact report, Ndir, co-observation,
      `corr(|SignedBreadth|, Coverage)`, `corr(|SignedBreadth|, Nobs)`, band별 Nobs 분포를
      outcome 없이 저장한다.
-   - min Nobs 2/3을 hard-code하지 않고 freeze 시 명시적으로 선택한다. [-1,+1] five-band
-     boundary도 feature-only threshold 또는 quantile로 정한다.
+   - V2 freeze는 `min Nobs=2`로 고정한다. 표본 quantile이나 outcome을 보지 않고
+     `Strong Bear=-1`, `Bear=(-1,0)`, `Neutral=0`, `Bull=(0,1)`,
+     `Strong Bull=+1`의 경제적 다섯 밴드를 그대로 사용한다.
    - band별 row뿐 아니라 unique issuer/month, 최대 issuer/year/evidence-source 집중도까지
      통과해야 pre-outcome seal이 가능하다. 이 seal도 outcome authorization을 열지 않으며,
      별도 V2 eligibility와 Reverse DCF 단계가 구현·통과된 뒤에만 t+63 ERI를 허용한다.
+8. `freeze_historical_evidence_index_v2.py`
+   - 미래 primary를 Demand + Price/Mix + Margin + Inventory + Backlog의
+     `FULL_EVIDENCE_SIGNED_BREADTH_V2`로 사전명세한다. Demand/Price-Mix semantic parser의
+     dual LOCKED gate 전에는 Full Index를 물질화하지 않는다.
+   - 현재 사용 가능한 secondary baseline은 Margin + Inventory + Backlog의
+     `DETERMINISTIC_CORE_SIGNED_BREADTH_V2`다. CAPEX는 raw 방향 진단으로만 남는다.
+   - 선택 2 deterministic evidence의 43,752개 pair를 모두 다시 검증한 결과, 고정
+     `Nobs>=2` eligible은 37,014개, 2,321개 issuer, 59개 signal month다. 고정 밴드별
+     row/issuer/month/year/Nobs/exact-score 분포와 집중도를 outcome 없이 저장한다.
+   - 입력 gate는 Arcana `business-info`·`finance-comment`·`finance-statement` 세 섹션과
+     MoatRader OpenDART 원천 정기공시를 모두 사용했는지, 예상 source path와 검증 path가
+     일치하는지, 원본 write/hash mismatch가 0인지 다시 확인한다.
+   - 이 동결 뒤에도 `outcome_stage_authorized=false`다. 다음 단계는 Demand/Price-Mix
+     semantic parser LOCK이며 ERI, return, Value는 계속 닫혀 있다.
 
 V2 selective semantic packet 준비 예시:
 
@@ -405,7 +422,7 @@ python scripts\calibrate_historical_sparse_features_v2.py `
   --output <new-v2-diagnostics>
 ```
 
-진단을 검토한 뒤에만 명시적인 Nobs threshold로 freeze한다. 이 시점까지 ERI, return,
+고정 `Nobs=2`와 경제적 다섯 밴드의 coverage gate를 통과한 뒤에도 ERI, return,
 Value 데이터를 열지 않는다. Value 비교 순서는 ERI mechanism gate 이후이며 PBR, PER,
 P/FCF, PSR, PCR, EV/EBITDA, RPR의 joint·individual neutralization을 보고한다.
 `PER+PBR`은 comparator일 뿐 우선 ranking이 아니다.

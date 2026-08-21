@@ -9,7 +9,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from moatrader.expectations.historical_evidence import canonical_payload_sha256, sha256_file
-from moatrader.expectations.historical_evidence_v2 import PITApplicabilityRulesV2
+from moatrader.expectations.historical_evidence_v2 import (
+    EvidenceIndexContractV2,
+    PITApplicabilityRulesV2,
+)
 
 
 SEOUL = ZoneInfo("Asia/Seoul")
@@ -22,18 +25,23 @@ DETERMINISTIC_AXIS_POLICY = {
     "MARGIN": "OPERATING_MARGIN_DELTA_NUMERIC",
     "INVENTORY_MISMATCH": "INVENTORY_GROWTH_MINUS_REVENUE_GROWTH_NUMERIC",
     "BACKLOG": "BACKLOG_GROWTH_STRUCTURED_TABLE",
-    "CAPACITY_CAPEX": "CAPEX_INTENSITY_DELTA_NUMERIC_WITH_NARRATIVE_FALLBACK",
+    "CAPACITY_CAPEX": "RAW_INVESTMENT_DIRECTION_DIAGNOSTIC_ONLY",
 }
 FEATURE_POLICY = {
     "states": ["-1", "0", "+1", "NA", "NOT_APPLICABLE"],
     "zero_definition": "GROUNDED_CURRENT_AND_PREVIOUS_WITH_NO_DIRECTIONAL_CHANGE",
     "na_definition": "NO_CURRENTLY_GROUNDED_COMPARABLE_EVIDENCE",
     "not_applicable_definition": "AXIS_HAS_NO_ECONOMIC_MEANING_UNDER_PIT_RULE",
-    "nobs": "COUNT_OF_GROUNDED_-1_0_+1",
+    "nobs": "COUNT_OF_GROUNDED_PRIMARY_-1_0_+1_EXCLUDING_CAPEX",
+    "minimum_nobs": 2,
     "n_directional": "COUNT_OF_GROUNDED_ABSOLUTE_DIRECTION_1_DIAGNOSTIC_ONLY",
     "signed_breadth": "(N_POSITIVE-N_NEGATIVE)/NOBS",
-    "coverage": "NOBS/N_APPLICABLE",
+    "coverage": "NOBS/N_APPLICABLE_PRIMARY_AXES_EXCLUDING_CAPEX",
     "score_and_coverage_separate": True,
+    "index_multiplied_by_coverage": False,
+    "banding_method": "FIXED_ECONOMIC_SIGN_BANDS_V2",
+    "primary_index": "FULL_EVIDENCE_SIGNED_BREADTH_V2",
+    "secondary_index": "DETERMINISTIC_CORE_SIGNED_BREADTH_V2",
     "last_grounded_role": "PREVIOUS_COMPARISON_BASIS_ONLY",
     "current_evidence_carry_forward": False,
     "primary_ranking_policy": "NONE_MECHANISM_ONLY",
@@ -86,6 +94,7 @@ def freeze_contract(
         "locked_evaluator": workspace / "scripts" / "evaluate_historical_evidence_parser_v2.py",
         "locked_set_preparer": workspace / "scripts" / "prepare_historical_locked_sets_v2.py",
         "abstention_audit": workspace / "scripts" / "audit_historical_evidence_abstentions_v2.py",
+        "evidence_index_freezer": workspace / "scripts" / "freeze_historical_evidence_index_v2.py",
     }
     for path in (
         rules_input,
@@ -129,8 +138,9 @@ def freeze_contract(
     if dirty and not allow_dirty_for_dry_run:
         raise ValueError("production V2 contract freeze requires a clean committed worktree")
     code_hashes = {name: sha256_file(path) for name, path in code_paths.items()}
+    evidence_index_contract = EvidenceIndexContractV2()
     payload = {
-        "schema_version": "moatrader-historical-sparse-contract-freeze-v2/1",
+        "schema_version": "moatrader-historical-sparse-contract-freeze-v2/2",
         "status": "V2_PRE_OUTCOME_CONTRACT_FROZEN",
         "contract_tag": contract_tag.strip(),
         "frozen_at": datetime.now(SEOUL).isoformat(),
@@ -139,6 +149,10 @@ def freeze_contract(
         "dry_run_only": dirty,
         "feature_policy": FEATURE_POLICY,
         "feature_policy_sha256": canonical_payload_sha256(FEATURE_POLICY),
+        "evidence_index_contract": evidence_index_contract.model_dump(mode="json"),
+        "evidence_index_contract_sha256": canonical_payload_sha256(
+            evidence_index_contract.model_dump(mode="json")
+        ),
         "applicability_policy_sha256": canonical_payload_sha256(
             rules.model_dump(mode="json")
         ),
@@ -166,6 +180,7 @@ def freeze_contract(
         "outcome_stage_authorized": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
         "primary_ranking_policy": "NONE_MECHANISM_ONLY",
         "per_pbr_role": "NOT_USED",
     }

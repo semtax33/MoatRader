@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
+from fractions import Fraction
 from math import sqrt
 from typing import Literal, Sequence
 
@@ -70,6 +71,246 @@ class SparseBreadthBandV2(StrEnum):
     NEUTRAL = "NEUTRAL"
     BULL = "BULL"
     STRONG_BULL = "STRONG_BULL"
+
+
+class EvidenceIndexAxisStateV2(StrEnum):
+    NEGATIVE = "-1"
+    NEUTRAL = "0"
+    POSITIVE = "+1"
+    NA = "NA"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
+DETERMINISTIC_CORE_AXES_V2 = (
+    OperatingEvidenceAxis.MARGIN,
+    OperatingEvidenceAxis.INVENTORY_MISMATCH,
+    OperatingEvidenceAxis.BACKLOG,
+)
+SEMANTIC_EVIDENCE_AXES_V2 = (
+    OperatingEvidenceAxis.DEMAND,
+    OperatingEvidenceAxis.PRICE_MIX,
+)
+FULL_EVIDENCE_INDEX_AXES_V2 = (
+    *SEMANTIC_EVIDENCE_AXES_V2,
+    *DETERMINISTIC_CORE_AXES_V2,
+)
+FIXED_ECONOMIC_BAND_RULES_V2 = {
+    SparseBreadthBandV2.STRONG_BEAR: "SIGNED_BREADTH == -1",
+    SparseBreadthBandV2.BEAR: "-1 < SIGNED_BREADTH < 0",
+    SparseBreadthBandV2.NEUTRAL: "SIGNED_BREADTH == 0",
+    SparseBreadthBandV2.BULL: "0 < SIGNED_BREADTH < 1",
+    SparseBreadthBandV2.STRONG_BULL: "SIGNED_BREADTH == 1",
+}
+
+
+def fixed_economic_breadth_band_v2(value: Decimal) -> SparseBreadthBandV2:
+    if value < D(-1) or value > D(1):
+        raise ValueError("signed breadth must lie inside [-1, 1]")
+    if value == D(-1):
+        return SparseBreadthBandV2.STRONG_BEAR
+    if value < D(0):
+        return SparseBreadthBandV2.BEAR
+    if value == D(0):
+        return SparseBreadthBandV2.NEUTRAL
+    if value < D(1):
+        return SparseBreadthBandV2.BULL
+    return SparseBreadthBandV2.STRONG_BULL
+
+
+class EvidenceIndexContractV2(ContractModel):
+    schema_version: str = "moatrader-evidence-index-contract-v2/1"
+    primary_index: Literal["FULL_EVIDENCE_SIGNED_BREADTH_V2"] = (
+        "FULL_EVIDENCE_SIGNED_BREADTH_V2"
+    )
+    primary_axes: tuple[OperatingEvidenceAxis, ...] = FULL_EVIDENCE_INDEX_AXES_V2
+    primary_measurement_status: Literal[
+        "PRESPECIFIED_PENDING_DEMAND_PRICE_MIX_GATE"
+    ] = "PRESPECIFIED_PENDING_DEMAND_PRICE_MIX_GATE"
+    secondary_index: Literal["DETERMINISTIC_CORE_SIGNED_BREADTH_V2"] = (
+        "DETERMINISTIC_CORE_SIGNED_BREADTH_V2"
+    )
+    core_axes: tuple[OperatingEvidenceAxis, ...] = DETERMINISTIC_CORE_AXES_V2
+    semantic_axes: tuple[OperatingEvidenceAxis, ...] = SEMANTIC_EVIDENCE_AXES_V2
+    capex_role: Literal["DIAGNOSTIC_ONLY"] = "DIAGNOSTIC_ONLY"
+    minimum_observed_axes: Literal[2] = 2
+    score_range: tuple[Decimal, Decimal] = (D(-1), D(1))
+    banding_method: Literal["FIXED_ECONOMIC_SIGN_BANDS_V2"] = (
+        "FIXED_ECONOMIC_SIGN_BANDS_V2"
+    )
+    band_rules: dict[SparseBreadthBandV2, str] = FIXED_ECONOMIC_BAND_RULES_V2
+    band_scope: Literal["MIN_NOBS_2_ELIGIBLE_SUBSET_ONLY"] = (
+        "MIN_NOBS_2_ELIGIBLE_SUBSET_ONLY"
+    )
+    coverage_kept_separate: Literal[True] = True
+    index_multiplied_by_coverage: Literal[False] = False
+    last_grounded_days: Literal[450] = 450
+    current_evidence_carry_forward: Literal[False] = False
+    semantic_parser_gate_required: Literal[True] = True
+    semantic_parser_gate_passed: Literal[False] = False
+    full_index_materialized: Literal[False] = False
+    deterministic_core_materialized: Literal[True] = True
+    outcome_stage_authorized: Literal[False] = False
+    outcome_vault_opened: Literal[False] = False
+    return_data_opened: Literal[False] = False
+    value_data_opened: Literal[False] = False
+    per_pbr_role: Literal["NOT_USED"] = "NOT_USED"
+
+    @model_validator(mode="after")
+    def fixed_pre_outcome_index_contract(self) -> "EvidenceIndexContractV2":
+        if self.primary_axes != FULL_EVIDENCE_INDEX_AXES_V2:
+            raise ValueError("Full Evidence Index axes changed from the V2 prespecification")
+        if self.core_axes != DETERMINISTIC_CORE_AXES_V2:
+            raise ValueError("Deterministic Core axes changed from the V2 prespecification")
+        if self.semantic_axes != SEMANTIC_EVIDENCE_AXES_V2:
+            raise ValueError("semantic axes changed from Demand and Price/Mix")
+        if self.score_range != (D(-1), D(1)):
+            raise ValueError("Evidence Index score range must remain [-1, 1]")
+        if self.band_rules != FIXED_ECONOMIC_BAND_RULES_V2:
+            raise ValueError("Evidence Index must use the fixed economic five-band rules")
+        return self
+
+
+class DeterministicCoreIndexCoveragePolicyV2(ContractModel):
+    schema_version: str = "moatrader-deterministic-core-index-coverage-policy-v2/1"
+    minimum_rows_per_band: int = Field(ge=1)
+    minimum_unique_issuers_per_band: int = Field(ge=1)
+    minimum_unique_signal_months_per_band: int = Field(ge=1)
+    minimum_total_unique_issuers: int = Field(ge=1)
+    minimum_total_unique_signal_months: int = Field(ge=1)
+    maximum_top_issuer_share_per_band: Decimal = Field(gt=0, le=1)
+    maximum_top_month_share_per_band: Decimal = Field(gt=0, le=1)
+    maximum_top_year_share_per_band: Decimal = Field(gt=0, le=1)
+    selected_outcome_blind: Literal[True] = True
+    outcome_data_accessed: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    value_data_accessed: Literal[False] = False
+
+
+class DeterministicCoreIndexRowV2(ContractModel):
+    schema_version: str = "moatrader-deterministic-core-index-row-v2/1"
+    observation_id: str = Field(pattern=r"^OBS_[0-9a-f]{24}$")
+    pair_id: str = Field(pattern=r"^PAIR_[0-9a-f]{24}$")
+    issuer_id: str = Field(pattern=r"^[0-9]{6}$")
+    signal_timestamp: datetime
+    core_axis_states: dict[OperatingEvidenceAxis, EvidenceIndexAxisStateV2]
+    applicable_axis_count: int = Field(ge=0, le=3)
+    nobs: int = Field(ge=0, le=3)
+    unavailable_axis_count: int = Field(ge=0, le=3)
+    not_applicable_axis_count: int = Field(ge=0, le=3)
+    positive_axis_count: int = Field(ge=0, le=3)
+    neutral_axis_count: int = Field(ge=0, le=3)
+    negative_axis_count: int = Field(ge=0, le=3)
+    net_evidence: int = Field(ge=-3, le=3)
+    core_evidence_index: Decimal | None = Field(default=None, ge=-1, le=1)
+    core_evidence_index_fraction: str | None = None
+    coverage: Decimal | None = Field(default=None, ge=0, le=1)
+    minimum_observed_axes: Literal[2] = 2
+    eligible: bool
+    band: SparseBreadthBandV2 | None = None
+    last_grounded_core_axis_count: int = Field(ge=0, le=3)
+    capex_availability: SparseAxisAvailabilityV2
+    capex_raw_direction: EvidenceState | None = None
+    capex_raw_metric_name: str | None = None
+    capex_raw_delta: Decimal | None = None
+    capex_in_index: Literal[False] = False
+    score_and_coverage_separate: Literal[True] = True
+    index_multiplied_by_coverage: Literal[False] = False
+    last_grounded_days: Literal[450] = 450
+    current_evidence_carry_forward: Literal[False] = False
+    row_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    outcome_data_accessed: Literal[False] = False
+    return_data_accessed: Literal[False] = False
+    value_data_accessed: Literal[False] = False
+    per_pbr_role: Literal["NOT_USED"] = "NOT_USED"
+
+    @model_validator(mode="after")
+    def deterministic_core_arithmetic(self) -> "DeterministicCoreIndexRowV2":
+        if self.signal_timestamp.tzinfo is None or self.signal_timestamp.utcoffset() is None:
+            raise ValueError("signal_timestamp must be timezone-aware")
+        if set(self.core_axis_states) != set(DETERMINISTIC_CORE_AXES_V2):
+            raise ValueError("Core Index row must contain exactly Margin, Inventory, and Backlog")
+        states = list(self.core_axis_states.values())
+        scored = [
+            int(state.value)
+            for state in states
+            if state
+            in {
+                EvidenceIndexAxisStateV2.NEGATIVE,
+                EvidenceIndexAxisStateV2.NEUTRAL,
+                EvidenceIndexAxisStateV2.POSITIVE,
+            }
+        ]
+        not_applicable = states.count(EvidenceIndexAxisStateV2.NOT_APPLICABLE)
+        expected_nobs = len(scored)
+        expected_net = sum(scored)
+        expected_index = D(expected_net) / D(expected_nobs) if expected_nobs else None
+        expected_fraction = (
+            str(Fraction(expected_net, expected_nobs)) if expected_nobs else None
+        )
+        expected_coverage = (
+            D(expected_nobs) / D(3 - not_applicable)
+            if 3 - not_applicable
+            else None
+        )
+        expected_eligible = expected_nobs >= self.minimum_observed_axes
+        expected_band = (
+            fixed_economic_breadth_band_v2(expected_index)
+            if expected_eligible and expected_index is not None
+            else None
+        )
+        expected = (
+            3 - not_applicable,
+            expected_nobs,
+            states.count(EvidenceIndexAxisStateV2.NA),
+            not_applicable,
+            sum(value > 0 for value in scored),
+            sum(value == 0 for value in scored),
+            sum(value < 0 for value in scored),
+            expected_net,
+            expected_index,
+            expected_fraction,
+            expected_coverage,
+            expected_eligible,
+            expected_band,
+        )
+        actual = (
+            self.applicable_axis_count,
+            self.nobs,
+            self.unavailable_axis_count,
+            self.not_applicable_axis_count,
+            self.positive_axis_count,
+            self.neutral_axis_count,
+            self.negative_axis_count,
+            self.net_evidence,
+            self.core_evidence_index,
+            self.core_evidence_index_fraction,
+            self.coverage,
+            self.eligible,
+            self.band,
+        )
+        if actual != expected:
+            raise ValueError("Deterministic Core Index arithmetic does not match axis states")
+        if self.capex_availability == SparseAxisAvailabilityV2.GROUNDED:
+            if (
+                self.capex_raw_direction is None
+                or self.capex_raw_metric_name is None
+                or self.capex_raw_delta is None
+            ):
+                raise ValueError("grounded CAPEX diagnostic requires direction, metric, and delta")
+        elif any(
+            value is not None
+            for value in (
+                self.capex_raw_direction,
+                self.capex_raw_metric_name,
+                self.capex_raw_delta,
+            )
+        ):
+            raise ValueError("unavailable CAPEX diagnostic cannot contain raw values")
+        payload = self.model_dump(mode="json")
+        actual_hash = str(payload.pop("row_sha256"))
+        if actual_hash != canonical_payload_sha256(payload):
+            raise ValueError("Deterministic Core Index row hash mismatch")
+        return self
 
 
 class SparseAxisEvidenceV2(ContractModel):
@@ -294,12 +535,12 @@ class HistoricalSparseEvidenceFeatureRowV2(ContractModel):
 
 
 class SparseBreadthBandContractV2(ContractModel):
-    schema_version: str = "moatrader-sparse-breadth-band-contract-v2/1"
-    minimum_observed_axes: int = Field(ge=1, le=6)
-    cut_points: tuple[Decimal, Decimal, Decimal, Decimal]
-    calibration_method: Literal["FEATURE_ONLY_UNIQUE_VALUE_QUINTILES_V2"] = (
-        "FEATURE_ONLY_UNIQUE_VALUE_QUINTILES_V2"
+    schema_version: str = "moatrader-sparse-breadth-band-contract-v2/2"
+    minimum_observed_axes: int = Field(ge=1, le=5)
+    calibration_method: Literal["FIXED_ECONOMIC_SIGN_BANDS_V2"] = (
+        "FIXED_ECONOMIC_SIGN_BANDS_V2"
     )
+    band_rules: dict[SparseBreadthBandV2, str] = FIXED_ECONOMIC_BAND_RULES_V2
     calibration_feature_count: int = Field(gt=0)
     calibration_feature_dataset_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     band_counts: dict[SparseBreadthBandV2, int]
@@ -310,10 +551,8 @@ class SparseBreadthBandContractV2(ContractModel):
 
     @model_validator(mode="after")
     def feature_only_band_contract(self) -> "SparseBreadthBandContractV2":
-        if not all(D(-1) < value < D(1) for value in self.cut_points):
-            raise ValueError("V2 breadth cut points must lie strictly inside [-1, 1]")
-        if tuple(sorted(self.cut_points)) != self.cut_points or len(set(self.cut_points)) != 4:
-            raise ValueError("V2 breadth cut points must be strictly increasing")
+        if self.band_rules != FIXED_ECONOMIC_BAND_RULES_V2:
+            raise ValueError("V2 must use the fixed economic five-band rules")
         if set(self.band_counts) != set(SparseBreadthBandV2):
             raise ValueError("V2 band counts must cover exactly five bands")
         sufficient = all(value >= self.minimum_rows_per_band for value in self.band_counts.values())
@@ -322,16 +561,7 @@ class SparseBreadthBandContractV2(ContractModel):
         return self
 
     def band_for(self, value: Decimal) -> SparseBreadthBandV2:
-        first, second, third, fourth = self.cut_points
-        if value <= first:
-            return SparseBreadthBandV2.STRONG_BEAR
-        if value <= second:
-            return SparseBreadthBandV2.BEAR
-        if value <= third:
-            return SparseBreadthBandV2.NEUTRAL
-        if value <= fourth:
-            return SparseBreadthBandV2.BULL
-        return SparseBreadthBandV2.STRONG_BULL
+        return fixed_economic_breadth_band_v2(value)
 
 
 class SparseCoverageGatePolicyV2(ContractModel):
@@ -360,7 +590,7 @@ class HistoricalSparseEvidenceDatasetSealV2(ContractModel):
     contract_freeze_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     abstention_audit_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     coverage_gate_report_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    minimum_observed_axes: int = Field(ge=1, le=6)
+    minimum_observed_axes: int = Field(ge=1, le=5)
     natural_frequency_locked_gate_passed: Literal[True] = True
     balanced_directional_locked_gate_passed: Literal[True] = True
     measurement_coverage_gate_passed: Literal[True] = True
@@ -942,10 +1172,106 @@ def build_sparse_feature_row_v2(
     )
 
 
+def build_deterministic_core_index_row_v2(
+    *,
+    pair: HistoricalFilingPair,
+    axis_evidence: Sequence[SparseAxisEvidenceV2],
+) -> DeterministicCoreIndexRowV2:
+    by_axis = {item.axis: item for item in axis_evidence}
+    required = {*DETERMINISTIC_CORE_AXES_V2, OperatingEvidenceAxis.CAPACITY_CAPEX}
+    if len(by_axis) != len(axis_evidence):
+        raise ValueError("Deterministic Core Index axis evidence must be unique")
+    if set(by_axis) != required:
+        raise ValueError(
+            "Deterministic Core Index requires exactly Margin, Inventory, Backlog, and CAPEX"
+        )
+
+    core_states: dict[OperatingEvidenceAxis, EvidenceIndexAxisStateV2] = {}
+    last_grounded_core_axis_count = 0
+    for axis in DETERMINISTIC_CORE_AXES_V2:
+        evidence = by_axis[axis]
+        if evidence.signed_score_role != AxisSignedScoreRoleV2.PRIMARY_SIGNED_SCORE:
+            raise ValueError(f"{axis.value} must be a primary signed-score axis")
+        if evidence.availability == SparseAxisAvailabilityV2.GROUNDED:
+            assert evidence.direction is not None
+            core_states[axis] = EvidenceIndexAxisStateV2(
+                "+1" if evidence.direction.value > 0 else str(evidence.direction.value)
+            )
+            last_grounded_core_axis_count += (
+                evidence.previous_evidence_basis
+                == PreviousEvidenceBasisV2.LAST_GROUNDED_WITHIN_STALENESS
+            )
+        elif evidence.availability == SparseAxisAvailabilityV2.NOT_APPLICABLE:
+            core_states[axis] = EvidenceIndexAxisStateV2.NOT_APPLICABLE
+        else:
+            core_states[axis] = EvidenceIndexAxisStateV2.NA
+
+    scored = [
+        int(state.value)
+        for state in core_states.values()
+        if state
+        in {
+            EvidenceIndexAxisStateV2.NEGATIVE,
+            EvidenceIndexAxisStateV2.NEUTRAL,
+            EvidenceIndexAxisStateV2.POSITIVE,
+        }
+    ]
+    nobs = len(scored)
+    not_applicable = sum(
+        state == EvidenceIndexAxisStateV2.NOT_APPLICABLE
+        for state in core_states.values()
+    )
+    net = sum(scored)
+    index = D(net) / D(nobs) if nobs else None
+    eligible = nobs >= 2
+
+    capex = by_axis[OperatingEvidenceAxis.CAPACITY_CAPEX]
+    if capex.signed_score_role != AxisSignedScoreRoleV2.RAW_DIRECTION_ONLY:
+        raise ValueError("CAPEX must remain raw-direction diagnostic only")
+    capex_grounded = capex.availability == SparseAxisAvailabilityV2.GROUNDED
+    draft = DeterministicCoreIndexRowV2.model_construct(
+        observation_id=historical_observation_id(pair.pair_id),
+        pair_id=pair.pair_id,
+        issuer_id=pair.ticker,
+        signal_timestamp=pair.current.signal_timestamp,
+        core_axis_states=core_states,
+        applicable_axis_count=3 - not_applicable,
+        nobs=nobs,
+        unavailable_axis_count=sum(
+            state == EvidenceIndexAxisStateV2.NA for state in core_states.values()
+        ),
+        not_applicable_axis_count=not_applicable,
+        positive_axis_count=sum(value > 0 for value in scored),
+        neutral_axis_count=sum(value == 0 for value in scored),
+        negative_axis_count=sum(value < 0 for value in scored),
+        net_evidence=net,
+        core_evidence_index=index,
+        core_evidence_index_fraction=str(Fraction(net, nobs)) if nobs else None,
+        coverage=(
+            D(nobs) / D(3 - not_applicable) if 3 - not_applicable else None
+        ),
+        eligible=eligible,
+        band=fixed_economic_breadth_band_v2(index) if eligible and index is not None else None,
+        last_grounded_core_axis_count=last_grounded_core_axis_count,
+        capex_availability=capex.availability,
+        capex_raw_direction=capex.direction if capex_grounded else None,
+        capex_raw_metric_name=(
+            capex.deterministic_metric_name if capex_grounded else None
+        ),
+        capex_raw_delta=capex.deterministic_delta if capex_grounded else None,
+        row_sha256="0" * 64,
+    )
+    payload = draft.model_dump(mode="json", exclude={"row_sha256"})
+    return DeterministicCoreIndexRowV2.model_validate(
+        {**payload, "row_sha256": canonical_payload_sha256(payload)}
+    )
+
+
 def sparse_feature_coverage_report(
     rows: Sequence[HistoricalSparseEvidenceFeatureRowV2],
 ) -> dict[str, object]:
-    nobs = Counter(item.observed_axis_count for item in rows)
+    nobs = Counter(item.signed_score_axis_count for item in rows)
+    grounded_all_axes = Counter(item.observed_axis_count for item in rows)
     napplicable = Counter(item.applicable_axis_count for item in rows)
     axes = list(OperatingEvidenceAxis)
     co_observation = {
@@ -960,8 +1286,8 @@ def sparse_feature_coverage_report(
         for left in axes
     }
     thresholds: dict[str, object] = {}
-    for minimum in range(1, 7):
-        selected = [item for item in rows if item.observed_axis_count >= minimum]
+    for minimum in range(1, 6):
+        selected = [item for item in rows if item.signed_score_axis_count >= minimum]
         issuers = Counter(item.issuer_id for item in selected)
         months = Counter(item.signal_timestamp.strftime("%Y-%m") for item in selected)
         thresholds[str(minimum)] = {
@@ -977,8 +1303,8 @@ def sparse_feature_coverage_report(
             ),
         }
     exact_nobs: dict[str, object] = {}
-    for value in range(7):
-        selected = [item for item in rows if item.observed_axis_count == value]
+    for value in range(6):
+        selected = [item for item in rows if item.signed_score_axis_count == value]
         breadth = Counter(
             item.signed_breadth for item in selected if item.signed_breadth is not None
         )
@@ -997,10 +1323,10 @@ def sparse_feature_coverage_report(
                 if selected
                 else 0.0
             ),
-            "directional_axis_share_of_observed": (
+            "directional_axis_share_of_primary_signed_nobs": (
                 sum(item.n_directional for item in selected)
-                / sum(item.observed_axis_count for item in selected)
-                if sum(item.observed_axis_count for item in selected)
+                / sum(item.signed_score_axis_count for item in selected)
+                if sum(item.signed_score_axis_count for item in selected)
                 else 0.0
             ),
             "observations": [
@@ -1011,8 +1337,8 @@ def sparse_feature_coverage_report(
                     "signed_breadth": item.signed_breadth,
                     "n_directional": item.n_directional,
                     "directional_ratio": (
-                        D(item.n_directional) / D(item.observed_axis_count)
-                        if item.observed_axis_count
+                        D(item.n_directional) / D(item.signed_score_axis_count)
+                        if item.signed_score_axis_count
                         else None
                     ),
                 }
@@ -1051,9 +1377,12 @@ def sparse_feature_coverage_report(
     years = Counter(item.signal_timestamp.strftime("%Y") for item in rows)
     ndir = Counter(item.n_directional for item in rows)
     return {
-        "schema_version": "moatrader-sparse-feature-coverage-report-v2/1",
+        "schema_version": "moatrader-sparse-feature-coverage-report-v2/2",
         "pair_count": len(rows),
-        "grounded_axis_count_histogram": {str(key): nobs[key] for key in range(7)},
+        "primary_signed_nobs_histogram": {str(key): nobs[key] for key in range(6)},
+        "grounded_axis_count_histogram": {
+            str(key): grounded_all_axes[key] for key in range(7)
+        },
         "applicable_axis_count_histogram": {
             str(key): napplicable[key] for key in range(7)
         },
@@ -1105,7 +1434,7 @@ def sparse_band_diagnostics_v2(
     selected = [
         row
         for row in rows
-        if row.observed_axis_count >= band_contract.minimum_observed_axes
+        if row.signed_score_axis_count >= band_contract.minimum_observed_axes
         and row.signed_breadth is not None
     ]
     by_band: dict[str, object] = {}
@@ -1116,7 +1445,7 @@ def sparse_band_diagnostics_v2(
         issuers = Counter(row.issuer_id for row in band_rows)
         months = Counter(row.signal_timestamp.strftime("%Y-%m") for row in band_rows)
         years = Counter(row.signal_timestamp.strftime("%Y") for row in band_rows)
-        nobs = Counter(row.observed_axis_count for row in band_rows)
+        nobs = Counter(row.signed_score_axis_count for row in band_rows)
         ndir = Counter(row.n_directional for row in band_rows)
         provenance = Counter(
             item.provenance.value
@@ -1164,7 +1493,7 @@ def sparse_band_diagnostics_v2(
         ),
         "corr_abs_signed_breadth_nobs": _pearson(
             abs_breadth,
-            [D(row.observed_axis_count) for row in selected],
+            [D(row.signed_score_axis_count) for row in selected],
         ),
         "by_band": by_band,
         "outcomes_opened": False,
@@ -1234,28 +1563,18 @@ def calibrate_sparse_band_contract_v2(
     minimum_observed_axes: int,
     minimum_rows_per_band: int,
 ) -> SparseBreadthBandContractV2:
-    if not 1 <= minimum_observed_axes <= 6:
-        raise ValueError("minimum_observed_axes must be in [1, 6]")
+    if not 1 <= minimum_observed_axes <= 5:
+        raise ValueError("minimum_observed_axes must be in [1, 5]")
     selected = [
         item
         for item in rows
-        if item.observed_axis_count >= minimum_observed_axes
+        if item.signed_score_axis_count >= minimum_observed_axes
         and item.signed_breadth is not None
     ]
-    unique = sorted({item.signed_breadth for item in selected if item.signed_breadth is not None})
-    if len(unique) < 5:
-        raise ValueError("at least five unique breadth values are required to freeze five bands")
-    boundaries: list[Decimal] = []
-    for quantile in range(1, 5):
-        upper_index = max(1, min(len(unique) - 1, (len(unique) * quantile) // 5))
-        lower = unique[upper_index - 1]
-        upper = unique[upper_index]
-        boundaries.append((lower + upper) / D(2))
-    if len(set(boundaries)) != 4:
-        raise ValueError("feature-only unique-value quantiles did not produce five bands")
+    if not selected:
+        raise ValueError("no signed-score rows satisfy the minimum observed-axis contract")
     provisional = SparseBreadthBandContractV2(
         minimum_observed_axes=minimum_observed_axes,
-        cut_points=tuple(boundaries),  # type: ignore[arg-type]
         calibration_feature_count=len(selected),
         calibration_feature_dataset_sha256=canonical_payload_sha256(
             [item.model_dump(mode="json") for item in sorted(rows, key=lambda row: row.observation_id)]
@@ -1294,7 +1613,11 @@ def seal_sparse_features_v2(
     if not band_contract.all_bands_sufficient:
         raise ValueError("cannot seal V2 outcome features before all bands are sufficient")
     eligible = sorted(
-        (item for item in rows if item.observed_axis_count >= band_contract.minimum_observed_axes),
+        (
+            item
+            for item in rows
+            if item.signed_score_axis_count >= band_contract.minimum_observed_axes
+        ),
         key=lambda item: item.observation_id,
     )
     if not eligible:

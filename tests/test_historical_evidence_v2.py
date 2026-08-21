@@ -31,6 +31,8 @@ from moatrader.expectations.historical_evidence_v2 import (
     AxisApplicabilityV2,
     AxisEvidenceProvenanceV2,
     AxisSignedScoreRoleV2,
+    DeterministicCoreIndexCoveragePolicyV2,
+    EvidenceIndexContractV2,
     GroundedAxisStateSnapshotV2,
     PITApplicabilityRulesV2,
     PITOperatingSnapshotV2,
@@ -39,10 +41,12 @@ from moatrader.expectations.historical_evidence_v2 import (
     SparseAxisEvidenceV2,
     SparseCoverageGatePolicyV2,
     build_deterministic_pit_axis_evidence,
+    build_deterministic_core_index_row_v2,
     build_last_grounded_axis_evidence,
     build_sparse_feature_row_v2,
     calibrate_sparse_band_contract_v2,
     evaluate_sparse_coverage_gate_v2,
+    fixed_economic_breadth_band_v2,
     merge_axis_evidence_v2,
     sparse_band_diagnostics_v2,
     sparse_feature_coverage_report,
@@ -69,6 +73,9 @@ from scripts.evaluate_historical_evidence_parser_v2 import (
     combine_v2_locked_evaluations,
     create_v2_parser_freeze,
     evaluate_v2_locked_parser,
+)
+from scripts.freeze_historical_evidence_index_v2 import (
+    deterministic_core_diagnostics_v2,
 )
 from scripts.prepare_historical_evidence_classification_subset import prepare_subset
 from scripts.prepare_historical_locked_sets_v2 import (
@@ -233,6 +240,149 @@ def test_sparse_contract_keeps_na_and_not_applicable_distinct_from_neutral() -> 
             abstention_reason=AbstentionReasonV2.TRUE_NO_MENTION,
             applicability_rule_id="BAD_ZERO_IMPUTATION",
         )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("-1", "STRONG_BEAR"),
+        ("-0.999", "BEAR"),
+        ("-0.5", "BEAR"),
+        ("0", "NEUTRAL"),
+        ("0.5", "BULL"),
+        ("0.999", "BULL"),
+        ("1", "STRONG_BULL"),
+    ],
+)
+def test_fixed_economic_bands_do_not_depend_on_sample_quantiles(
+    value: str,
+    expected: str,
+) -> None:
+    assert fixed_economic_breadth_band_v2(D(value)).value == expected
+
+
+def test_evidence_index_contract_prespecifies_full_and_freezes_core() -> None:
+    contract = EvidenceIndexContractV2()
+
+    assert contract.primary_index == "FULL_EVIDENCE_SIGNED_BREADTH_V2"
+    assert contract.primary_measurement_status == (
+        "PRESPECIFIED_PENDING_DEMAND_PRICE_MIX_GATE"
+    )
+    assert contract.full_index_materialized is False
+    assert contract.secondary_index == "DETERMINISTIC_CORE_SIGNED_BREADTH_V2"
+    assert contract.minimum_observed_axes == 2
+    assert contract.capex_role == "DIAGNOSTIC_ONLY"
+    assert contract.index_multiplied_by_coverage is False
+    assert contract.outcome_stage_authorized is False
+    assert contract.value_data_opened is False
+    assert contract.per_pbr_role == "NOT_USED"
+
+
+def _core_row(
+    index: int,
+    directions: tuple[EvidenceState | None, EvidenceState | None, EvidenceState | None],
+    *,
+    capex_direction: EvidenceState | None = None,
+):
+    pair = _pair(index)
+    evidence = []
+    for axis, direction in zip(
+        (
+            OperatingEvidenceAxis.MARGIN,
+            OperatingEvidenceAxis.INVENTORY_MISMATCH,
+            OperatingEvidenceAxis.BACKLOG,
+        ),
+        directions,
+        strict=True,
+    ):
+        evidence.append(
+            _grounded(axis, direction, pair=pair) if direction is not None else _na(axis)
+        )
+    if capex_direction is None:
+        evidence.append(_na(OperatingEvidenceAxis.CAPACITY_CAPEX))
+    else:
+        evidence.append(
+            _grounded(
+                OperatingEvidenceAxis.CAPACITY_CAPEX,
+                capex_direction,
+                pair=pair,
+            ).model_copy(
+                update={
+                    "deterministic_metric_name": "CAPEX_TO_REVENUE",
+                    "deterministic_previous_value": D("0.1"),
+                    "deterministic_current_value": D("0.2"),
+                    "deterministic_delta": D("0.1"),
+                }
+            )
+        )
+    return build_deterministic_core_index_row_v2(pair=pair, axis_evidence=evidence)
+
+
+def test_deterministic_core_score_excludes_capex_and_keeps_coverage_separate() -> None:
+    bullish_capex = _core_row(
+        101,
+        (EvidenceState.IMPROVING, EvidenceState.WEAKENING, None),
+        capex_direction=EvidenceState.IMPROVING,
+    )
+    bearish_capex = _core_row(
+        102,
+        (EvidenceState.IMPROVING, EvidenceState.WEAKENING, None),
+        capex_direction=EvidenceState.WEAKENING,
+    )
+
+    assert bullish_capex.nobs == 2
+    assert bullish_capex.core_evidence_index == D(0)
+    assert bullish_capex.core_evidence_index_fraction == "0"
+    assert bullish_capex.coverage == D(2) / D(3)
+    assert bullish_capex.band.value == "NEUTRAL"
+    assert bullish_capex.eligible is True
+    assert bullish_capex.capex_in_index is False
+    assert bearish_capex.core_evidence_index == bullish_capex.core_evidence_index
+    assert bearish_capex.nobs == bullish_capex.nobs
+    assert bearish_capex.row_sha256 != bullish_capex.row_sha256
+
+
+def test_deterministic_core_requires_nobs_two_before_assigning_a_band() -> None:
+    row = _core_row(103, (EvidenceState.IMPROVING, None, None))
+
+    assert row.nobs == 1
+    assert row.core_evidence_index == D(1)
+    assert row.eligible is False
+    assert row.band is None
+
+
+def test_deterministic_core_diagnostics_report_all_fixed_bands() -> None:
+    rows = [
+        _core_row(111, (EvidenceState.WEAKENING, EvidenceState.WEAKENING, None)),
+        _core_row(112, (EvidenceState.WEAKENING, EvidenceState.STABLE, None)),
+        _core_row(113, (EvidenceState.WEAKENING, EvidenceState.IMPROVING, None)),
+        _core_row(114, (EvidenceState.IMPROVING, EvidenceState.STABLE, None)),
+        _core_row(115, (EvidenceState.IMPROVING, EvidenceState.IMPROVING, None)),
+    ]
+    diagnostics = deterministic_core_diagnostics_v2(
+        rows,
+        policy=DeterministicCoreIndexCoveragePolicyV2(
+            minimum_rows_per_band=1,
+            minimum_unique_issuers_per_band=1,
+            minimum_unique_signal_months_per_band=1,
+            minimum_total_unique_issuers=5,
+            minimum_total_unique_signal_months=1,
+            maximum_top_issuer_share_per_band=D(1),
+            maximum_top_month_share_per_band=D(1),
+            maximum_top_year_share_per_band=D(1),
+        ),
+    )
+
+    assert diagnostics["coverage_gate_passed"] is True
+    assert diagnostics["eligible_row_count"] == 5
+    assert set(diagnostics["by_band"]) == {
+        "STRONG_BEAR",
+        "BEAR",
+        "NEUTRAL",
+        "BULL",
+        "STRONG_BULL",
+    }
+    assert {values["row_count"] for values in diagnostics["by_band"].values()} == {1}
 
 
 def _pit_snapshot(
@@ -810,7 +960,10 @@ def test_feature_only_band_calibration_requires_explicit_nobs_and_covers_five_ba
 
     assert contract.all_bands_sufficient is True
     assert set(contract.band_counts.values()) == {1}
-    assert all(D(-1) < value < D(1) for value in contract.cut_points)
+    assert contract.calibration_method == "FIXED_ECONOMIC_SIGN_BANDS_V2"
+    assert contract.band_for(D(-1)).value == "STRONG_BEAR"
+    assert contract.band_for(D(0)).value == "NEUTRAL"
+    assert contract.band_for(D(1)).value == "STRONG_BULL"
     assert report["grounded_axis_count_histogram"]["2"] == 5
     assert len(report["signed_breadth_distribution"]) == 5
     assert report["n_directional_histogram"]["0"] == 1
