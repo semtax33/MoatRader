@@ -117,6 +117,7 @@ def evaluate_parser(
         minimum_overall_agreement=minimum_overall_agreement,
         minimum_axis_agreement=minimum_axis_agreement,
         gold_split=split,
+        required_axes={packet.axis for packet in packets_list},
     )
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / "parser-quality-report.json"

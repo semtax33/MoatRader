@@ -110,6 +110,7 @@ def evaluate_human_gold_quality(
     minimum_overall_agreement: float = 0.80,
     minimum_axis_agreement: float = 0.70,
     gold_split: str | None = None,
+    required_axes: Iterable[OperatingEvidenceAxis] | None = None,
 ) -> dict[str, Any]:
     reviewed: list[tuple[AxisPairClassification, AxisPairClassification]] = []
     invalid_rows: list[dict[str, Any]] = []
@@ -143,7 +144,14 @@ def evaluate_human_gold_quality(
     fatal_direction_flip_count = 0
     false_stable_count = 0
     machine_abstention_count = 0
-    for axis in OperatingEvidenceAxis:
+    evaluation_axes = (
+        tuple(OperatingEvidenceAxis)
+        if required_axes is None
+        else tuple(sorted(set(required_axes), key=lambda item: item.value))
+    )
+    if not evaluation_axes:
+        raise ValueError("quality evaluation requires at least one operating-evidence axis")
+    for axis in evaluation_axes:
         values = [(human, machine) for human, machine in reviewed if human.axis == axis]
         matches = 0
         axis_fatal_flips = 0
@@ -210,6 +218,7 @@ def evaluate_human_gold_quality(
         "status": status,
         "gate_passed": gate,
         "evaluated_gold_split": gold_split or "ALL",
+        "evaluated_axes": [axis.value for axis in evaluation_axes],
         "reviewed_count": len(reviewed),
         "overall_exact_status_and_state_pair_agreement": overall,
         "minimum_gold_per_axis": minimum_gold_per_axis,

@@ -108,7 +108,7 @@ def test_semantic_v2_profile_is_demand_price_mix_only_and_never_defaults_na_to_z
     assert "current_state minus previous_state" in request.system
     assert "Revenue alone is not demand" in request.system
     assert "Pricing policy" in request.system
-    assert request.prompt_cache_key == "moatrader:historical-demand-price-mix-v2-0"
+    assert request.prompt_cache_key == "moatrader:historical-demand-price-mix-v2-5"
 
     with pytest.raises(ValueError, match="only Demand and PriceMix"):
         build_request(
@@ -1069,3 +1069,67 @@ def test_quality_gate_reads_only_requested_gold_split(tmp_path: Path) -> None:
     assert quality["evaluated_gold_split"] == "LOCKED_TEST"
     assert quality["source_span_grounding_rate"] == 1
     assert all(item["reviewed"] == 1 for item in quality["by_axis"].values())
+
+
+def test_quality_gate_requires_only_axes_present_in_semantic_subset(tmp_path: Path) -> None:
+    packet = _packet(101, OperatingEvidenceAxis.DEMAND)
+    previous = packet.previous_excerpts[0]
+    current = packet.current_excerpts[0]
+    machine = AxisPairClassification(
+        packet_id=packet.packet_id,
+        axis=packet.axis,
+        previous_state=EvidenceState.STABLE,
+        current_state=EvidenceState.IMPROVING,
+        previous_source_id=previous.source_id,
+        current_source_id=current.source_id,
+        previous_source_span=previous.text,
+        current_source_span=current.text,
+        confidence=1,
+    )
+    gold = tmp_path / "semantic-gold.csv"
+    with gold.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "packet_id",
+                "axis",
+                "human_status",
+                "human_previous_state",
+                "human_current_state",
+                "human_previous_source_id",
+                "human_current_source_id",
+                "human_previous_source_span",
+                "human_current_source_span",
+                "gold_split",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "packet_id": packet.packet_id,
+                "axis": packet.axis.value,
+                "human_status": "COMPLETE",
+                "human_previous_state": "0",
+                "human_current_state": "1",
+                "human_previous_source_id": previous.source_id,
+                "human_current_source_id": current.source_id,
+                "human_previous_source_span": previous.text,
+                "human_current_source_span": current.text,
+                "gold_split": "DEV",
+            }
+        )
+
+    quality = evaluate_human_gold_quality(
+        human_gold_path=gold,
+        classifications={packet.packet_id: machine},
+        packets={packet.packet_id: packet},
+        minimum_gold_per_axis=1,
+        minimum_overall_agreement=1,
+        minimum_axis_agreement=1,
+        gold_split="DEV",
+        required_axes={OperatingEvidenceAxis.DEMAND},
+    )
+
+    assert quality["gate_passed"] is True
+    assert quality["evaluated_axes"] == ["DEMAND"]
+    assert set(quality["by_axis"]) == {"DEMAND"}
