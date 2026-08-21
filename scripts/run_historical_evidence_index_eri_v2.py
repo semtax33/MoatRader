@@ -114,7 +114,9 @@ def _blocked(output: Path, status: str, **extra: object) -> dict[str, Any]:
         "eligibility_inventory_opened": False,
         "outcome_vault_opened": False,
         "return_data_opened": False,
+        "value_data_opened": False,
         "downstream_stage_authorized": False,
+        "value_neutralization_stage_authorized": False,
         "future_eri_used_as_signal": False,
         "future_eri_used_as_ranking": False,
         "per_pbr_role": "NOT_USED",
@@ -369,7 +371,8 @@ def run_evidence_index_eri_v2(
                 trading_sessions=sessions,
             )
         )
-    _write_jsonl(output / "future-eri-labels.jsonl", labels)
+    labels_path = output / "future-eri-labels.jsonl"
+    _write_jsonl(labels_path, labels)
     _write_json(output / "missing-outcomes.json", missing_outcomes)
     feature_by_id = {item.observation_id: item for item in feature_rows}
     primary_rows = [
@@ -439,11 +442,14 @@ def run_evidence_index_eri_v2(
         "future_eri_used_as_ranking": False,
         "return_data_opened": False,
         "downstream_stage_authorized": False,
+        "value_data_opened": False,
+        "value_neutralization_stage_authorized": bool(labels),
         "production_null_fixtures_passed": True,
         "primary_ranking_policy": "NONE_MECHANISM_ONLY",
         "per_pbr_role": "NOT_USED",
     }
-    _write_json(output / "stage-status.json", status)
+    stage_status_path = output / "stage-status.json"
+    _write_json(stage_status_path, status)
     _write_json(
         output / "build-manifest.json",
         {
@@ -458,9 +464,16 @@ def run_evidence_index_eri_v2(
             "eligibility_report_sha256": sha256_file(eligibility_path),
             "production_null_fixture_sha256": sha256_file(null_fixture_path),
             "dual_mechanism_report_sha256": sha256_file(report_path),
+            "feature_input_sha256": sha256_file(feature_path),
+            "future_eri_labels_sha256": sha256_file(labels_path),
+            "stage_status_sha256": sha256_file(stage_status_path),
             "outcome_opened_only_after_common_feature_seal": True,
             "exact_horizon_trading_sessions": 63,
             "return_data_opened": False,
+            "value_data_opened": False,
+            "value_neutralization_stage_authorized": bool(labels),
+            "value_neutralization_policy": "POST_ERI_PARALLEL_SENSITIVITY_NO_RANKING",
+            "per_pbr_joint_primary": False,
             "per_pbr_role": "NOT_USED",
         },
     )

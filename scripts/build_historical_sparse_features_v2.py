@@ -239,6 +239,9 @@ def _measurement_contract(
         / "scripts"
         / "seal_historical_full_evidence_index_v2.py",
         "eri_runner": workspace / "scripts" / "run_historical_evidence_index_eri_v2.py",
+        "value_neutralization_runner": workspace
+        / "scripts"
+        / "run_historical_evidence_index_value_neutralization_v2.py",
     }
     frozen_code_hashes = contract.get("code_sha256", {})
     for name, path in current_code_paths.items():

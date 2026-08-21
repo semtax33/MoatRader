@@ -171,21 +171,26 @@ In each case, an economically explained price produces ERI at zero within Decima
 
 ## Value-neutralization policy
 
-Value appears only after the ERI mechanism and return gates pass. The primary neutralization
-specification jointly controls all available metrics:
+V2 Value data is opened only after the Full Evidence Index → t+63 Future ERI evaluation is
+complete and its feature/label hashes are verified. This diagnostic does not require or open
+future returns. Every Value metric is an equal-status, same-sample sensitivity; there is no
+preferred joint neutralizer and no Value-based ranking:
 
-- PBR
-- PER
-- P/FCF
-- PSR
-- PCR
-- EV/EBITDA
-- RPR
+- PBR (B/M)
+- PER (E/P)
+- P/FCF (FCF/P)
+- PSR (Sales/P)
+- PCR (CFO/P)
+- EV/EBITDA (EBITDA/EV)
+- EV/EBIT, POR, PGPR
+- RPR/PRR (R&D/P)
+- retained earnings/P, assets/P, NCAV/P
 
-Each metric is also reported individually, followed by a Value + Momentum + Analyst Revision
-specification. `PER+PBR` is retained only as a comparator control. It is not a primary ranking,
-feature definition, or preferred neutralization specification. Reports include the retained
-F-score coefficient and the share of signal variation explained by Value controls.
+For each signal month and metric, raw Full Evidence Index IC and residualized IC use exactly the
+same complete-case observations. The report includes IC retention/attenuation, Value-exposure
+R-squared, Newey-West inference, and moving-block bootstrap intervals. `PBR`, `PER`, and
+`PER+PBR` receive no priority: the V2 diagnostic does not create a `PER+PBR` joint primary,
+portfolio rank, or trading signal. Actual Future ERI remains the downstream outcome only.
 
 ## Completed feature-only source build (2026-08-21)
 
@@ -329,7 +334,7 @@ contract freeze → Natural/Balanced single-use LOCKED 평가 → 87,204건 full
 Full Evidence Index coverage seal → t+63 ERI open`이다. 검증용
 `CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE` 결과는 sparse production 입력으로
 승격할 수 없고, `FULL_HISTORICAL` authorization과 dual LOCKED SHA가 기록된 분류만 허용한다.
-Full Index seal은 classifier, sparse builder, sealer, ERI runner의 동결 SHA와 git commit도
+Full Index seal은 classifier, sparse builder, sealer, ERI runner, Value-neutral runner의 동결 SHA와 git commit도
 재검증한다. 이 순서 전에는 ERI, Value, return이 닫혀 있다.
 
 1. `freeze_historical_sparse_contract_v2.py`
@@ -500,6 +505,19 @@ python scripts\calibrate_historical_sparse_features_v2.py `
 ```
 
 고정 `Nobs=2`와 경제적 다섯 밴드의 coverage gate를 통과한 뒤에도 ERI, return,
-Value 데이터를 열지 않는다. Value 비교 순서는 ERI mechanism gate 이후이며 PBR, PER,
-P/FCF, PSR, PCR, EV/EBITDA, RPR의 joint·individual neutralization을 보고한다.
-`PER+PBR`은 comparator일 뿐 우선 ranking이 아니다.
+Value 데이터를 열지 않는다. Value 비교는 Full Index → t+63 ERI 평가와 artifact hash
+검증이 끝난 뒤에만 별도 실행한다. PBR, PER, P/FCF, PSR, PCR, EV/EBITDA,
+EV/EBIT, POR, PGPR, RPR/PRR, retained earnings/P, assets/P, NCAV/P를 모두 동등한
+individual sensitivity로 보고하며, joint primary 또는 Value ranking은 만들지 않는다.
+
+```powershell
+python scripts\run_historical_evidence_index_value_neutralization_v2.py `
+  --eri-build <completed-v2-eri-build> `
+  --value-input <pit-value-controls.jsonl> `
+  --value-manifest <pit-value-controls-manifest.json> `
+  --output <new-v2-value-neutralization-output>
+```
+
+Value manifest는 모든 관측치가 signal timestamp 이전에 이용 가능했음을 확인하고,
+Future ERI로 Value control을 만들지 않았으며 원천파일 before/after 무결성이 통과했음을
+명시해야 한다. 이 러너는 future return을 읽지 않고 순위를 출력하지 않는다.

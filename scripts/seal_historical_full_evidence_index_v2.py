@@ -113,6 +113,9 @@ def _validate_frozen_execution_code(
         / "scripts"
         / "seal_historical_full_evidence_index_v2.py",
         "eri_runner": workspace / "scripts" / "run_historical_evidence_index_eri_v2.py",
+        "value_neutralization_runner": workspace
+        / "scripts"
+        / "run_historical_evidence_index_value_neutralization_v2.py",
     }
     for name, path in required.items():
         if frozen.get(name) != sha256_file(path):

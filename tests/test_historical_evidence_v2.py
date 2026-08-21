@@ -600,6 +600,11 @@ def test_full_index_dry_run_seals_five_axis_primary_after_every_prior_gate(
         "eri_runner": sha256_file(
             workspace / "scripts" / "run_historical_evidence_index_eri_v2.py"
         ),
+        "value_neutralization_runner": sha256_file(
+            workspace
+            / "scripts"
+            / "run_historical_evidence_index_value_neutralization_v2.py"
+        ),
     }
 
     def write_manifest(name: str, payload: dict[str, object]) -> Path:
@@ -981,9 +986,22 @@ def test_t63_runner_opens_outcomes_only_after_full_primary_and_core_secondary_se
     assert status["future_eri_used_as_signal"] is False
     assert status["future_eri_used_as_ranking"] is False
     assert status["return_data_opened"] is False
+    assert status["value_data_opened"] is False
+    assert status["value_neutralization_stage_authorized"] is True
     assert status["per_pbr_role"] == "NOT_USED"
     build_manifest = json.loads((output / "build-manifest.json").read_text(encoding="utf-8"))
     assert build_manifest["outcome_opened_only_after_common_feature_seal"] is True
+    assert build_manifest["feature_input_sha256"] == sha256_file(
+        output / "features-with-frozen-expectations-pre-outcome.jsonl"
+    )
+    assert build_manifest["future_eri_labels_sha256"] == sha256_file(
+        output / "future-eri-labels.jsonl"
+    )
+    assert build_manifest["stage_status_sha256"] == sha256_file(
+        output / "stage-status.json"
+    )
+    assert build_manifest["value_neutralization_stage_authorized"] is True
+    assert build_manifest["per_pbr_joint_primary"] is False
     assert (output / "feature-seal-pre-outcome.json").is_file()
 
 
