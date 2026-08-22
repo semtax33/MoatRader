@@ -556,8 +556,9 @@ def run_size_diagnostic_v2(
     ledger_by_id = _index(_read_records(ledger_path), source="eligibility ledger")
     feature_by_id = _index(_read_records(feature_path), source="ERI features")
     label_by_id = _index(_read_records(labels_path), source="ERI labels")
-    if set(full_by_id) != set(ledger_by_id) or len(full_by_id) != 37_014:
-        raise ValueError("Full Evidence and eligibility ledger panels do not match")
+    if not set(ledger_by_id) <= set(full_by_id) or len(ledger_by_id) != 37_014:
+        raise ValueError("eligibility ledger is not the sealed Full/Core common panel")
+    full_by_id = {key: full_by_id[key] for key in ledger_by_id}
     if set(label_by_id) != {key for key, row in ledger_by_id.items() if row["final_common"]}:
         raise ValueError("final ERI labels do not match the eligibility ledger")
     if not set(label_by_id) <= set(feature_by_id):
