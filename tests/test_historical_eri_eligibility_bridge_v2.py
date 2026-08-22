@@ -30,6 +30,9 @@ def _row(
         "t63_snapshot_available": t63,
         "eri_decomposition_valid": valid,
         "final_common": final,
+        "primary_exclusion_stage": None,
+        "primary_exclusion_reason": None,
+        "all_exclusion_reasons": [],
     }
 
 
@@ -77,6 +80,9 @@ def test_bridge_and_dimension_coverage_are_additive() -> None:
         _row("o3", "b", "BANK", (True, True, False, False, False)),
         _row("o4", "c", "BANK", (False, False, False, False, False)),
     ]
+    ledger[1]["primary_exclusion_stage"] = "T63_SNAPSHOT_TO_ERI_DECOMPOSITION"
+    ledger[1]["primary_exclusion_reason"] = "INVALID_ERI_ENTERPRISE_VALUE"
+    ledger[1]["all_exclusion_reasons"] = ["INVALID_ERI_ENTERPRISE_VALUE"]
     bridge = _stage_bridge(ledger)
     assert [row["observation_count"] for row in bridge] == [4, 3, 3, 2, 1, 1]
     assert [row["loss_from_previous_stage"] for row in bridge] == [0, 1, 0, 1, 1, 0]
@@ -88,6 +94,9 @@ def test_bridge_and_dimension_coverage_are_additive() -> None:
     assert tech["evidence_eligible_count"] == 2
     assert tech["final_common_count"] == 1
     assert tech["lost_at_eri_decomposition_count"] == 1
+    assert tech["primary_exclusion_reason_counts"] == {
+        "INVALID_ERI_ENTERPRISE_VALUE": 1
+    }
     assert bank["lost_before_price_pit_count"] == 1
     assert bank["lost_at_t63_snapshot_count"] == 1
     assert sum(row["final_common_count"] for row in coverage) == 1

@@ -261,6 +261,21 @@ def _coverage_rows(
             stage: len({row["issuer_id"] for row in rows if row[stage]})
             for stage, _ in STAGES
         }
+        primary_stage_counts = Counter(
+            str(row["primary_exclusion_stage"])
+            for row in rows
+            if row.get("primary_exclusion_stage")
+        )
+        primary_reason_counts = Counter(
+            str(row["primary_exclusion_reason"])
+            for row in rows
+            if row.get("primary_exclusion_reason")
+        )
+        overlapping_reason_counts: Counter[str] = Counter()
+        for row in rows:
+            overlapping_reason_counts.update(
+                str(reason) for reason in row.get("all_exclusion_reasons", [])
+            )
         baseline = counts["evidence_eligible"]
         final = counts["final_common"]
         baseline_share = baseline / total_baseline if total_baseline else None
@@ -305,6 +320,15 @@ def _coverage_rows(
                     final_share - baseline_share
                     if baseline_share is not None and final_share is not None
                     else None
+                ),
+                "primary_exclusion_stage_counts": dict(
+                    sorted(primary_stage_counts.items())
+                ),
+                "primary_exclusion_reason_counts": dict(
+                    sorted(primary_reason_counts.items())
+                ),
+                "overlapping_exclusion_reason_counts": dict(
+                    sorted(overlapping_reason_counts.items())
                 ),
             }
         )
