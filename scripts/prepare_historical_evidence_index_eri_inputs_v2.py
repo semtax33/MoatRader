@@ -31,8 +31,10 @@ from moatrader.expectations.driver_signals import (
 from moatrader.expectations.future_eri import (
     CurrentExpectationStateV1,
     EvidenceIndexFeatureDatasetSealV2,
+    EvidenceIndexFutureEriFeatureRowV2,
     FutureEriOutcomeInputV1,
     RealizedFcffStateV1,
+    build_evidence_index_future_eri_label_v2,
     target_trading_session,
 )
 from moatrader.expectations.historical_evidence import (
@@ -887,6 +889,10 @@ def materialize_outcome_vault(
     ):
         raise ValueError("ERI feature panel is not sealed with outcomes closed")
     feature_ids = set(feature_seal.observation_ids)
+    feature_rows = _read_jsonl(feature_path, EvidenceIndexFutureEriFeatureRowV2)
+    feature_by_id = {item.observation_id: item for item in feature_rows}
+    if set(feature_by_id) != feature_ids or len(feature_by_id) != len(feature_rows):
+        raise ValueError("sealed ERI feature rows do not match the feature seal")
     snapshot_path = pre_outcome_build / "private-pit-annual-financial-snapshots.jsonl"
     inventory_path = pre_outcome_build / "outcome-eligibility-inventory.jsonl"
     if stage.get("artifact_hashes", {}).get("annual_snapshots") != sha256_file(snapshot_path):
@@ -909,6 +915,7 @@ def materialize_outcome_vault(
     target_rows = _row_map(target_frame)
     target_sizes = _size_maps(target_frame)
     marcap_sources = _parquet_source_map(marcap_files)
+    sessions = _load_sessions(marcap_files)
     outcomes: list[FutureEriOutcomeInputV1] = []
     exclusion_counts: Counter[str] = Counter()
     for item in inventory:
@@ -1003,16 +1010,30 @@ def materialize_outcome_vault(
         ):
             exclusion_counts["TARGET_MARKET_SOURCE_ID_MISMATCH"] += 1
             continue
-        outcomes.append(
-            FutureEriOutcomeInputV1(
-                observation_id=item.observation_id,
-                target_session=item.target_session,
-                target_price_at=item.target_price_at,
-                actual_market_price=close,
-                target_price_source_id=target_source_id,
-                realized_state=state,
-            )
+        candidate = FutureEriOutcomeInputV1(
+            observation_id=item.observation_id,
+            target_session=item.target_session,
+            target_price_at=item.target_price_at,
+            actual_market_price=close,
+            target_price_source_id=target_source_id,
+            realized_state=state,
         )
+        try:
+            build_evidence_index_future_eri_label_v2(
+                feature=feature_by_id[item.observation_id],
+                outcome=candidate,
+                feature_seal=feature_seal,
+                trading_sessions=sessions,
+            )
+        except ValueError as exc:
+            reason = (
+                "INVALID_ERI_ENTERPRISE_VALUE"
+                if "enterprise values must be positive" in str(exc)
+                else f"ERI_LABEL_VALIDATION_ERROR:{type(exc).__name__}"
+            )
+            exclusion_counts[reason] += 1
+            continue
+        outcomes.append(candidate)
     output.mkdir(parents=True, exist_ok=True)
     outcome_path = output / "future-eri-outcomes.jsonl"
     _write_jsonl(outcome_path, sorted(outcomes, key=lambda row: row.observation_id))
