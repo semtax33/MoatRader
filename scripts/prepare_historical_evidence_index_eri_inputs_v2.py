@@ -85,9 +85,47 @@ _DEBT_LABELS = {
     "유동리스부채",
     "비유동리스부채",
 }
-_REVENUE_LABELS = {"수익매출액", "매출액", "매출액계", "매출", "영업수익", "수익"}
-_OPERATING_PROFIT_LABELS = {"영업이익", "영업이익손실", "영업손실", "영업손익"}
+_REVENUE_LABELS = {
+    "수익매출액",
+    "수익(매출액)",
+    "매출액",
+    "매출액계",
+    "매출액(매출액)",
+    "매출",
+    "영업수익",
+    "수익",
+}
+_OPERATING_PROFIT_LABELS = {
+    "영업이익",
+    "영업이익손실",
+    "영업이익(손실)",
+    "영업손실",
+    "영업손익",
+}
 _ASSET_LABELS = {"자산총계"}
+
+# These labels are used only when the original conservative debt-component set
+# finds nothing.  Aggregate rows take precedence so a total and its components
+# can never be counted twice.
+_DEBT_FALLBACK_TOTAL_LABELS = {
+    "차입금",
+    "차입부채",
+    "차입금및사채",
+    "차입금및사채총액",
+    "리스부채",
+}
+_DEBT_FALLBACK_COMPONENT_LABELS = {
+    "단기차입부채",
+    "장기차입부채",
+    "유동차입부채",
+    "비유동차입부채",
+    "단기리스부채",
+    "장기리스부채",
+    "전환사채",
+    "교환사채",
+    "유동차입금(사채포함)",
+    "비유동차입금(사채포함)",
+}
 
 
 class PITEconomicAnnualSnapshotV2(ContractModel):
@@ -240,6 +278,25 @@ def extract_pit_economic_metrics_from_html(document: str) -> dict[str, Decimal |
             for value in [_current_value(values)]
             if value is not None
         ]
+        if not debt_values:
+            aggregate_debt = next(
+                (
+                    _current_value(values)
+                    for name, values in row_index.items()
+                    if name in _DEBT_FALLBACK_TOTAL_LABELS
+                ),
+                None,
+            )
+            if aggregate_debt is not None:
+                debt_values = [aggregate_debt]
+            else:
+                debt_values = [
+                    value
+                    for name, values in row_index.items()
+                    if name in _DEBT_FALLBACK_COMPONENT_LABELS
+                    for value in [_current_value(values)]
+                    if value is not None
+                ]
         balance_candidates.append(
             (
                 order,
@@ -336,6 +393,128 @@ def _load_common_index_rows(
     }
     common = set(full) & set(core)
     return ({key: full[key] for key in common}, {key: core[key] for key in common})
+
+
+def _validate_label_replication_contract(
+    contract: dict[str, Any],
+    *,
+    full_seal_path: Path,
+    full_eligible_path: Path,
+) -> None:
+    if contract.get("status") != "PREREGISTERED_PRE_EXPANDED_ERI_OUTCOME":
+        raise ValueError("label replication contract is not pre-outcome preregistered")
+    frozen_evidence = contract.get("frozen_evidence") or {}
+    frozen_label = contract.get("frozen_label") or {}
+    allowed = contract.get("allowed_engineering_change") or {}
+    if frozen_evidence.get("full_evidence_index_seal_sha256") != sha256_file(full_seal_path):
+        raise ValueError("label replication contract does not match the frozen Full Evidence seal")
+    if frozen_evidence.get("eligible_nobs2_rows_sha256") != sha256_file(full_eligible_path):
+        raise ValueError("label replication contract does not match the frozen eligible Evidence rows")
+    if frozen_evidence.get("minimum_observed_axes") != 2:
+        raise ValueError("label replication contract changed the Evidence eligibility rule")
+    if frozen_label.get("horizon_trading_sessions") != 63:
+        raise ValueError("label replication contract changed the Future ERI horizon")
+    if frozen_label.get("reverse_dcf_method") != "TURBO_DRIVER_ONE_DIMENSIONAL_REVERSE_DCF_V2":
+        raise ValueError("label replication contract changed the reverse-DCF method")
+    if any(
+        frozen_label.get(field) is not False
+        for field in (
+            "reverse_dcf_solver_behavior_changed",
+            "future_eri_formula_changed",
+            "signal_market_price_policy_changed",
+            "target_market_price_policy_changed",
+        )
+    ):
+        raise ValueError("label replication contract permits a forbidden label-definition change")
+    if (
+        allowed.get("scope") != "LABEL_SIDE_PIT_ANNUAL_FINANCIAL_EXTRACTION_COVERAGE_ONLY"
+        or allowed.get("new_data_source_allowed") is not False
+        or allowed.get("source_priority_changed") is not False
+        or allowed.get("source_files_may_be_modified") is not False
+        or allowed.get("evidence_rows_may_be_modified") is not False
+    ):
+        raise ValueError("label replication contract does not preserve source/Evidence immutability")
+
+
+def _label_replication_coverage_gate(
+    contract: dict[str, Any],
+    *,
+    expectation_ids: set[str],
+    complete_inventory_ids: set[str],
+    full_rows: dict[str, FullEvidenceIndexRowV2],
+    signal_sizes: dict[date, dict[str, str]],
+) -> dict[str, Any]:
+    thresholds = contract.get("pre_outcome_coverage_gate") or {}
+    required = {
+        "minimum_reverse_expectation_count",
+        "minimum_potential_t63_label_count",
+        "minimum_small_reverse_expectation_count",
+        "minimum_mid_reverse_expectation_count",
+        "minimum_unique_reverse_expectation_issuers",
+        "minimum_signal_month_count_with_potential_labels",
+        "maximum_large_share_of_potential_labels",
+    }
+    missing = sorted(required - set(thresholds))
+    if missing:
+        raise ValueError(f"label replication coverage gate is incomplete: {missing}")
+
+    def size_for(observation_id: str) -> str:
+        row = full_rows[observation_id]
+        return str(
+            signal_sizes.get(row.signal_timestamp.date(), {}).get(row.issuer_id, "UNKNOWN")
+        ).upper()
+
+    potential_ids = expectation_ids & complete_inventory_ids
+    expectation_sizes = Counter(size_for(item) for item in expectation_ids)
+    potential_sizes = Counter(size_for(item) for item in potential_ids)
+    expectation_issuers = {full_rows[item].issuer_id for item in expectation_ids}
+    potential_months = {
+        full_rows[item].signal_timestamp.strftime("%Y-%m") for item in potential_ids
+    }
+    metrics: dict[str, int | float] = {
+        "reverse_expectation_count": len(expectation_ids),
+        "potential_t63_label_count": len(potential_ids),
+        "small_reverse_expectation_count": expectation_sizes.get("SMALL", 0),
+        "mid_reverse_expectation_count": expectation_sizes.get("MID", 0),
+        "unique_reverse_expectation_issuers": len(expectation_issuers),
+        "signal_month_count_with_potential_labels": len(potential_months),
+        "large_share_of_potential_labels": (
+            potential_sizes.get("LARGE", 0) / len(potential_ids) if potential_ids else 0.0
+        ),
+    }
+    checks = {
+        "minimum_reverse_expectation_count": metrics["reverse_expectation_count"]
+        >= int(thresholds["minimum_reverse_expectation_count"]),
+        "minimum_potential_t63_label_count": metrics["potential_t63_label_count"]
+        >= int(thresholds["minimum_potential_t63_label_count"]),
+        "minimum_small_reverse_expectation_count": metrics[
+            "small_reverse_expectation_count"
+        ]
+        >= int(thresholds["minimum_small_reverse_expectation_count"]),
+        "minimum_mid_reverse_expectation_count": metrics["mid_reverse_expectation_count"]
+        >= int(thresholds["minimum_mid_reverse_expectation_count"]),
+        "minimum_unique_reverse_expectation_issuers": metrics[
+            "unique_reverse_expectation_issuers"
+        ]
+        >= int(thresholds["minimum_unique_reverse_expectation_issuers"]),
+        "minimum_signal_month_count_with_potential_labels": metrics[
+            "signal_month_count_with_potential_labels"
+        ]
+        >= int(thresholds["minimum_signal_month_count_with_potential_labels"]),
+        "maximum_large_share_of_potential_labels": metrics[
+            "large_share_of_potential_labels"
+        ]
+        <= float(thresholds["maximum_large_share_of_potential_labels"]),
+    }
+    return {
+        "status": "PASS" if all(checks.values()) else "FAIL",
+        "selected_without_expanded_future_eri_values": True,
+        "thresholds": thresholds,
+        "metrics": metrics,
+        "checks": checks,
+        "reverse_expectation_size_counts": dict(sorted(expectation_sizes.items())),
+        "potential_t63_label_size_counts": dict(sorted(potential_sizes.items())),
+    }
 
 
 def _parquet_source_map(files: Sequence[Path]) -> dict[int, dict[str, str]]:
@@ -502,6 +681,7 @@ def prepare_pre_outcome_inputs(
     marcap_commit: str,
     output: Path,
     workers: int = 16,
+    replication_contract: Path | None = None,
 ) -> dict[str, Any]:
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"output directory must be new or empty: {output}")
@@ -510,6 +690,7 @@ def prepare_pre_outcome_inputs(
         raise ValueError("production ERI pre-outcome input preparation requires a clean worktree")
     full_stage = _read_json(full_index_build / "stage-status.json")
     full_seal_path = full_index_build / "full-evidence-index-seal.json"
+    full_eligible_path = full_index_build / "full-evidence-index-eligible-nobs2.jsonl"
     core_manifest_path = core_index_build / "pre-outcome-index-manifest.json"
     if not (
         full_stage.get("status") == "V2_FULL_EVIDENCE_INDEX_SEALED_OUTCOMES_CLOSED"
@@ -522,6 +703,14 @@ def prepare_pre_outcome_inputs(
         raise ValueError("Full Index is not sealed with outcomes closed")
     if not marcap_files or workers < 1:
         raise ValueError("marcap files and positive workers are required")
+    replication_contract_payload: dict[str, Any] | None = None
+    if replication_contract is not None:
+        replication_contract_payload = _read_json(replication_contract)
+        _validate_label_replication_contract(
+            replication_contract_payload,
+            full_seal_path=full_seal_path,
+            full_eligible_path=full_eligible_path,
+        )
     full_rows, core_rows = _load_common_index_rows(full_index_build, core_index_build)
     common_ids = sorted(set(full_rows) & set(core_rows))
     if not common_ids:
@@ -785,6 +974,20 @@ def prepare_pre_outcome_inputs(
         and item.diluted_shares_source_id
         and item.wacc_source_id
     }
+    replication_coverage_gate = (
+        _label_replication_coverage_gate(
+            replication_contract_payload,
+            expectation_ids=expectation_ids,
+            complete_inventory_ids=complete_inventory_ids,
+            full_rows=full_rows,
+            signal_sizes=signal_sizes,
+        )
+        if replication_contract_payload is not None
+        else None
+    )
+    coverage_authorized = bool(
+        replication_coverage_gate is None or replication_coverage_gate["status"] == "PASS"
+    )
     artifacts = {
         "annual_snapshots": sha256_file(snapshot_path),
         "expectations_pre_outcome": sha256_file(expectation_path),
@@ -802,6 +1005,9 @@ def prepare_pre_outcome_inputs(
         "core_pre_outcome_manifest_sha256": sha256_file(core_manifest_path),
         "filing_pair_sha256": sha256_file(filing_pair_input),
         "pair_source_map_sha256": sha256_file(pair_source_map_input),
+        "label_replication_contract_sha256": (
+            sha256_file(replication_contract) if replication_contract is not None else None
+        ),
         "marcap_provider_commit": marcap_commit,
         "marcap_sources": marcap_sources,
         "common_full_core_index_count": len(common_ids),
@@ -811,13 +1017,15 @@ def prepare_pre_outcome_inputs(
         "potential_label_eligible_count": len(expectation_ids & complete_inventory_ids),
         "expectation_exclusion_reason_counts": dict(sorted(expectation_reason_counts.items())),
         "inventory_counts": dict(sorted(inventory_counts.items())),
+        "label_replication_coverage_gate": replication_coverage_gate,
         "reverse_dcf_method": "TURBO_DRIVER_ONE_DIMENSIONAL_REVERSE_DCF_V2",
         "exact_horizon_trading_sessions": 63,
         "original_source_files_modified": False,
         "source_hash_mismatch_count": 0,
         "verified_original_source_count": len(verified_paths),
         "artifact_hashes": artifacts,
-        "outcome_stage_authorized": bool(expectation_ids & complete_inventory_ids),
+        "outcome_stage_authorized": bool(expectation_ids & complete_inventory_ids)
+        and coverage_authorized,
         "outcome_vault_opened": False,
         "return_data_opened": False,
         "value_data_opened": False,
@@ -1078,6 +1286,15 @@ def main() -> int:
     pre.add_argument("--marcap-commit", required=True)
     pre.add_argument("--output", type=Path, required=True)
     pre.add_argument("--workers", type=int, default=16)
+    pre.add_argument(
+        "--replication-contract",
+        type=Path,
+        help=(
+            "Optional pre-outcome expanded-label contract. When supplied, its frozen "
+            "Evidence hashes are verified and outcome authorization is withheld unless "
+            "all preregistered coverage gates pass."
+        ),
+    )
     outcome = subparsers.add_parser("outcome")
     outcome.add_argument("--workspace", type=Path, default=Path.cwd())
     outcome.add_argument("--pre-outcome-build", type=Path, required=True)

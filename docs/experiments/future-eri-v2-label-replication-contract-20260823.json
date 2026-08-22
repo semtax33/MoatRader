@@ -1,0 +1,68 @@
+{
+  "schema_version": "moatrader-future-eri-v2-label-replication-contract-v1/1",
+  "status": "PREREGISTERED_PRE_EXPANDED_ERI_OUTCOME",
+  "preregistered_at": "2026-08-23T00:00:00+09:00",
+  "preregistered_base_git_commit": "2df4d6c",
+  "hypothesis": "The sealed Full Evidence V2 relationship to the same t+63 Future ERI label is replicated in a broader and more size-balanced label-eligible panel after label-side PIT annual-financial extraction coverage is repaired.",
+  "frozen_evidence": {
+    "primary_index": "FULL_EVIDENCE_SIGNED_BREADTH_V2",
+    "full_evidence_index_seal_sha256": "6e9fe8e59de0d4a8a12be8d2ac481a001ebe241b5f49d3ecf91194409be00ab5",
+    "eligible_nobs2_rows_sha256": "cb98912c5cb65e9c8909db0e4fdf6fac9cc92e6e757470a1dc2bbc5965860f5c",
+    "minimum_observed_axes": 2,
+    "score_and_coverage_separate": true,
+    "index_multiplied_by_coverage": false,
+    "banding_method": "FIXED_ECONOMIC_SIGN_BANDS_V2",
+    "band_rules": {
+      "STRONG_BEAR": "SIGNED_BREADTH == -1",
+      "BEAR": "-1 < SIGNED_BREADTH < 0",
+      "NEUTRAL": "SIGNED_BREADTH == 0",
+      "BULL": "0 < SIGNED_BREADTH < 1",
+      "STRONG_BULL": "SIGNED_BREADTH == 1"
+    }
+  },
+  "frozen_label": {
+    "horizon_trading_sessions": 63,
+    "outcome_metric": "FROZEN_EQUITY_ERI_V1",
+    "reverse_dcf_method": "TURBO_DRIVER_ONE_DIMENSIONAL_REVERSE_DCF_V2",
+    "reverse_dcf_solver_behavior_changed": false,
+    "future_eri_formula_changed": false,
+    "signal_market_price_policy_changed": false,
+    "target_market_price_policy_changed": false
+  },
+  "allowed_engineering_change": {
+    "scope": "LABEL_SIDE_PIT_ANNUAL_FINANCIAL_EXTRACTION_COVERAGE_ONLY",
+    "standard_dart_parenthesized_income_labels": true,
+    "conservative_debt_label_fallback": true,
+    "new_data_source_allowed": false,
+    "source_priority_changed": false,
+    "source_files_may_be_modified": false,
+    "evidence_rows_may_be_modified": false
+  },
+  "pre_outcome_coverage_gate": {
+    "minimum_reverse_expectation_count": 5000,
+    "minimum_potential_t63_label_count": 4500,
+    "minimum_small_reverse_expectation_count": 1000,
+    "minimum_mid_reverse_expectation_count": 1400,
+    "minimum_unique_reverse_expectation_issuers": 600,
+    "minimum_signal_month_count_with_potential_labels": 24,
+    "maximum_large_share_of_potential_labels": 0.45,
+    "selected_without_expanded_future_eri_values": true
+  },
+  "replication_gate_if_coverage_passes": {
+    "minimum_observations_per_band": 20,
+    "required_adjacent_median_nondecreasing_count": 4,
+    "five_band_medians_must_be_nondecreasing": true,
+    "monthly_ic_is_secondary": true,
+    "outer_spread_is_secondary": true,
+    "selection_weighting_is_diagnostic_only": true
+  },
+  "failure_policy": {
+    "if_coverage_gate_fails": "DO_NOT_OPEN_EXPANDED_FUTURE_ERI_VALUES;_REPORT_ENGINEERING_SHORTFALL",
+    "if_replication_gate_fails": "SEAL_REPLICATION_AS_FAILED;DO_NOT_RETUNE_EVIDENCE_OR_LABEL",
+    "v2_primary_result_may_be_overwritten": false
+  },
+  "return_data_opened": false,
+  "per_pbr_primary_ranking": false,
+  "future_eri_used_as_signal": false,
+  "future_eri_used_as_ranking": false
+}
