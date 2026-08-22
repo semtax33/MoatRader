@@ -57,6 +57,28 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _strict_balanced_candidate_build(
+    root: Path, name: str, packets: list[PairedAxisPacket]
+) -> Path:
+    build = root / name
+    build.mkdir()
+    packet_path = build / "balanced-retest-candidate-packets.jsonl"
+    _write_packets(packet_path, packets)
+    _write_json(
+        build / "balanced-retest-preparation-manifest.json",
+        {
+            "status": "V2_BALANCED_RETEST_1_CANDIDATES_PREPARED_OUTCOME_BLIND",
+            "candidate_packet_count": len(packets),
+            "balanced_retest_candidate_packet_sha256": sha256_file(packet_path),
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+        },
+    )
+    return build
+
+
 def _base_candidate_build(
     root: Path, source_packet_input: Path
 ) -> tuple[Path, list[PairedAxisPacket]]:
@@ -250,3 +272,138 @@ def test_merge_human_review_batches_and_reject_duplicates(tmp_path: Path) -> Non
         merge_human_review_decisions(
             inputs=[first, duplicate], output=tmp_path / "not-written.json"
         )
+
+
+def test_strict_balanced_retest_merge_preserves_human_identity_and_coverage(
+    tmp_path: Path,
+) -> None:
+    first_packet = _packet(
+        1_001,
+        OperatingEvidenceAxis.DEMAND,
+        "전년 대비 수요가 감소했습니다.",
+        "전년 대비 수요가 증가했습니다.",
+    )
+    second_packet = _packet(
+        1_002,
+        OperatingEvidenceAxis.DEMAND,
+        "전년 대비 수요가 증가했습니다.",
+        "전년 대비 수요가 감소했습니다.",
+    )
+    first_build = _strict_balanced_candidate_build(
+        tmp_path, "first-candidates", [first_packet]
+    )
+    second_build = _strict_balanced_candidate_build(
+        tmp_path, "second-candidates", [second_packet]
+    )
+    combined_build = _strict_balanced_candidate_build(
+        tmp_path, "combined-candidates", [first_packet, second_packet]
+    )
+
+    def imported_payload(
+        *, packet: PairedAxisPacket, build: Path, review_date: str
+    ) -> dict[str, object]:
+        manifest_path = build / "balanced-retest-preparation-manifest.json"
+        return {
+            "status": "HUMAN_REVIEW_DECISIONS_IMPORTED_OUTCOME_BLIND",
+            "review_type": "balanced-retest-1",
+            "reviewer": "HUMAN",
+            "human_reviewer_name": "Test Reviewer",
+            "attestation": "YES",
+            "review_date": review_date,
+            "candidate_count": 1,
+            "decision_count": 1,
+            "reviewed_count": 1,
+            "pending_count": 0,
+            "row_error_count": 0,
+            "candidate_manifest_sha256": sha256_file(manifest_path),
+            "candidate_excerpts_verified": True,
+            "decision_export_formulas_verified": True,
+            "workbook_read_only_verified": True,
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+            "decisions": [
+                {
+                    "packet_id": packet.packet_id,
+                    "axis": packet.axis.value,
+                    "status": "COMPLETE",
+                    "previous_state": -1,
+                    "current_state": 1,
+                    "previous_anchor": packet.previous_excerpts[0].text,
+                    "current_anchor": packet.current_excerpts[0].text,
+                }
+            ],
+        }
+
+    first = tmp_path / "first-import.json"
+    second = tmp_path / "second-import.json"
+    _write_json(
+        first,
+        imported_payload(
+            packet=first_packet, build=first_build, review_date="2026-08-21"
+        ),
+    )
+    _write_json(
+        second,
+        imported_payload(
+            packet=second_packet, build=second_build, review_date="2026-08-22"
+        ),
+    )
+    source_hashes_before = {
+        path: sha256_file(path)
+        for path in (
+            first,
+            second,
+            first_build / "balanced-retest-candidate-packets.jsonl",
+            second_build / "balanced-retest-candidate-packets.jsonl",
+            combined_build / "balanced-retest-candidate-packets.jsonl",
+        )
+    }
+
+    output = tmp_path / "strict-merged.json"
+    merged = merge_human_review_decisions(
+        inputs=[first, second],
+        output=output,
+        input_candidate_builds=[first_build, second_build],
+        combined_candidate_build=combined_build,
+    )
+    assert merged["status"] == (
+        "V2_BALANCED_RETEST_1_COMBINED_HUMAN_REVIEW_DECISIONS_READY_OUTCOME_BLIND"
+    )
+    assert merged["human_reviewer_name"] == "Test Reviewer"
+    assert merged["attestation"] == "YES"
+    assert merged["review_date"] == "2026-08-22"
+    assert merged["candidate_count"] == 2
+    assert merged["decision_count"] == 2
+    assert merged["candidate_manifest_sha256"] == sha256_file(
+        combined_build / "balanced-retest-preparation-manifest.json"
+    )
+    assert merged["outcome_vault_opened"] is False
+    assert merged["return_data_opened"] is False
+    assert merged["value_data_opened"] is False
+    assert merged["per_pbr_role"] == "NOT_USED"
+    assert {path: sha256_file(path) for path in source_hashes_before} == (
+        source_hashes_before
+    )
+
+    unexpected_packet = _packet(
+        1_003,
+        OperatingEvidenceAxis.DEMAND,
+        "전년 대비 수요가 유지되었습니다.",
+        "전년 대비 수요가 유지되었습니다.",
+    )
+    overcomplete_build = _strict_balanced_candidate_build(
+        tmp_path,
+        "overcomplete-combined-candidates",
+        [first_packet, second_packet, unexpected_packet],
+    )
+    rejected_output = tmp_path / "strict-merged-missing-candidate.json"
+    with pytest.raises(ValueError, match="do not exactly cover combined candidates"):
+        merge_human_review_decisions(
+            inputs=[first, second],
+            output=rejected_output,
+            input_candidate_builds=[first_build, second_build],
+            combined_candidate_build=overcomplete_build,
+        )
+    assert not rejected_output.exists()

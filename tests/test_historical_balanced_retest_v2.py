@@ -22,6 +22,9 @@ from scripts.evaluate_historical_evidence_parser_v2 import (
     combine_v2_locked_evaluations,
     evaluate_v2_locked_parser,
 )
+from scripts.merge_historical_human_review_decisions_v2 import (
+    merge_human_review_decisions,
+)
 from scripts.materialize_historical_balanced_retest_v2 import (
     freeze_balanced_retest_measurement,
     materialize_balanced_retest_human_gold,
@@ -58,6 +61,64 @@ def _write_packets(path: Path, rows: list[PairedAxisPacket]) -> None:
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_strict_candidate_subset(
+    path: Path, packets: list[PairedAxisPacket]
+) -> Path:
+    path.mkdir()
+    packet_path = path / "balanced-retest-candidate-packets.jsonl"
+    _write_packets(packet_path, packets)
+    manifest_path = path / "balanced-retest-preparation-manifest.json"
+    _write_json(
+        manifest_path,
+        {
+            "status": "V2_BALANCED_RETEST_1_CANDIDATES_PREPARED_OUTCOME_BLIND",
+            "candidate_packet_count": len(packets),
+            "balanced_retest_candidate_packet_sha256": sha256_file(packet_path),
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+        },
+    )
+    return path
+
+
+def _write_completed_review_import(
+    path: Path,
+    *,
+    decisions: list[dict[str, object]],
+    candidate_build: Path,
+    review_date: str,
+) -> None:
+    _write_json(
+        path,
+        {
+            "status": "HUMAN_REVIEW_DECISIONS_IMPORTED_OUTCOME_BLIND",
+            "review_type": "balanced-retest-1",
+            "reviewer": "HUMAN",
+            "human_reviewer_name": "Test Reviewer",
+            "attestation": "YES",
+            "review_date": review_date,
+            "candidate_count": len(decisions),
+            "decision_count": len(decisions),
+            "reviewed_count": len(decisions),
+            "pending_count": 0,
+            "row_error_count": 0,
+            "candidate_manifest_sha256": sha256_file(
+                candidate_build / "balanced-retest-preparation-manifest.json"
+            ),
+            "candidate_excerpts_verified": True,
+            "decision_export_formulas_verified": True,
+            "workbook_read_only_verified": True,
+            "outcome_vault_opened": False,
+            "return_data_opened": False,
+            "value_data_opened": False,
+            "per_pbr_role": "NOT_USED",
+            "decisions": decisions,
+        },
+    )
 
 
 def _gold_row(
@@ -330,20 +391,50 @@ def test_balanced_retest_materialize_freeze_evaluate_and_combine(tmp_path: Path)
                 current_anchor=packet.current_excerpts[0].text,
             )
         decisions.append(decision)
+    split = len(packets) // 2
+    first_candidate_build = _write_strict_candidate_subset(
+        tmp_path / "balanced-retest-first-candidates", packets[:split]
+    )
+    second_candidate_build = _write_strict_candidate_subset(
+        tmp_path / "balanced-retest-second-candidates", packets[split:]
+    )
+    first_review_path = tmp_path / "balanced-retest-first-review-import.json"
+    second_review_path = tmp_path / "balanced-retest-second-review-import.json"
+    _write_completed_review_import(
+        first_review_path,
+        decisions=decisions[:split],
+        candidate_build=first_candidate_build,
+        review_date="2026-08-21",
+    )
+    _write_completed_review_import(
+        second_review_path,
+        decisions=decisions[split:],
+        candidate_build=second_candidate_build,
+        review_date="2026-08-22",
+    )
+    source_hashes_before = {
+        path: sha256_file(path)
+        for path in (
+            first_review_path,
+            second_review_path,
+            first_candidate_build / "balanced-retest-candidate-packets.jsonl",
+            second_candidate_build / "balanced-retest-candidate-packets.jsonl",
+            packet_path,
+        )
+    }
     review_path = tmp_path / "balanced-retest-review.json"
-    _write_json(
-        review_path,
-        {
-            "reviewer": "HUMAN",
-            "human_reviewer_name": "Test Reviewer",
-            "attestation": "YES",
-            "review_date": "2026-08-22",
-            "outcome_vault_opened": False,
-            "return_data_opened": False,
-            "value_data_opened": False,
-            "per_pbr_role": "NOT_USED",
-            "decisions": decisions,
-        },
+    merged = merge_human_review_decisions(
+        inputs=[first_review_path, second_review_path],
+        output=review_path,
+        input_candidate_builds=[first_candidate_build, second_candidate_build],
+        combined_candidate_build=candidate_build,
+    )
+    assert merged["human_reviewer_name"] == "Test Reviewer"
+    assert merged["attestation"] == "YES"
+    assert merged["review_date"] == "2026-08-22"
+    assert merged["candidate_count"] == len(packets)
+    assert {path: sha256_file(path) for path in source_hashes_before} == (
+        source_hashes_before
     )
     human_gold_build = tmp_path / "balanced-retest-human-gold"
     materialized = materialize_balanced_retest_human_gold(

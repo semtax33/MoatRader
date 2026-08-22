@@ -1195,6 +1195,12 @@ def qualitative_axis_evidence(
 ) -> SparseAxisEvidenceV2:
     if applicability == AxisApplicabilityV2.NOT_APPLICABLE:
         return _not_applicable_axis(packet.axis, rule_id=applicability_rule_id)
+    if pair.previous.available_at > pair.current.available_at:
+        return _na_axis(
+            packet.axis,
+            AbstentionReasonV2.PERIOD_MISMATCH,
+            rule_id="PIT_PREVIOUS_DISCLOSURE_AVAILABLE_AFTER_CURRENT_V2",
+        )
     if classification is None:
         if packet.previous_excerpts and packet.current_excerpts:
             reason = AbstentionReasonV2.CLASSIFICATION_NOT_RUN

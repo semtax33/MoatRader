@@ -58,6 +58,7 @@ from moatrader.expectations.historical_evidence_v2 import (
     evaluate_sparse_coverage_gate_v2,
     fixed_economic_breadth_band_v2,
     merge_axis_evidence_v2,
+    qualitative_axis_evidence,
     sparse_band_diagnostics_v2,
     sparse_feature_coverage_report,
 )
@@ -267,6 +268,40 @@ def test_sparse_contract_keeps_na_and_not_applicable_distinct_from_neutral() -> 
             abstention_reason=AbstentionReasonV2.TRUE_NO_MENTION,
             applicability_rule_id="BAD_ZERO_IMPUTATION",
         )
+
+
+def test_qualitative_axis_evidence_fails_closed_when_previous_filing_arrives_late() -> None:
+    pair = _pair()
+    reversed_pair = pair.model_copy(
+        update={
+            "previous": pair.previous.model_copy(
+                update={"available_at": pair.current.available_at + timedelta(days=1)}
+            )
+        }
+    )
+    packet = _packet(reversed_pair, OperatingEvidenceAxis.DEMAND)
+    classification = AxisPairClassification(
+        packet_id=packet.packet_id,
+        axis=packet.axis,
+        previous_state=EvidenceState.STABLE,
+        current_state=EvidenceState.IMPROVING,
+        previous_source_id=packet.previous_excerpts[0].source_id,
+        current_source_id=packet.current_excerpts[0].source_id,
+        previous_source_span=packet.previous_excerpts[0].text,
+        current_source_span=packet.current_excerpts[0].text,
+        confidence=1,
+    )
+
+    evidence = qualitative_axis_evidence(
+        classification=classification,
+        packet=packet,
+        pair=reversed_pair,
+    )
+
+    assert evidence.availability == SparseAxisAvailabilityV2.NA
+    assert evidence.abstention_reason == AbstentionReasonV2.PERIOD_MISMATCH
+    assert evidence.direction is None
+    assert evidence.applicability_rule_id == "PIT_PREVIOUS_DISCLOSURE_AVAILABLE_AFTER_CURRENT_V2"
 
 
 @pytest.mark.parametrize(
