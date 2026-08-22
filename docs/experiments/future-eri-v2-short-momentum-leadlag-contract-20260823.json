@@ -8,6 +8,7 @@
     "feature_rows_sha256": "194b8e89ceab109d25edc29760540fc651973822865384b2ef287684c17cbd5b",
     "future_eri_labels_sha256": "9eba84ff5e819a8c96e9776ab77063b1f6ebc59ff208602ba6590676c7eadcaa",
     "full_evidence_index_seal_sha256": "6e9fe8e59de0d4a8a12be8d2ac481a001ebe241b5f49d3ecf91194409be00ab5",
+    "pre_outcome_feature_count": 1673,
     "panel_observation_count": 1640,
     "signal": "FULL_EVIDENCE_SIGNED_BREADTH_V2",
     "outcome": "FUTURE_ERI_T63"
@@ -105,5 +106,10 @@
   "future_eri_definition_changed": false,
   "factor_based_ranking_allowed": false,
   "future_eri_used_as_ranking": false,
-  "source_files_may_be_modified": false
+  "source_files_may_be_modified": false,
+  "pre_result_amendment": {
+    "reason": "Separate the 1,673 sealed pre-outcome feature rows from the 1,640 final Future ERI label rows.",
+    "short_momentum_values_opened_before_amendment": false,
+    "future_eri_values_opened_before_amendment": false
+  }
 }

@@ -89,6 +89,7 @@ def _contract_payload(contract_path: Path, *, eri_build: Path) -> dict[str, Any]
         contract.get("status") == "PREREGISTERED_BEFORE_SHORT_MOMENTUM_RESULTS"
         and frozen.get("eri_stage_status_sha256") == sha256_file(stage_path)
         and frozen.get("feature_rows_sha256") == sha256_file(feature_path)
+        and frozen.get("pre_outcome_feature_count") == 1673
         and frozen.get("panel_observation_count") == 1640
         and control.get("definitions") == WINDOW_DEFINITIONS_V2
         and control.get("signal_day_included") is False
@@ -284,7 +285,7 @@ def prepare_momentum_controls_pre_outcome(
     features = _read_records(feature_path)
     _assert_pre_outcome_rows(features)
     frozen = contract["frozen_inputs"]
-    if len(features) != int(frozen["panel_observation_count"]):
+    if len(features) != int(frozen["pre_outcome_feature_count"]):
         raise ValueError("frozen ERI feature count changed")
     tickers = {str(item["issuer_id"]).zfill(6) for item in features}
     sessions = _load_sessions(marcap_files)
@@ -372,8 +373,10 @@ def _prepare_neutral_panel(
     feature_by_id = {str(item["observation_id"]): item for item in features}
     label_by_id = {str(item["observation_id"]): item for item in labels}
     control_by_id = {str(item["observation_id"]): item for item in controls}
-    if not (set(feature_by_id) == set(label_by_id) == set(control_by_id)):
-        raise ValueError("feature, Future ERI, and momentum-control IDs differ")
+    if not set(label_by_id).issubset(feature_by_id) or not set(label_by_id).issubset(
+        control_by_id
+    ):
+        raise ValueError("final Future ERI IDs are not covered by feature/control rows")
     rows: list[dict[str, Any]] = []
     for observation_id in sorted(label_by_id):
         feature = feature_by_id[observation_id]
@@ -872,7 +875,13 @@ def run_future_momentum_lead_lag(
         raise ValueError("lead-lag gate failed; forward price returns must remain closed")
     feature_path = eri_build / "features-with-frozen-expectations-pre-outcome.jsonl"
     controls_path = pre_outcome_build / "momentum-controls-pre-outcome.jsonl"
-    features = _read_records(feature_path)
+    label_ids = {
+        str(item["observation_id"])
+        for item in _read_records(eri_build / "future-eri-labels.jsonl")
+    }
+    features = [
+        item for item in _read_records(feature_path) if str(item["observation_id"]) in label_ids
+    ]
     controls = _read_records(controls_path)
     tickers = {str(item["issuer_id"]).zfill(6) for item in features}
     sessions = _load_sessions(marcap_files)
