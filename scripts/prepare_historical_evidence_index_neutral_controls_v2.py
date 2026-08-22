@@ -125,38 +125,43 @@ def _load_hankyung_records(
     rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     hashes: dict[str, str] = {}
     counts: Counter[str] = Counter()
-    for ticker in sorted(tickers):
-        for path in sorted(root.glob(f"{ticker}_*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8-sig"))
-            except Exception:
-                counts["INVALID_JSON"] += 1
-                continue
-            registered = _parse_timestamp(payload.get("REGISTER_DATE"))
-            updated = _parse_timestamp(payload.get("UPDATE_DATE")) or registered
-            eps = _parse_decimal(payload.get("STOCK_PRE_EPS"))
-            settlement = str(payload.get("STOCK_SETTLEMENT_DAY") or "").strip()
-            if not (registered and updated and eps is not None and eps > 0):
-                counts["MISSING_PIT_EPS_FIELDS"] += 1
-                continue
-            if len(settlement) < 4 or not settlement[:4].isdigit():
-                counts["INVALID_SETTLEMENT_PERIOD"] += 1
-                continue
-            available_at = max(registered, updated)
-            source_hash = sha256_file(path)
-            hashes[str(path.resolve())] = source_hash
-            rows[ticker].append(
-                {
-                    "available_at": available_at,
-                    "registered_at": registered,
-                    "updated_at": updated,
-                    "forecast_year": int(settlement[:4]),
-                    "eps": eps,
-                    "broker": str(payload.get("PUBLISH_CODE") or payload.get("OFFICE_NAME") or path.name),
-                    "source_id": f"HANKYUNG:{source_hash}:{payload.get('REPORT_IDX', path.stem)}",
-                }
-            )
-            counts["VALID_PIT_EPS_REPORT"] += 1
+    for path in sorted(root.glob("*.json")):
+        ticker = path.name[:6]
+        if ticker not in tickers or len(path.name) < 8 or path.name[6] != "_":
+            continue
+        counts["RELEVANT_TICKER_REPORT_FILE"] += 1
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            counts["INVALID_JSON"] += 1
+            continue
+        registered = _parse_timestamp(payload.get("REGISTER_DATE"))
+        updated = _parse_timestamp(payload.get("UPDATE_DATE")) or registered
+        eps = _parse_decimal(payload.get("STOCK_PRE_EPS"))
+        settlement = str(payload.get("STOCK_SETTLEMENT_DAY") or "").strip()
+        if not (registered and updated and eps is not None and eps > 0):
+            counts["MISSING_PIT_EPS_FIELDS"] += 1
+            continue
+        if len(settlement) < 4 or not settlement[:4].isdigit():
+            counts["INVALID_SETTLEMENT_PERIOD"] += 1
+            continue
+        available_at = max(registered, updated)
+        source_hash = sha256_file(path)
+        hashes[str(path.resolve())] = source_hash
+        rows[ticker].append(
+            {
+                "available_at": available_at,
+                "registered_at": registered,
+                "updated_at": updated,
+                "forecast_year": int(settlement[:4]),
+                "eps": eps,
+                "broker": str(
+                    payload.get("PUBLISH_CODE") or payload.get("OFFICE_NAME") or path.name
+                ),
+                "source_id": f"HANKYUNG:{source_hash}:{payload.get('REPORT_IDX', path.stem)}",
+            }
+        )
+        counts["VALID_PIT_EPS_REPORT"] += 1
     for values in rows.values():
         values.sort(key=lambda item: (item["available_at"], item["source_id"]))
     return rows, hashes, counts
