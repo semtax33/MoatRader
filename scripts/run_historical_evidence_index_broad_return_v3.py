@@ -286,8 +286,6 @@ def prepare_controls_pre_return(
     size = _index(_read_records(size_rows_path), source="Size rows")
     if len(ledger) != 37_014 or set(size) != set(ledger) or not set(ledger).issubset(full_all):
         raise ValueError("V3 inputs do not share the exact 37,014-row baseline")
-    if any(str(row.get("security_type")) != "COMMON" for row in ledger.values()):
-        raise ValueError("broad baseline contains a non-common security")
     full = {key: full_all[key] for key in ledger}
     snapshots = _read_snapshots(snapshot_path)
     snapshots_by_ticker: dict[str, list[PITEconomicAnnualSnapshotV2]] = defaultdict(list)
@@ -345,6 +343,7 @@ def prepare_controls_pre_return(
                 "log_market_cap": _finite(size_row.get("log_market_cap")),
                 "signal_open_market_cap": market_cap,
                 "signal_size_bucket": str(size_row["signal_size_bucket"]),
+                "security_type": str(ledger_row["security_type"]),
                 "sector": str(ledger_row["sector"]),
                 "sector_basis": str(ledger_row["sector_basis"]),
                 "control_available_at": signal.isoformat(),
@@ -385,6 +384,10 @@ def prepare_controls_pre_return(
         "baseline_issuer_count": int(frame["issuer_id"].nunique()),
         "baseline_signal_month_count": int(frame["signal_month"].nunique()),
         "final_eri_flag_count": int(frame["final_eri_1640"].sum()),
+        "security_type_counts": {
+            str(key): int(value)
+            for key, value in frame["security_type"].value_counts().sort_index().items()
+        },
         "control_coverage_counts": coverage,
         "value_metric_fields": list(VALUE_FIELDS_V3),
         "value_neutralizer_priority": "NONE_PARALLEL_SENSITIVITY",

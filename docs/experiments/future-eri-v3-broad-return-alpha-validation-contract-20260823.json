@@ -12,6 +12,13 @@
   "frozen_inputs": {
     "baseline_observation_count": 37014,
     "universe_definition": "EXACT_COMMON_FULL_CORE_EVIDENCE_ELIGIBLE_INTERSECTION_FROM_SELECTION_LEDGER",
+    "security_type_policy": "Retain the exact sealed 37,014-row Full/Core intersection; COMMON in the universe label refers to the common Full/Core evidence intersection, not to common-stock security type.",
+    "security_type_counts_observed_outcome_blind": {
+      "COMMON": 34981,
+      "PREFERRED": 11,
+      "REIT": 30,
+      "UNKNOWN": 1992
+    },
     "full_evidence_rows_sha256": "cb98912c5cb65e9c8909db0e4fdf6fac9cc92e6e757470a1dc2bbc5965860f5c",
     "eligibility_ledger_sha256": "224fea0d63f8414255607bb59ba0f12d37f42b34465a56a1ee1d3382d23e6b2a",
     "size_selection_rows_sha256": "6e8257e8d3173628ba9030eb7e00ec6d22c82fa91944dd4521a7eb8377022f54",
@@ -120,5 +127,12 @@
     "return_used_as_signal_or_ranking": false,
     "llm_or_openai_api_required": false,
     "historical_result_must_be_labeled_confirmation_not_oos": true
+  },
+  "pre_return_amendment": {
+    "reason": "Clarify that the pre-existing phrase common Full/Core intersection names the intersection of two Evidence panels and is not a common-stock filter.",
+    "forward_return_values_opened_before_amendment": false,
+    "only_security_type_counts_opened_before_amendment": true,
+    "baseline_observation_count_changed": false,
+    "factor_or_outcome_definition_changed": false
   }
 }
