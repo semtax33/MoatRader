@@ -472,6 +472,17 @@ python -m scripts.prepare_historical_natural_retest_v2 `
   --parser-freeze-manifest <root-parser-freeze.json> `
   --output <new-natural-retest-candidates>
 
+python -m scripts.import_historical_human_review_workbook_v2 audit `
+  --review-type natural-retest-1 `
+  --workbook <human-locked-natural-retest-workbook.xlsx> `
+  --candidate-build <new-natural-retest-candidates>
+
+python -m scripts.import_historical_human_review_workbook_v2 import `
+  --review-type natural-retest-1 `
+  --workbook <human-locked-natural-retest-workbook.xlsx> `
+  --candidate-build <new-natural-retest-candidates> `
+  --output <fresh-human-review-decisions.json>
+
 python -m scripts.materialize_historical_natural_retest_v2 materialize `
   --candidate-build <new-natural-retest-candidates> `
   --review-decisions <fresh-human-review-decisions.json> `
@@ -483,6 +494,14 @@ python -m scripts.materialize_historical_natural_retest_v2 freeze `
   --human-gold-build <new-natural-retest-human-gold> `
   --output <new-natural-retest-freeze.json>
 ```
+
+XLSX importer는 `row_check=OK`나 `FORMAT_OK_ONLY` 수식값을 정답으로 신뢰하지
+않는다. 원본 workbook을 한 번만 읽고 전후 SHA-256을 확인하며, candidate manifest와
+packet 해시, 모든 packet ID·축·이전/현재 excerpt를 원본 candidate와 다시 대조한다.
+HUMAN 입력 셀의 수식, 숨김/추가 시트, 외부 링크, 매크로, embedded object도 거부한다.
+80행과 reviewer/attestation/date가 모두 유효하고 각 행의
+`contract_self_check=YES`가 확인된 경우에만 새 JSON output을 만들며 XLSX를
+덮어쓰지 않는다.
 
 첫 Balanced LOCKED가 단일사용 평가에서 실패하면 그 결과와 consumption record를
 그대로 보존한다. Retest 1은 실패 분류나 불일치 행을 읽지 않고, 이미 사용한
@@ -505,6 +524,17 @@ python -m scripts.prepare_historical_balanced_retest_v2 `
   --failed-balanced-consumption-record <balanced-consumption.json> `
   --parser-freeze-manifest <root-parser-freeze.json> `
   --output <new-balanced-retest-candidates>
+
+python -m scripts.import_historical_human_review_workbook_v2 audit `
+  --review-type balanced-retest-1 `
+  --workbook <human-locked-balanced-retest-workbook.xlsx> `
+  --candidate-build <new-balanced-retest-candidates>
+
+python -m scripts.import_historical_human_review_workbook_v2 import `
+  --review-type balanced-retest-1 `
+  --workbook <human-locked-balanced-retest-workbook.xlsx> `
+  --candidate-build <new-balanced-retest-candidates> `
+  --output <fresh-human-review-decisions.json>
 
 python -m scripts.materialize_historical_balanced_retest_v2 materialize `
   --candidate-build <new-balanced-retest-candidates> `
