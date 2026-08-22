@@ -315,9 +315,10 @@ def _band_summary(frame: pd.DataFrame, *, weight: str | None) -> list[dict[str, 
     rows: list[dict[str, Any]] = []
     for band, group in frame.groupby("full_evidence_band", sort=False):
         values = group["future_eri"].to_numpy(dtype=float)
+        weighted = weight is not None
         weights = (
             group[weight].to_numpy(dtype=float)
-            if weight is not None
+            if weighted
             else np.ones(len(group), dtype=float)
         )
         rows.append(
@@ -327,8 +328,14 @@ def _band_summary(frame: pd.DataFrame, *, weight: str | None) -> list[dict[str, 
                 "issuer_count": int(group["issuer_id"].nunique()),
                 "weight_sum": float(weights.sum()),
                 "effective_sample_size": _effective_sample_size(weights),
-                "mean_future_eri": float(np.average(values, weights=weights)),
-                "median_future_eri": _weighted_quantile(values, weights, 0.5),
+                "mean_future_eri": float(
+                    np.average(values, weights=weights) if weighted else np.mean(values)
+                ),
+                "median_future_eri": (
+                    _weighted_quantile(values, weights, 0.5)
+                    if weighted
+                    else float(np.median(values))
+                ),
                 "negative_future_eri_share": float(
                     np.average((values < 0).astype(float), weights=weights)
                 ),
@@ -637,6 +644,8 @@ def run_selection_weighting_v2(
     weighted_bands = _band_summary(analysis, weight="analysis_weight")
     selected_probabilities = propensity[eligible_mask]
     selected_weights = normalized[eligible_mask]
+    weighted_ess = _effective_sample_size(selected_weights)
+    ess_ratio = weighted_ess / len(analysis)
     summary = {
         "schema_version": "moatrader-eri-selection-weighting-diagnostic-v2/1",
         "status": "V2_SELECTION_WEIGHTING_SENSITIVITY_COMPLETE_NOT_PRIMARY_RETEST",
@@ -667,7 +676,15 @@ def run_selection_weighting_v2(
             "selected_weight_max": float(selected_weights.max()),
             "weight_cap_hit_count": int(np.sum(stabilized[eligible_mask] > WEIGHT_CAP)),
             "unweighted_effective_sample_size": len(analysis),
-            "weighted_effective_sample_size": _effective_sample_size(selected_weights),
+            "weighted_effective_sample_size": weighted_ess,
+            "weighted_ess_ratio": ess_ratio,
+            "weight_stability_status": (
+                "SEVERE_WEIGHT_CONCENTRATION"
+                if ess_ratio < 0.30
+                else "MODERATE_WEIGHT_CONCENTRATION"
+                if ess_ratio < 0.60
+                else "ACCEPTABLE_WEIGHT_CONCENTRATION"
+            ),
         },
         "monthly_ic": inference,
         "unweighted_five_band": raw_bands,
@@ -684,6 +701,11 @@ def run_selection_weighting_v2(
         "ranking_output_produced": False,
         "return_data_opened": False,
         "causal_claim_allowed": False,
+        "interpretation": (
+            "Selection weighting materially attenuates the monthly IC and does not repair "
+            "five-band monotonicity. Severe effective-sample-size loss makes this a warning "
+            "diagnostic, not a substitute for coverage-expanded label replication."
+        ),
     }
     monthly_path = output / "monthly-selection-weighted-ic.jsonl"
     summary_path = output / "selection-weighting-summary.json"
