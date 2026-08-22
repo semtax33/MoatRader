@@ -1,0 +1,124 @@
+{
+  "schema_version": "moatrader-future-eri-v3-broad-return-alpha-validation-contract-v1/1",
+  "status": "CONFIRMATORY_PROTOCOL_FROZEN_AFTER_NARROW_RETURN_DISCOVERY_BEFORE_BROAD_RETURN_PANEL",
+  "preregistered_at": "2026-08-23T00:00:00+09:00",
+  "research_question": "Does frozen Full Evidence V2 predict the 63-session forward stock return in the broad Evidence-eligible universe after point-in-time factor controls?",
+  "independence_classification": {
+    "historical_2020_2025": "CONFIRMATION_DISCOVERY_ONLY_NOT_INDEPENDENT_OOS",
+    "reason": "A secondary forward-return result was already observed in the 1,640-row Future ERI panel before this protocol was frozen.",
+    "true_oos_start": "2026-08-23",
+    "true_oos_policy": "Only signals first available strictly after the OOS start can support a new alpha claim."
+  },
+  "frozen_inputs": {
+    "baseline_observation_count": 37014,
+    "universe_definition": "EXACT_COMMON_FULL_CORE_EVIDENCE_ELIGIBLE_INTERSECTION_FROM_SELECTION_LEDGER",
+    "full_evidence_rows_sha256": "cb98912c5cb65e9c8909db0e4fdf6fac9cc92e6e757470a1dc2bbc5965860f5c",
+    "eligibility_ledger_sha256": "224fea0d63f8414255607bb59ba0f12d37f42b34465a56a1ee1d3382d23e6b2a",
+    "size_selection_rows_sha256": "6e8257e8d3173628ba9030eb7e00ec6d22c82fa91944dd4521a7eb8377022f54",
+    "pit_annual_snapshots_sha256": "0a75f4e1e82c552ddc24b0411b04d5325145543d0f51408b4d77f718c228a521",
+    "pit_snapshot_stage_sha256": "34c9bb0bd46cae7b80776bb70bfe0030132391aefb036b7c64152d0c3bc3a81a",
+    "narrow_panel_return_discovery_summary_sha256": "982363119cedfc77b6a5b0f85a78bb4a5579beb8107a65c9cfa71553136dcfcb",
+    "narrow_final_eri_panel_count": 1640,
+    "marcap_source_sha256_by_year": {
+      "2019": "7d2f4018558b9409485da83c7f539692ecbb2be206f7a800cc0f3f84cbdbe503",
+      "2020": "565f55ef141f58b3ec74c7ccb733fc551b7c6e30fbc7a1da59a78c23e7230806",
+      "2021": "ede65acaaa9ee61f56564f6a66840133ff4bbab9d2dbc21437f41b4c8d20199e",
+      "2022": "179650f5d1bd6abecb03d1b8eddf5f59c5ca6a0402e7bf2578635790b9ca811c",
+      "2023": "08f96990358f5afc4e17321613cef7126e2f0bd4290b82db952b7808d87f9c22",
+      "2024": "b0c38943e67637d5faf88429880092cf0f46a394be39860dd3bcd0b04231bccb",
+      "2025": "2bfd93c217eb74263bc5020b23fa6debb6b02531c11eaccc2826639bc191559e"
+    }
+  },
+  "primary_outcome": {
+    "name": "forward_return_63_open_to_close",
+    "horizon_common_trading_sessions": 63,
+    "signal_session_is_holding_session_one": true,
+    "definition": "Signal-session Close/Open minus one, compounded with MARCAP ChangesRatio for the following 62 common sessions through the target session.",
+    "signal_price": "EXACT_SIGNAL_SESSION_OPEN",
+    "target_price": "EXACT_63RD_HOLDING_SESSION_CLOSE",
+    "minimum_observed_following_session_returns": 50,
+    "exact_signal_and_target_rows_required": true,
+    "reason_for_open_anchor": "The filing signal is timestamped at the market open; the prior-close-to-open gap is excluded.",
+    "direct_unadjusted_close_over_open_sensitivity": true,
+    "next_session_open_sensitivity": true
+  },
+  "factor_controls": {
+    "neutralization_method": "WITHIN_SIGNAL_MONTH_RANK_NORMAL_EVIDENCE_RESIDUALIZED_ON_RANK_NORMAL_NUMERIC_CONTROLS",
+    "same_sample_raw_and_neutral": true,
+    "minimum_monthly_observations": 20,
+    "size": "log exact signal-session Open market capitalization",
+    "momentum": {
+      "momentum_1m": [21, 0, 17],
+      "momentum_3_1": [63, 21, 34],
+      "momentum_6_1": [126, 21, 84],
+      "momentum_12_1": [252, 21, 185],
+      "signal_session_excluded": true
+    },
+    "value_parallel_metrics": {
+      "value_btm": "positive PIT book equity / signal market capitalization",
+      "value_sales_yield": "positive PIT annual sales / signal market capitalization",
+      "value_operating_income_yield": "positive PIT operating income / signal market capitalization",
+      "value_ebit_ev_yield": "positive PIT operating income / positive enterprise value",
+      "value_assets_yield": "positive PIT total assets / signal market capitalization"
+    },
+    "value_core_composite": "Within-month mean rank-normal score across at least three available parallel Value metrics.",
+    "per_pbr_priority": false,
+    "per_pbr_joint_primary": false,
+    "growth": "latest valid PIT annual revenue / prior valid PIT annual revenue minus one",
+    "quality": "latest PIT annual (operating income minus debt) / total assets; CFO-free broad definition",
+    "sector": "CURRENT_2026_KRX_KIND_NON_PIT_SENSITIVITY_ONLY",
+    "sector_is_primary": false,
+    "predefined_tests": {
+      "raw": [],
+      "size": ["log_market_cap"],
+      "momentum_1m": ["momentum_1m"],
+      "momentum_3_1": ["momentum_3_1"],
+      "momentum_6_1": ["momentum_6_1"],
+      "momentum_12_1": ["momentum_12_1"],
+      "momentum_joint": ["momentum_1m", "momentum_3_1", "momentum_6_1", "momentum_12_1"],
+      "value_core_composite": ["value_core_composite"],
+      "growth": ["growth_revenue_yoy"],
+      "quality": ["quality_operating_roa_minus_leverage"],
+      "momentum_growth_quality_joint": ["momentum_1m", "momentum_3_1", "momentum_6_1", "momentum_12_1", "growth_revenue_yoy", "quality_operating_roa_minus_leverage"],
+      "all_numeric_joint": ["log_market_cap", "momentum_1m", "momentum_3_1", "momentum_6_1", "momentum_12_1", "value_core_composite", "growth_revenue_yoy", "quality_operating_roa_minus_leverage"],
+      "all_numeric_plus_sector_sensitivity": ["log_market_cap", "momentum_1m", "momentum_3_1", "momentum_6_1", "momentum_12_1", "value_core_composite", "growth_revenue_yoy", "quality_operating_roa_minus_leverage", "sector"]
+    }
+  },
+  "statistics": {
+    "primary": "equal-weight mean of monthly Spearman IC between frozen Full Evidence and primary forward return",
+    "secondary": [
+      "Strong Bull minus Strong Bear median forward return",
+      "five-band count, mean, median, and positive-return share",
+      "individual Value-metric same-sample neutral IC",
+      "direct close/open and next-open anchored return sensitivities"
+    ],
+    "newey_west_lag_months": 3,
+    "moving_block_length_months": 4,
+    "bootstrap_repetitions": 10000,
+    "bootstrap_seed": 42
+  },
+  "broadness_and_interpretation_gate": {
+    "minimum_primary_return_observations": 20000,
+    "minimum_primary_return_issuers": 1000,
+    "minimum_valid_signal_months": 12,
+    "supportive_historical_confirmation_requires_primary_bootstrap_ci_low_above": 0.0,
+    "alpha_claim_allowed_from_historical_gate": false,
+    "ranking_or_portfolio_output_allowed": false
+  },
+  "selection_bias_comparison": {
+    "groups": ["BROAD_RETURN_ELIGIBLE", "FINAL_ERI_1640_INTERSECTION"],
+    "same_return_definition": true,
+    "report_observation_issuer_month_counts": true,
+    "report_raw_monthly_ic_and_five_bands": true,
+    "report_size_and_control_coverage_differences": true
+  },
+  "source_and_role_guards": {
+    "source_files_read_only": true,
+    "source_files_may_be_modified": false,
+    "evidence_definition_changed": false,
+    "future_eri_used_as_signal_or_ranking": false,
+    "return_used_as_signal_or_ranking": false,
+    "llm_or_openai_api_required": false,
+    "historical_result_must_be_labeled_confirmation_not_oos": true
+  }
+}
