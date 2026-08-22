@@ -583,6 +583,13 @@ classification-stage SHA-256 두 개와 입력 stage가 정확히 같아야 한�
 Natural stage를 두 번째 pilot으로 바꿔 끼울 수 없다. Dual gate 전에는 아래 prelock
 preflight만 만들 수 있으며, status와 `full_historical_execution_authorized=false` 때문에
 전체 실행 gate의 입력으로 사용할 수 없다.
+Preflight와 최종 cost manifest는 1회 성공 기준 예상치, 20% 운영 buffer뿐 아니라
+모든 packet이 최대 4회 grounding 검증을 소비하는 상한과 그 상한의 20% buffer도
+별도로 기록한다. 이 상한은 지출 승인이 아니라 kill-switch 및 예산 ceiling용이다.
+첫 Natural/Balanced LOCKED 결과가 이미 소비된 현재 계약에서는 최종 manifest 전에
+`NATURAL_RETEST_1_HUMAN_GATE_PASS`와 `BALANCED_RETEST_1_HUMAN_GATE_PASS`가 모두
+필요하다. 과거 parser V1.2 사용량으로 만든 `cost-manifest.json`은 참고용 tombstone이며
+전체 실행 권한으로 승격하지 않는다.
 
 ```powershell
 python scripts\classify_historical_future_eri_evidence.py `

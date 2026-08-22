@@ -874,6 +874,9 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
         output=tmp_path / "cost.json",
     )
 
+    assert result["schema_version"] == (
+        "moatrader-historical-semantic-cost-manifest-v2/3"
+    )
     assert result["exact_expected_api_calls_without_retries"] == 2
     assert result["axis_counts"] == {"DEMAND": 1, "PRICE_MIX": 1}
     assert result["parser_profile"] == "DEMAND_PRICE_MIX_V2"
@@ -884,6 +887,19 @@ def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
         "output_tokens": 60,
     }
     assert result["pricing"]["expected_cost"]["total"] == "0.000106"
+    assert result["maximum_grounding_attempts_per_packet"] == 4
+    assert result["token_estimation"]["maximum_grounding_attempt_tokens"] == {
+        "input_tokens": 800,
+        "cached_input_tokens": 160,
+        "cache_write_tokens": 80,
+        "output_tokens": 240,
+    }
+    assert result["pricing"]["maximum_grounding_attempt_cost"]["total"] == (
+        "0.000423"
+    )
+    assert result["pricing"][
+        "maximum_grounding_attempt_conservative_20pct_cost"
+    ]["total"] == "0.000508"
     assert result["api_calls_executed"] is False
     assert result["outcome_vault_opened"] is False
     assert result["per_pbr_role"] == "NOT_USED"
@@ -971,16 +987,34 @@ def test_semantic_cost_preflight_uses_current_prompt_but_never_authorizes_run(
         output=tmp_path / "preflight.json",
     )
 
+    assert result["schema_version"] == (
+        "moatrader-historical-semantic-cost-preflight-v2/2"
+    )
     assert result["status"] == (
         "PRELOCK_COST_PREFLIGHT_ONLY_AWAITING_DUAL_LOCKED_USAGE"
     )
     assert result["full_historical_execution_authorized"] is False
     assert result["api_calls_executed"] is False
     assert result["token_estimation"]["observed_packet_count"] == 2
+    assert result["maximum_grounding_attempts_per_packet"] == 4
+    assert result["token_estimation"]["maximum_grounding_attempt_tokens"] == {
+        "input_tokens": 800,
+        "cached_input_tokens": 160,
+        "cache_write_tokens": 80,
+        "output_tokens": 240,
+    }
+    assert result["pricing"]["maximum_grounding_attempt_cost"]["total"] == (
+        "0.000423"
+    )
     assert result["token_estimation"][
-        "balanced_locked_usage_required_for_final_manifest"
+        "passed_natural_and_balanced_usage_required_for_final_manifest"
     ] is True
-    assert "BALANCED_LOCKED_GATE_PASS" in result["missing_final_requirements"]
+    assert result["token_estimation"][
+        "observed_stages_accepted_as_final_dual_locked_lineage"
+    ] is False
+    assert "BALANCED_RETEST_1_HUMAN_GATE_PASS" in result[
+        "missing_final_requirements"
+    ]
 
 
 def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> None:

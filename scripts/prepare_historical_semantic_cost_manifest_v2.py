@@ -61,6 +61,19 @@ def _expected_token_counts(
     }
 
 
+def _scale_token_counts(
+    tokens: dict[str, int], multiplier: Decimal
+) -> dict[str, int]:
+    if multiplier <= 0:
+        raise ValueError("token multiplier must be positive")
+    return {
+        key: int(
+            (D(value) * multiplier).to_integral_value(rounding=ROUND_HALF_UP)
+        )
+        for key, value in tokens.items()
+    }
+
+
 def _cost_components(
     tokens: dict[str, int],
     rates: dict[str, Decimal],
@@ -247,22 +260,32 @@ def prepare_cost_manifest(
     )
     active_rates = rates or DEFAULT_USD_PER_MILLION
     base_cost = _cost_components(expected, active_rates)
-    conservative_tokens = {
-        key: int((D(value) * D("1.20")).to_integral_value(rounding=ROUND_HALF_UP))
-        for key, value in expected.items()
-    }
+    conservative_tokens = _scale_token_counts(expected, D("1.20"))
     conservative_cost = _cost_components(conservative_tokens, active_rates)
+    maximum_grounding_tokens = _scale_token_counts(
+        expected, D(GROUNDING_VALIDATION_ATTEMPTS)
+    )
+    maximum_grounding_cost = _cost_components(
+        maximum_grounding_tokens, active_rates
+    )
+    maximum_grounding_conservative_tokens = _scale_token_counts(
+        maximum_grounding_tokens, D("1.20")
+    )
+    maximum_grounding_conservative_cost = _cost_components(
+        maximum_grounding_conservative_tokens, active_rates
+    )
     created = prepared_at or datetime.now(timezone.utc)
     if created.tzinfo is None or created.utcoffset() is None:
         raise ValueError("prepared_at must be timezone-aware")
     manifest: dict[str, Any] = {
-        "schema_version": "moatrader-historical-semantic-cost-manifest-v2/2",
+        "schema_version": "moatrader-historical-semantic-cost-manifest-v2/3",
         "status": "FULL_SEMANTIC_RUN_COST_PRESPECIFIED_NO_EXTERNAL_CALL",
         "prepared_at": created.isoformat(),
         "exact_expected_api_calls_without_retries": packet_count,
         "maximum_api_calls_with_grounding_retries": (
             packet_count * GROUNDING_VALIDATION_ATTEMPTS
         ),
+        "maximum_grounding_attempts_per_packet": GROUNDING_VALIDATION_ATTEMPTS,
         "exact_packet_count": packet_count,
         "axis_counts": dict(sorted(axis_counts.items())),
         "model": model,
@@ -278,6 +301,10 @@ def prepare_cost_manifest(
             "pilot_usage": combined_usage,
             "expected_tokens": expected,
             "conservative_20pct_tokens": conservative_tokens,
+            "maximum_grounding_attempt_tokens": maximum_grounding_tokens,
+            "maximum_grounding_attempt_conservative_20pct_tokens": (
+                maximum_grounding_conservative_tokens
+            ),
             "pilot_prompt_differs_from_frozen_full_prompt": False,
             "pilot_contract_matches_frozen_full_prompt": True,
             "estimate_not_research_result": True,
@@ -290,6 +317,10 @@ def prepare_cost_manifest(
             "rates": {key: str(value) for key, value in active_rates.items()},
             "expected_cost": base_cost,
             "conservative_20pct_cost": conservative_cost,
+            "maximum_grounding_attempt_cost": maximum_grounding_cost,
+            "maximum_grounding_attempt_conservative_20pct_cost": (
+                maximum_grounding_conservative_cost
+            ),
         },
         "inputs": {
             "semantic_packet_input": str(semantic_packet_input),
@@ -444,22 +475,32 @@ def prepare_prelock_cost_preflight(
     )
     active_rates = rates or DEFAULT_USD_PER_MILLION
     base_cost = _cost_components(expected, active_rates)
-    conservative_tokens = {
-        key: int((D(value) * D("1.20")).to_integral_value(rounding=ROUND_HALF_UP))
-        for key, value in expected.items()
-    }
+    conservative_tokens = _scale_token_counts(expected, D("1.20"))
     conservative_cost = _cost_components(conservative_tokens, active_rates)
+    maximum_grounding_tokens = _scale_token_counts(
+        expected, D(GROUNDING_VALIDATION_ATTEMPTS)
+    )
+    maximum_grounding_cost = _cost_components(
+        maximum_grounding_tokens, active_rates
+    )
+    maximum_grounding_conservative_tokens = _scale_token_counts(
+        maximum_grounding_tokens, D("1.20")
+    )
+    maximum_grounding_conservative_cost = _cost_components(
+        maximum_grounding_conservative_tokens, active_rates
+    )
     created = prepared_at or datetime.now(timezone.utc)
     if created.tzinfo is None or created.utcoffset() is None:
         raise ValueError("prepared_at must be timezone-aware")
     manifest: dict[str, Any] = {
-        "schema_version": "moatrader-historical-semantic-cost-preflight-v2/1",
+        "schema_version": "moatrader-historical-semantic-cost-preflight-v2/2",
         "status": "PRELOCK_COST_PREFLIGHT_ONLY_AWAITING_DUAL_LOCKED_USAGE",
         "prepared_at": created.isoformat(),
         "exact_expected_api_calls_without_retries": packet_count,
         "maximum_api_calls_with_grounding_retries": (
             packet_count * GROUNDING_VALIDATION_ATTEMPTS
         ),
+        "maximum_grounding_attempts_per_packet": GROUNDING_VALIDATION_ATTEMPTS,
         "exact_packet_count": packet_count,
         "axis_counts": dict(sorted(axis_counts.items())),
         "model": model,
@@ -475,9 +516,14 @@ def prepare_prelock_cost_preflight(
             "observed_usage": combined_usage,
             "expected_tokens": expected,
             "conservative_20pct_tokens": conservative_tokens,
+            "maximum_grounding_attempt_tokens": maximum_grounding_tokens,
+            "maximum_grounding_attempt_conservative_20pct_tokens": (
+                maximum_grounding_conservative_tokens
+            ),
             "observed_prompt_differs_from_frozen_full_prompt": False,
             "observed_contract_matches_frozen_full_prompt": True,
-            "balanced_locked_usage_required_for_final_manifest": True,
+            "passed_natural_and_balanced_usage_required_for_final_manifest": True,
+            "observed_stages_accepted_as_final_dual_locked_lineage": False,
             "estimate_not_research_result": True,
         },
         "pricing": {
@@ -488,6 +534,10 @@ def prepare_prelock_cost_preflight(
             "rates": {key: str(value) for key, value in active_rates.items()},
             "expected_cost": base_cost,
             "conservative_20pct_cost": conservative_cost,
+            "maximum_grounding_attempt_cost": maximum_grounding_cost,
+            "maximum_grounding_attempt_conservative_20pct_cost": (
+                maximum_grounding_conservative_cost
+            ),
         },
         "inputs": {
             "semantic_packet_input": str(semantic_packet_input),
@@ -500,7 +550,7 @@ def prepare_prelock_cost_preflight(
         },
         "missing_final_requirements": [
             "NATURAL_RETEST_1_HUMAN_GATE_PASS",
-            "BALANCED_LOCKED_GATE_PASS",
+            "BALANCED_RETEST_1_HUMAN_GATE_PASS",
             "V2_LOCKED_TESTS_PASSED",
             "EXACT_NATURAL_AND_BALANCED_CLASSIFICATION_LINEAGE",
         ],
