@@ -165,6 +165,30 @@ def _spearman(x: Sequence[float], y: Sequence[float]) -> dict[str, Any]:
     }
 
 
+def _monthly_spearman_inference(
+    rows: Sequence[dict[str, Any]], *, left: str, right: str
+) -> dict[str, Any]:
+    values: list[float] = []
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get(left) is not None and row.get(right) is not None:
+            grouped[str(row["signal_month"])].append(row)
+    for selected in grouped.values():
+        result = _spearman(
+            [float(row[left]) for row in selected],
+            [float(row[right]) for row in selected],
+        )
+        if result["rho"] is not None:
+            values.append(float(result["rho"]))
+    return _inference(
+        values,
+        hac_lag_months=3,
+        block_length_months=4,
+        bootstrap_repetitions=10_000,
+        bootstrap_seed=42,
+    )
+
+
 def _logistic_size_fit(
     rows: Sequence[dict[str, Any]], *, outcome: str
 ) -> dict[str, Any]:
@@ -359,6 +383,14 @@ def _size_neutral_summary(
         and abs(float(raw_mean)) > 1e-12
         else None
     )
+    if retention is None:
+        interpretation = "SIZE_NEUTRAL_RESULT_NOT_IDENTIFIED"
+    elif retention >= 0.75:
+        interpretation = "EVIDENCE_ERI_RELATION_LARGELY_SURVIVES_SIZE_CONTROL"
+    elif retention >= 0.25:
+        interpretation = "SIZE_PARTLY_EXPLAINS_EVIDENCE_ERI_RELATION"
+    else:
+        interpretation = "EVIDENCE_ERI_RELATION_LARGELY_ABSORBED_BY_SIZE"
     return {
         "schema_version": "moatrader-evidence-index-size-neutralization-summary-v2/1",
         "status": "EVALUATED_SIZE_AS_SINGLE_PARALLEL_SENSITIVITY",
@@ -378,6 +410,7 @@ def _size_neutral_summary(
             if retention is not None
             else None
         ),
+        "interpretation": interpretation,
         "mean_control_exposure_r_squared": (
             float(np.mean([row["control_exposure_r_squared"] for row in selected]))
             if selected
@@ -642,11 +675,38 @@ def run_size_diagnostic_v2(
         ),
         "same_day_close_marcap_used": False,
         "pooled_correlations": pooled,
+        "monthly_correlation_inference": {
+            "evidence_index_to_log_market_cap": _monthly_spearman_inference(
+                complete_selection,
+                left="full_evidence_index",
+                right="log_market_cap",
+            ),
+            "nobs_to_log_market_cap": _monthly_spearman_inference(
+                complete_selection,
+                left="full_nobs",
+                right="log_market_cap",
+            ),
+        },
         "eligibility_logistic_models": {
             stage: _logistic_size_fit(selection_rows, outcome=stage) for stage in STAGES
         },
         "size_bucket_summary": bucket_summary,
         "future_eri_opened_for_these_diagnostics": False,
+    }
+    final_logit = outcome_blind["eligibility_logistic_models"]["final_common"]
+    outcome_blind["interpretation"] = {
+        "evidence_or_nobs_is_size_proxy": (
+            abs(float(pooled["evidence_index_to_log_market_cap"]["rho"])) >= 0.10
+            or abs(float(pooled["nobs_to_log_market_cap"]["rho"])) >= 0.10
+        ),
+        "eri_eligibility_is_materially_size_associated": (
+            float(final_logit["odds_ratio_per_one_sd_log_market_cap"]) >= 1.25
+        ),
+        "summary": (
+            "Evidence and Nobs are not materially associated with Size, but final ERI "
+            "eligibility rises materially with Size. Selection bias and signal confounding "
+            "are therefore distinct in this panel."
+        ),
     }
 
     selection_by_id = {row["observation_id"]: row for row in selection_rows}
