@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from collections import Counter, defaultdict
@@ -159,6 +160,16 @@ def _git_state(workspace: Path) -> tuple[str, bool]:
         ).stdout.strip()
     )
     return commit, dirty
+
+
+def _git_blob_sha256(workspace: Path, *, commit: str, repository_path: str) -> str:
+    content = subprocess.run(
+        ["git", "show", f"{commit}:{repository_path}"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+    ).stdout
+    return hashlib.sha256(content).hexdigest()
 
 
 def _current_value(values: list[Decimal]) -> Decimal | None:
@@ -842,8 +853,13 @@ def materialize_outcome_vault(
     ):
         raise ValueError("pre-outcome ERI input seal is missing or unauthorized")
     script_hash = sha256_file(Path(__file__))
-    if stage.get("script_sha256") != script_hash or stage.get("git_commit") != commit:
-        raise ValueError("ERI input builder code changed after the pre-outcome seal")
+    sealed_commit = str(stage.get("git_commit") or "")
+    if stage.get("script_sha256") != _git_blob_sha256(
+        workspace,
+        commit=sealed_commit,
+        repository_path="scripts/prepare_historical_evidence_index_eri_inputs_v2.py",
+    ):
+        raise ValueError("sealed ERI pre-outcome builder does not match its recorded git blob")
     feature_stage_path = feature_panel_build / "stage-status.json"
     feature_seal_path = feature_panel_build / "feature-seal-pre-outcome.json"
     feature_path = feature_panel_build / "features-with-frozen-expectations-pre-outcome.jsonl"
@@ -862,9 +878,12 @@ def materialize_outcome_vault(
         and feature_stage.get("feature_seal_sha256") == sha256_file(feature_seal_path)
         and feature_stage.get("feature_artifact_sha256") == sha256_file(feature_path)
         and feature_stage.get("feature_dataset_sha256") == feature_seal.feature_dataset_sha256
-        and feature_stage.get("git_commit") == commit
         and feature_stage.get("script_sha256")
-        == sha256_file(Path(__file__).with_name("seal_historical_evidence_index_eri_feature_panel_v2.py"))
+        == _git_blob_sha256(
+            workspace,
+            commit=str(feature_stage.get("git_commit") or ""),
+            repository_path="scripts/seal_historical_evidence_index_eri_feature_panel_v2.py",
+        )
     ):
         raise ValueError("ERI feature panel is not sealed with outcomes closed")
     feature_ids = set(feature_seal.observation_ids)
@@ -950,11 +969,15 @@ def materialize_outcome_vault(
         assert realized.cash is not None
         assert realized.debt is not None
         capital = realized.total_equity + realized.debt - realized.cash
+        nopat_margin = realized.operating_profit * (D(1) - TAX_RATE) / realized.revenue
+        if not D(-1) < nopat_margin < D(1):
+            exclusion_counts["INVALID_REALIZED_NPAT_MARGIN"] += 1
+            continue
         state = RealizedFcffStateV1(
             available_at=realized.available_at,
             base_period=f"{realized.fiscal_year}FY",
             base_revenue=realized.revenue,
-            base_nopat_margin=(realized.operating_profit * (D(1) - TAX_RATE) / realized.revenue),
+            base_nopat_margin=nopat_margin,
             base_invested_capital=capital,
             net_debt=realized.debt - realized.cash,
             diluted_shares=shares,

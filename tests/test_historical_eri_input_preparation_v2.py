@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import subprocess
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from moatrader.expectations.historical_evidence import sha256_file
 from scripts.prepare_historical_evidence_index_eri_inputs_v2 import (
+    _git_blob_sha256,
     extract_pit_economic_metrics_from_html,
 )
 from scripts.seal_historical_evidence_index_eri_feature_panel_v2 import (
@@ -64,3 +68,20 @@ def test_pre_outcome_feature_panel_allows_target_metadata_without_value() -> Non
             }
         ]
     )
+
+
+def test_recorded_pre_outcome_script_hash_matches_git_blob() -> None:
+    workspace = Path(__file__).resolve().parents[1]
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    repository_path = "src/moatrader/expectations/future_eri.py"
+    assert _git_blob_sha256(
+        workspace,
+        commit=commit,
+        repository_path=repository_path,
+    ) == sha256_file(workspace / repository_path)
