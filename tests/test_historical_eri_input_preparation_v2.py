@@ -95,6 +95,50 @@ def test_extract_pit_economic_metrics_uses_debt_aggregate_fallback_without_compo
     assert extract_pit_economic_metrics_from_html(document)["debt"] == Decimal("400")
 
 
+def test_extract_pit_economic_metrics_sums_conservative_current_noncurrent_debt_aliases() -> None:
+    document = """
+    <html><body>
+      <p>(단위: 원)</p>
+      <table>
+        <tr><td>매출액</td><td>1,000</td></tr>
+        <tr><td>영업이익</td><td>100</td></tr>
+      </table>
+      <table>
+        <tr><td>자산총계</td><td>2,000</td></tr>
+        <tr><td>자본총계</td><td>1,200</td></tr>
+        <tr><td>현금및현금성자산</td><td>200</td></tr>
+        <tr><td>차입금(유동)</td><td>125</td></tr>
+        <tr><td>차입금(비유동)</td><td>275</td></tr>
+        <tr><td>리스부채(유동)</td><td>25</td></tr>
+        <tr><td>리스부채(비유동)</td><td>75</td></tr>
+      </table>
+    </body></html>
+    """
+
+    assert extract_pit_economic_metrics_from_html(document)["debt"] == Decimal("500")
+
+
+def test_extract_pit_economic_metrics_prefers_debt_total_over_fallback_components() -> None:
+    document = """
+    <html><body>
+      <p>(단위: 원)</p>
+      <table>
+        <tr><td>매출액</td><td>1,000</td></tr>
+        <tr><td>영업이익</td><td>100</td></tr>
+      </table>
+      <table>
+        <tr><td>자산총계</td><td>2,000</td></tr>
+        <tr><td>자본총계</td><td>1,200</td></tr>
+        <tr><td>현금및현금성자산</td><td>200</td></tr>
+        <tr><td>전환사채총액</td><td>400</td></tr>
+        <tr><td>유동성전환사채</td><td>100</td></tr>
+      </table>
+    </body></html>
+    """
+
+    assert extract_pit_economic_metrics_from_html(document)["debt"] == Decimal("400")
+
+
 def test_label_replication_coverage_gate_is_outcome_blind_and_size_aware() -> None:
     seoul = ZoneInfo("Asia/Seoul")
     rows = {
