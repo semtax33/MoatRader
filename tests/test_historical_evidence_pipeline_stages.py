@@ -791,6 +791,37 @@ def _write_packets(path: Path, packets: list[PairedAxisPacket]) -> None:
     )
 
 
+def _write_observed_cost_stage(path: Path, *, index: int) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "status": "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE",
+                "packet_count": 1,
+                "classification_count": 1,
+                "input_blinded_packet_sha256": str(index) * 64,
+                "parser_profile": "DEMAND_PRICE_MIX_V2",
+                "parser_version": SEMANTIC_PARSER_VERSION_V2,
+                "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+                "requested_model": "gpt-5.6-luna",
+                "semantic_execution_scope": "PILOT_OR_LOCKED_VALIDATION",
+                "full_historical_execution_authorized": False,
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+                "value_data_opened": False,
+                "credentials_persisted": False,
+                "per_pbr_role": "NOT_USED",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 20,
+                    "cache_write_tokens": 10,
+                    "output_tokens": 30,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_semantic_cost_manifest_freezes_calls_tokens_cost_and_prompt_before_run(
     tmp_path: Path,
 ) -> None:
@@ -988,13 +1019,14 @@ def test_semantic_cost_preflight_uses_current_prompt_but_never_authorizes_run(
     )
 
     assert result["schema_version"] == (
-        "moatrader-historical-semantic-cost-preflight-v2/2"
+        "moatrader-historical-semantic-cost-preflight-v2/3"
     )
     assert result["status"] == (
         "PRELOCK_COST_PREFLIGHT_ONLY_AWAITING_DUAL_LOCKED_USAGE"
     )
     assert result["full_historical_execution_authorized"] is False
     assert result["api_calls_executed"] is False
+    assert result["gate_progress"] == "NO_RETEST_GATE_PASSES_VERIFIED"
     assert result["token_estimation"]["observed_packet_count"] == 2
     assert result["maximum_grounding_attempts_per_packet"] == 4
     assert result["token_estimation"]["maximum_grounding_attempt_tokens"] == {
@@ -1015,6 +1047,99 @@ def test_semantic_cost_preflight_uses_current_prompt_but_never_authorizes_run(
     assert "BALANCED_RETEST_1_HUMAN_GATE_PASS" in result[
         "missing_final_requirements"
     ]
+
+
+def test_semantic_cost_preflight_verifies_natural_retest_pass_lineage(
+    tmp_path: Path,
+) -> None:
+    packet_input = tmp_path / "semantic.jsonl"
+    _write_packets(
+        packet_input,
+        [
+            _packet(1, OperatingEvidenceAxis.DEMAND),
+            _packet(2, OperatingEvidenceAxis.PRICE_MIX),
+        ],
+    )
+    selection = tmp_path / "selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "selected_packet_count": 2,
+                "output_packet_sha256": sha256_file(packet_input),
+                "outcome_vault_opened": False,
+                "return_data_opened": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    dev_stage = tmp_path / "dev-stage.json"
+    natural_stage = tmp_path / "natural-retest-stage.json"
+    _write_observed_cost_stage(dev_stage, index=1)
+    _write_observed_cost_stage(natural_stage, index=2)
+    natural_gate = tmp_path / "natural-retest-gate.json"
+    gate_payload = {
+        "status": "V2_NATURAL_RETEST_1_LOCKED_TEST_PASSED",
+        "locked_kind": "NATURAL_RETEST_1",
+        "gate_passed": True,
+        "natural_frequency_gate_passed": True,
+        "parser_profile": "DEMAND_PRICE_MIX_V2",
+        "parser_version": SEMANTIC_PARSER_VERSION_V2,
+        "prompt_sha256": SEMANTIC_PROMPT_SHA256_V2,
+        "requested_model": "gpt-5.6-luna",
+        "retest_number": 1,
+        "first_natural_test_remains_consumed": True,
+        "first_natural_result_superseded": False,
+        "v1_locked_rows_reused": False,
+        "classification_stage_sha256": sha256_file(natural_stage),
+        "classification_sha256": "a" * 64,
+        "input_blinded_packet_sha256": "2" * 64,
+        "semantic_parser_root_freeze_sha256": "b" * 64,
+        "outcome_vault_opened": False,
+        "return_data_opened": False,
+        "value_data_opened": False,
+        "per_pbr_role": "NOT_USED",
+    }
+    natural_gate.write_text(json.dumps(gate_payload), encoding="utf-8")
+
+    result = prepare_prelock_cost_preflight(
+        semantic_packet_input=packet_input,
+        semantic_selection_manifest=selection,
+        observed_stage_manifests={
+            "DEV": dev_stage,
+            "NATURAL_RETEST_1": natural_stage,
+        },
+        passed_gate_manifests={"NATURAL_RETEST_1": natural_gate},
+        output=tmp_path / "preflight-with-natural-pass.json",
+    )
+
+    assert result["gate_progress"] == (
+        "NATURAL_RETEST_1_PASSED_AWAITING_BALANCED_RETEST_1"
+    )
+    assert result["token_estimation"]["validated_passed_retest_gate_count"] == 1
+    assert "NATURAL_RETEST_1_HUMAN_GATE_PASS" not in result[
+        "missing_final_requirements"
+    ]
+    assert "BALANCED_RETEST_1_HUMAN_GATE_PASS" in result[
+        "missing_final_requirements"
+    ]
+    assert result["inputs"]["passed_gate_manifests"][0]["role"] == (
+        "NATURAL_RETEST_1"
+    )
+    assert result["full_historical_execution_authorized"] is False
+
+    gate_payload["classification_stage_sha256"] = "c" * 64
+    natural_gate.write_text(json.dumps(gate_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not seal its observed classification stage"):
+        prepare_prelock_cost_preflight(
+            semantic_packet_input=packet_input,
+            semantic_selection_manifest=selection,
+            observed_stage_manifests={
+                "DEV": dev_stage,
+                "NATURAL_RETEST_1": natural_stage,
+            },
+            passed_gate_manifests={"NATURAL_RETEST_1": natural_gate},
+            output=tmp_path / "tampered-preflight.json",
+        )
 
 
 def test_semantic_cost_manifest_rejects_legacy_pilot_prompt(tmp_path: Path) -> None:

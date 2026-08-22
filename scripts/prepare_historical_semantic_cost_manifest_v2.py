@@ -33,6 +33,20 @@ DEFAULT_USD_PER_MILLION = {
     "cache_write": D("0.25"),
     "output": D("1.20"),
 }
+PRELOCK_RETEST_GATE_CONTRACTS = {
+    "NATURAL_RETEST_1": {
+        "status": "V2_NATURAL_RETEST_1_LOCKED_TEST_PASSED",
+        "required_gate_flag": "natural_frequency_gate_passed",
+        "first_consumed_flag": "first_natural_test_remains_consumed",
+        "first_superseded_flag": "first_natural_result_superseded",
+    },
+    "BALANCED_RETEST_1": {
+        "status": "V2_BALANCED_RETEST_1_LOCKED_TEST_PASSED",
+        "required_gate_flag": "directional_strata_gate_passed",
+        "first_consumed_flag": "first_balanced_test_remains_consumed",
+        "first_superseded_flag": "first_balanced_result_superseded",
+    },
+}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -353,6 +367,7 @@ def prepare_prelock_cost_preflight(
     semantic_packet_input: Path,
     semantic_selection_manifest: Path,
     observed_stage_manifests: dict[str, Path],
+    passed_gate_manifests: dict[str, Path] | None = None,
     output: Path,
     model: str = "gpt-5.6-luna",
     pricing_checked_date: str = "2026-08-22",
@@ -375,6 +390,9 @@ def prepare_prelock_cost_preflight(
         raise ValueError("prelock estimate requires at least two distinct observed stages")
     if not set(observed_stage_manifests).issubset(allowed_roles):
         raise ValueError("prelock estimate contains an unsupported observed-stage role")
+    supplied_passed_gates = passed_gate_manifests or {}
+    if not set(supplied_passed_gates).issubset(PRELOCK_RETEST_GATE_CONTRACTS):
+        raise ValueError("prelock estimate contains an unsupported passed-gate role")
 
     selection = _read_json(semantic_selection_manifest)
     packet_sha = sha256_file(semantic_packet_input)
@@ -406,6 +424,7 @@ def prepare_prelock_cost_preflight(
     observed_packets = 0
     stage_sources: list[dict[str, Any]] = []
     seen_stage_hashes: set[str] = set()
+    observed_by_role: dict[str, dict[str, Any]] = {}
     for role, path in sorted(observed_stage_manifests.items()):
         stage = _read_json(path)
         if stage.get("status") != "CLASSIFICATION_COMPLETE_AWAITING_HUMAN_GOLD_GATE":
@@ -451,22 +470,118 @@ def prepare_prelock_cost_preflight(
             raise ValueError("prelock estimate cannot reuse the same observed stage")
         seen_stage_hashes.add(stage_sha)
         observed_packets += count
-        stage_sources.append(
+        source = {
+            "role": role,
+            "path": str(path),
+            "sha256": stage_sha,
+            "packet_count": count,
+            "input_blinded_packet_sha256": stage.get(
+                "input_blinded_packet_sha256"
+            ),
+            "parser_profile": stage.get("parser_profile"),
+            "parser_version": stage.get("parser_version"),
+            "prompt_sha256": stage.get("prompt_sha256"),
+            "requested_model": stage.get("requested_model"),
+            "semantic_execution_scope": stage.get("semantic_execution_scope"),
+        }
+        stage_sources.append(source)
+        observed_by_role[role] = source
+
+    passed_gate_sources: list[dict[str, Any]] = []
+    for role, path in sorted(supplied_passed_gates.items()):
+        contract = PRELOCK_RETEST_GATE_CONTRACTS[role]
+        if role not in observed_by_role:
+            raise ValueError(
+                f"passed gate requires its exact observed classification stage: {role}"
+            )
+        gate = _read_json(path)
+        for key, expected_value in (
+            ("status", contract["status"]),
+            ("locked_kind", role),
+            ("gate_passed", True),
+            (contract["required_gate_flag"], True),
+            ("parser_profile", spec.profile.value),
+            ("parser_version", spec.parser_version),
+            ("prompt_sha256", spec.prompt_sha256),
+            ("requested_model", model),
+            ("retest_number", 1),
+            (contract["first_consumed_flag"], True),
+            (contract["first_superseded_flag"], False),
+            ("v1_locked_rows_reused", False),
+        ):
+            if gate.get(key) != expected_value:
+                raise ValueError(f"passed {role} gate does not match frozen {key}")
+        if any(
+            gate.get(key) is not False
+            for key in (
+                "outcome_vault_opened",
+                "return_data_opened",
+                "value_data_opened",
+            )
+        ) or gate.get("per_pbr_role", "NOT_USED") != "NOT_USED":
+            raise ValueError(f"passed {role} gate violated the closed-data contract")
+        for key in (
+            "classification_stage_sha256",
+            "classification_sha256",
+            "input_blinded_packet_sha256",
+            "semantic_parser_root_freeze_sha256",
+        ):
+            value = gate.get(key)
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"passed {role} gate lacks {key} lineage")
+        observed = observed_by_role[role]
+        if gate["classification_stage_sha256"] != observed["sha256"]:
+            raise ValueError(
+                f"passed {role} gate does not seal its observed classification stage"
+            )
+        if gate["input_blinded_packet_sha256"] != observed[
+            "input_blinded_packet_sha256"
+        ]:
+            raise ValueError(
+                f"passed {role} gate does not seal its observed blinded packet input"
+            )
+        passed_gate_sources.append(
             {
                 "role": role,
                 "path": str(path),
-                "sha256": stage_sha,
-                "packet_count": count,
-                "input_blinded_packet_sha256": stage.get(
+                "sha256": sha256_file(path),
+                "status": gate["status"],
+                "classification_stage_sha256": gate[
+                    "classification_stage_sha256"
+                ],
+                "classification_sha256": gate["classification_sha256"],
+                "input_blinded_packet_sha256": gate[
                     "input_blinded_packet_sha256"
-                ),
-                "parser_profile": stage.get("parser_profile"),
-                "parser_version": stage.get("parser_version"),
-                "prompt_sha256": stage.get("prompt_sha256"),
-                "requested_model": stage.get("requested_model"),
-                "semantic_execution_scope": stage.get("semantic_execution_scope"),
+                ],
+                "semantic_parser_root_freeze_sha256": gate[
+                    "semantic_parser_root_freeze_sha256"
+                ],
             }
         )
+
+    passed_gate_roles = {source["role"] for source in passed_gate_sources}
+    if passed_gate_roles == set(PRELOCK_RETEST_GATE_CONTRACTS):
+        gate_progress = (
+            "DUAL_RETEST_PASSES_VERIFIED_AWAITING_COMBINED_LOCK_AND_FINAL_COST"
+        )
+    elif passed_gate_roles == {"NATURAL_RETEST_1"}:
+        gate_progress = "NATURAL_RETEST_1_PASSED_AWAITING_BALANCED_RETEST_1"
+    elif passed_gate_roles == {"BALANCED_RETEST_1"}:
+        gate_progress = "BALANCED_RETEST_1_PASSED_AWAITING_NATURAL_RETEST_1"
+    else:
+        gate_progress = "NO_RETEST_GATE_PASSES_VERIFIED"
+
+    missing_final_requirements = []
+    if "NATURAL_RETEST_1" not in passed_gate_roles:
+        missing_final_requirements.append("NATURAL_RETEST_1_HUMAN_GATE_PASS")
+    if "BALANCED_RETEST_1" not in passed_gate_roles:
+        missing_final_requirements.append("BALANCED_RETEST_1_HUMAN_GATE_PASS")
+    missing_final_requirements.extend(
+        [
+            "V2_LOCKED_TESTS_PASSED",
+            "EXACT_NATURAL_AND_BALANCED_CLASSIFICATION_LINEAGE",
+        ]
+    )
 
     expected = _expected_token_counts(
         combined_usage,
@@ -493,8 +608,9 @@ def prepare_prelock_cost_preflight(
     if created.tzinfo is None or created.utcoffset() is None:
         raise ValueError("prepared_at must be timezone-aware")
     manifest: dict[str, Any] = {
-        "schema_version": "moatrader-historical-semantic-cost-preflight-v2/2",
+        "schema_version": "moatrader-historical-semantic-cost-preflight-v2/3",
         "status": "PRELOCK_COST_PREFLIGHT_ONLY_AWAITING_DUAL_LOCKED_USAGE",
+        "gate_progress": gate_progress,
         "prepared_at": created.isoformat(),
         "exact_expected_api_calls_without_retries": packet_count,
         "maximum_api_calls_with_grounding_retries": (
@@ -523,6 +639,7 @@ def prepare_prelock_cost_preflight(
             "observed_prompt_differs_from_frozen_full_prompt": False,
             "observed_contract_matches_frozen_full_prompt": True,
             "passed_natural_and_balanced_usage_required_for_final_manifest": True,
+            "validated_passed_retest_gate_count": len(passed_gate_sources),
             "observed_stages_accepted_as_final_dual_locked_lineage": False,
             "estimate_not_research_result": True,
         },
@@ -547,13 +664,9 @@ def prepare_prelock_cost_preflight(
                 semantic_selection_manifest
             ),
             "observed_stage_manifests": stage_sources,
+            "passed_gate_manifests": passed_gate_sources,
         },
-        "missing_final_requirements": [
-            "NATURAL_RETEST_1_HUMAN_GATE_PASS",
-            "BALANCED_RETEST_1_HUMAN_GATE_PASS",
-            "V2_LOCKED_TESTS_PASSED",
-            "EXACT_NATURAL_AND_BALANCED_CLASSIFICATION_LINEAGE",
-        ],
+        "missing_final_requirements": missing_final_requirements,
         "final_cost_manifest_status_required": (
             "FULL_SEMANTIC_RUN_COST_PRESPECIFIED_NO_EXTERNAL_CALL"
         ),

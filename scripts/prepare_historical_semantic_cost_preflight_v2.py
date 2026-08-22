@@ -9,14 +9,14 @@ from scripts.prepare_historical_semantic_cost_manifest_v2 import (
 )
 
 
-def _parse_observed_stages(values: list[str]) -> dict[str, Path]:
+def _parse_role_paths(values: list[str], *, option: str) -> dict[str, Path]:
     stages: dict[str, Path] = {}
     for value in values:
         role, separator, raw_path = value.partition("=")
         if not separator or not role or not raw_path:
-            raise ValueError("--observed-stage must use ROLE=PATH")
+            raise ValueError(f"{option} must use ROLE=PATH")
         if role in stages:
-            raise ValueError(f"duplicate observed-stage role: {role}")
+            raise ValueError(f"duplicate {option} role: {role}")
         stages[role] = Path(raw_path)
     return stages
 
@@ -36,6 +36,15 @@ def main() -> int:
         required=True,
         help="Observed exact-prompt stage as ROLE=PATH; provide at least two.",
     )
+    parser.add_argument(
+        "--passed-gate",
+        action="append",
+        default=[],
+        help=(
+            "Optional passed retest evaluation as ROLE=PATH; accepted roles are "
+            "NATURAL_RETEST_1 and BALANCED_RETEST_1."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", default="gpt-5.6-luna")
     parser.add_argument("--pricing-checked-date", default="2026-08-22")
@@ -43,7 +52,12 @@ def main() -> int:
     result = prepare_prelock_cost_preflight(
         semantic_packet_input=args.semantic_packet_input,
         semantic_selection_manifest=args.semantic_selection_manifest,
-        observed_stage_manifests=_parse_observed_stages(args.observed_stage),
+        observed_stage_manifests=_parse_role_paths(
+            args.observed_stage, option="--observed-stage"
+        ),
+        passed_gate_manifests=_parse_role_paths(
+            args.passed_gate, option="--passed-gate"
+        ),
         output=args.output,
         model=args.model,
         pricing_checked_date=args.pricing_checked_date,

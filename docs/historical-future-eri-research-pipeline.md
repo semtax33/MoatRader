@@ -605,6 +605,8 @@ python -m scripts.prepare_historical_semantic_cost_preflight_v2 `
   --semantic-selection-manifest <semantic-packets.jsonl.manifest.json> `
   --observed-stage DEV=<completed-v2-dev-classification\stage-status.json> `
   --observed-stage NATURAL_LOCKED=<completed-v2-natural-classification\stage-status.json> `
+  --observed-stage NATURAL_RETEST_1=<completed-v2-natural-retest-classification\stage-status.json> `
+  --passed-gate NATURAL_RETEST_1=<passed-v2-natural-retest-evaluation\stage-status.json> `
   --pricing-checked-date <YYYY-MM-DD> `
   --output <new-prelock-cost-preflight.json>
 
