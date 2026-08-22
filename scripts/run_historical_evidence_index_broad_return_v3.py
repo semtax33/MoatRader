@@ -881,11 +881,29 @@ def _five_band(panel: pd.DataFrame, *, outcome: str) -> list[dict[str, Any]]:
 
 def _selection_comparison(panel: pd.DataFrame, contract: dict[str, Any]) -> dict[str, Any]:
     eligible = panel.dropna(subset=["forward_return_63_open_to_close"])
+    final_months = set(eligible.loc[eligible["final_eri_1640"], "signal_month"])
     groups = {
         "BROAD_RETURN_ELIGIBLE": eligible,
+        "BROAD_MATCHED_TO_FINAL_ERI_SIGNAL_MONTHS": eligible[
+            eligible["signal_month"].isin(final_months)
+        ],
         "FINAL_ERI_1640_INTERSECTION": eligible[eligible["final_eri_1640"]],
+        "COMMON_SECURITY_RETURN_ELIGIBLE_SENSITIVITY": eligible[
+            eligible["security_type"] == "COMMON"
+        ],
     }
-    result: dict[str, Any] = {}
+    result: dict[str, Any] = {
+        "diagnostic_timing": {
+            "BROAD_RETURN_ELIGIBLE": "PREREGISTERED",
+            "FINAL_ERI_1640_INTERSECTION": "PREREGISTERED",
+            "BROAD_MATCHED_TO_FINAL_ERI_SIGNAL_MONTHS": (
+                "POST_PRIMARY_RESULT_SELECTION_DECOMPOSITION"
+            ),
+            "COMMON_SECURITY_RETURN_ELIGIBLE_SENSITIVITY": (
+                "POST_PRIMARY_RESULT_SECURITY_TYPE_SENSITIVITY"
+            ),
+        }
+    }
     for name, group in groups.items():
         raw = _raw_outcome_summary(
             group, outcome="forward_return_63_open_to_close", contract=contract
@@ -910,6 +928,30 @@ def _selection_comparison(panel: pd.DataFrame, contract: dict[str, Any]) -> dict
             "raw_forward_return_ic": raw["ic"],
             "five_band": bands,
         }
+    broad_ic = float(
+        result["BROAD_RETURN_ELIGIBLE"]["raw_forward_return_ic"]["newey_west"]["mean"]
+    )
+    matched_ic = float(
+        result["BROAD_MATCHED_TO_FINAL_ERI_SIGNAL_MONTHS"]["raw_forward_return_ic"][
+            "newey_west"
+        ]["mean"]
+    )
+    final_ic = float(
+        result["FINAL_ERI_1640_INTERSECTION"]["raw_forward_return_ic"]["newey_west"][
+            "mean"
+        ]
+    )
+    result["selection_decomposition_post_primary"] = {
+        "broad_raw_ic": broad_ic,
+        "same_month_broad_raw_ic": matched_ic,
+        "final_eri_intersection_raw_ic": final_ic,
+        "calendar_composition_increment": matched_ic - broad_ic,
+        "within_matched_month_final_eri_selection_increment": final_ic - matched_ic,
+        "total_final_eri_minus_broad_increment": final_ic - broad_ic,
+        "broad_retention_vs_final_eri": broad_ic / final_ic,
+        "same_month_broad_retention_vs_final_eri": matched_ic / final_ic,
+        "alpha_claim_allowed": False,
+    }
     return result
 
 
@@ -1017,6 +1059,7 @@ def evaluate_broad_return(
         "ranking_output_produced": False,
         "per_pbr_primary_ranking": False,
         "sector_is_non_pit_sensitivity_only": True,
+        "post_primary_selection_diagnostics_added": True,
     }
     _write_json(summary_path, summary)
     _write_json(selection_path, selection)

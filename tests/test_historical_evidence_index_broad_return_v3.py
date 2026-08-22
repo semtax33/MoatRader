@@ -9,6 +9,7 @@ from scripts.run_historical_evidence_index_broad_return_v3 import (
     VALUE_FIELDS_V3,
     _add_monthly_value_composite,
     _monthly_neutralization,
+    _selection_comparison,
     open_to_close_forward_return,
 )
 
@@ -111,3 +112,52 @@ def test_monthly_raw_test_uses_same_sample_without_control() -> None:
     assert raw["status"] == "EVALUATED_SAME_SAMPLE"
     assert raw["raw_ic"] == pytest.approx(raw["neutral_ic"])
     assert raw["same_sample_raw_and_neutral"] is True
+
+
+def test_selection_comparison_adds_same_month_post_primary_decomposition() -> None:
+    rows = []
+    for month in ("2024-01", "2024-02"):
+        for index in range(40):
+            rows.append(
+                {
+                    "signal_month": month,
+                    "issuer_id": f"{index:06d}",
+                    "full_evidence_index": float(index % 5) / 2.0 - 1.0,
+                    "full_evidence_band": (
+                        "STRONG_BEAR",
+                        "BEAR",
+                        "NEUTRAL",
+                        "BULL",
+                        "STRONG_BULL",
+                    )[index % 5],
+                    "forward_return_63_open_to_close": float(index),
+                    "final_eri_1640": index < 20,
+                    "security_type": "COMMON",
+                    "log_market_cap": float(index + 1),
+                    "full_nobs": 2,
+                    "momentum_1m": 0.1,
+                    "momentum_3_1": 0.1,
+                    "momentum_6_1": 0.1,
+                    "momentum_12_1": 0.1,
+                    "value_core_composite": 0.1,
+                    "growth_revenue_yoy": 0.1,
+                    "quality_operating_roa_minus_leverage": 0.1,
+                }
+            )
+    contract = {
+        "factor_controls": {"minimum_monthly_observations": 20},
+        "statistics": {
+            "newey_west_lag_months": 1,
+            "moving_block_length_months": 1,
+            "bootstrap_repetitions": 100,
+            "bootstrap_seed": 42,
+        },
+    }
+
+    result = _selection_comparison(pd.DataFrame(rows), contract)
+
+    assert "BROAD_MATCHED_TO_FINAL_ERI_SIGNAL_MONTHS" in result
+    assert result["diagnostic_timing"]["BROAD_MATCHED_TO_FINAL_ERI_SIGNAL_MONTHS"] == (
+        "POST_PRIMARY_RESULT_SELECTION_DECOMPOSITION"
+    )
+    assert result["selection_decomposition_post_primary"]["alpha_claim_allowed"] is False
