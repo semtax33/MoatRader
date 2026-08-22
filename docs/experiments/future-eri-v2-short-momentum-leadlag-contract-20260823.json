@@ -1,0 +1,109 @@
+{
+  "schema_version": "moatrader-future-eri-v2-short-momentum-leadlag-contract-v1/1",
+  "status": "PREREGISTERED_BEFORE_SHORT_MOMENTUM_RESULTS",
+  "preregistered_at": "2026-08-23T00:00:00+09:00",
+  "hypothesis": "Full Evidence V2 contains information about t+63 Future ERI that is not subsumed by short-horizon price momentum, and may lead subsequent one-month momentum rank changes.",
+  "frozen_inputs": {
+    "eri_stage_status_sha256": "c97b0ccc685330ee63d569dda738106a9ee0af603d5a17ccad9d059504b4c801",
+    "feature_rows_sha256": "194b8e89ceab109d25edc29760540fc651973822865384b2ef287684c17cbd5b",
+    "future_eri_labels_sha256": "9eba84ff5e819a8c96e9776ab77063b1f6ebc59ff208602ba6590676c7eadcaa",
+    "full_evidence_index_seal_sha256": "6e9fe8e59de0d4a8a12be8d2ac481a001ebe241b5f49d3ecf91194409be00ab5",
+    "panel_observation_count": 1640,
+    "signal": "FULL_EVIDENCE_SIGNED_BREADTH_V2",
+    "outcome": "FUTURE_ERI_T63"
+  },
+  "historical_momentum_controls": {
+    "daily_return_field": "MARCAP_CHANGES_RATIO_PERCENT",
+    "calendar": "COMMON_KOSPI_KOSDAQ_TRADING_SESSIONS",
+    "signal_day_included": false,
+    "missing_daily_return_policy": "COMPOUND_OBSERVED_ONLY_IF_AT_LEAST_80_PERCENT_OF_EXPECTED_SESSIONS",
+    "minimum_coverage_ratio": 0.8,
+    "definitions": {
+      "momentum_1m": {
+        "lookback_sessions": 21,
+        "skip_most_recent_sessions": 0,
+        "expected_return_observations": 21,
+        "minimum_return_observations": 17
+      },
+      "momentum_3_1": {
+        "lookback_sessions": 63,
+        "skip_most_recent_sessions": 21,
+        "expected_return_observations": 42,
+        "minimum_return_observations": 34
+      },
+      "momentum_6_1": {
+        "lookback_sessions": 126,
+        "skip_most_recent_sessions": 21,
+        "expected_return_observations": 105,
+        "minimum_return_observations": 84
+      },
+      "momentum_12_1": {
+        "lookback_sessions": 252,
+        "skip_most_recent_sessions": 21,
+        "expected_return_observations": 231,
+        "minimum_return_observations": 185
+      }
+    },
+    "prefiling_return_21_equals_momentum_1m": true,
+    "neutralization_method": "MONTHLY_RANK_NORMAL_EVIDENCE_RESIDUALIZED_ON_RANK_NORMAL_CONTROLS",
+    "same_sample_raw_and_neutral": true,
+    "individual_controls": [
+      "momentum_1m",
+      "momentum_3_1",
+      "momentum_6_1",
+      "momentum_12_1"
+    ],
+    "primary_joint_control": [
+      "momentum_3_1",
+      "momentum_6_1",
+      "momentum_12_1"
+    ],
+    "all_four_joint_sensitivity": [
+      "momentum_1m",
+      "momentum_3_1",
+      "momentum_6_1",
+      "momentum_12_1"
+    ],
+    "minimum_complete_control_observations": 1500,
+    "minimum_valid_months": 12
+  },
+  "lead_lag_authorization_gate": {
+    "minimum_signed_ic_retention": 0.7,
+    "required_tests": [
+      "momentum_3_1",
+      "momentum_6_1",
+      "joint_3_6_12"
+    ],
+    "neutral_ic_moving_block_bootstrap_lower_bound_must_exceed": 0.0,
+    "minimum_valid_months": 12,
+    "if_gate_fails": "DO_NOT_OPEN_FORWARD_PRICE_RETURNS"
+  },
+  "lead_lag_test_if_authorized": {
+    "horizons_trading_sessions": [21, 42, 63],
+    "forward_return_definition": "COMPOUNDED_RETURN_FROM_SIGNAL_SESSION_THROUGH_HORIZON_SESSION",
+    "future_momentum_definition": "ROLLING_21_SESSION_RETURN_ENDING_AT_EACH_HORIZON",
+    "rank_universe": "SAME_SIGNAL_MONTH_COMPLETE_CASE_ERI_PANEL",
+    "delta_momentum_rank": "FUTURE_ROLLING_21_SESSION_RETURN_PERCENTILE_RANK_MINUS_PREFILING_21_SESSION_RETURN_PERCENTILE_RANK",
+    "primary_statistic": "MONTHLY_SPEARMAN_IC_FULL_EVIDENCE_TO_DELTA_MOMENTUM_RANK",
+    "secondary_statistic": "MONTHLY_SPEARMAN_IC_FULL_EVIDENCE_TO_CUMULATIVE_FORWARD_RETURN",
+    "minimum_monthly_observations": 5,
+    "minimum_horizons_with_positive_bootstrap_lower_bound": 2,
+    "minimum_horizons_with_positive_strong_bull_minus_strong_bear_median_delta_rank": 2
+  },
+  "inference": {
+    "newey_west_lag_months": 3,
+    "moving_block_length_months": 4,
+    "bootstrap_repetitions": 10000,
+    "bootstrap_seed": 42
+  },
+  "interpretation_bands": {
+    "largely_survives_minimum_retention": 0.8,
+    "partially_explained_minimum_retention": 0.5,
+    "short_momentum_dominates_if_neutral_ic_at_or_below": 0.025
+  },
+  "evidence_definition_changed": false,
+  "future_eri_definition_changed": false,
+  "factor_based_ranking_allowed": false,
+  "future_eri_used_as_ranking": false,
+  "source_files_may_be_modified": false
+}
